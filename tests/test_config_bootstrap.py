@@ -25,7 +25,12 @@ from codexd.domain.ids import utc_now_ms
 from codexd.errors import SecurityError
 from codexd.observability.logging import JsonFormatter
 from codexd.paths import AppPaths
-from codexd.security.redaction import redact_diff, redact_text, redact_value
+from codexd.security.redaction import (
+    redact_diff,
+    redact_text,
+    redact_value,
+    safe_thread_title_summary,
+)
 from codexd.security.secrets import SecretStore
 from codexd.service.process import current_process_identity
 
@@ -333,6 +338,93 @@ def test_redaction_preserves_ordinary_basic_and_bearer_prose() -> None:
     assert (
         redact_text("Send bearer eyJhbGciOiJIUzI1NiJ9.payload.signature")
         == "Send bearer <redacted>"
+    )
+
+
+def test_thread_title_summary_removes_discord_mentions_and_controls() -> None:
+    summary = safe_thread_title_summary(
+        "修复\x00\n <@123> <@!234> <@&345> <#456> @everyone @HERE 登录"
+    )
+
+    assert summary == "修复 登录"
+    assert all(
+        not (ord(character) < 32 or 127 <= ord(character) <= 159)
+        for character in summary
+    )
+
+
+@pytest.mark.parametrize(
+    ("value", "forbidden"),
+    (
+        ("OPENAI_API_KEY=provider-secret fix auth", "provider-secret"),
+        (
+            "Authorization: Bearer abcdefghijklmnopqrstuvwxyz fix auth",
+            "abcdefghijklmnopqrstuvwxyz",
+        ),
+        ("inspect /Users/alice/private/file.py", "/Users/alice"),
+    ),
+)
+def test_thread_title_summary_redacts_sensitive_values(
+    value: str,
+    forbidden: str,
+) -> None:
+    summary = safe_thread_title_summary(value)
+
+    assert forbidden not in summary
+    assert 1 <= len(summary) <= 72
+
+
+def test_thread_title_summary_redacts_full_project_root(tmp_path: Path) -> None:
+    project_root = tmp_path / "private-project"
+
+    summary = safe_thread_title_summary(
+        f"inspect {project_root}/src/main.py",
+        project_root=project_root,
+    )
+
+    assert str(project_root) not in summary
+    assert "<project>/src/main.py" in summary
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        "修复登录后刷新白屏",
+        "Fix the blank page after login",
+        "修复登录 👩‍💻🚀",
+    ),
+)
+def test_thread_title_summary_preserves_readable_unicode(value: str) -> None:
+    assert safe_thread_title_summary(value) == value
+
+
+def test_thread_title_summary_is_bounded_in_unicode_characters() -> None:
+    summary = safe_thread_title_summary("界🙂" * 100)
+
+    assert len(summary) == 72
+    assert summary.endswith("...")
+    assert summary.encode("utf-8")
+
+
+@pytest.mark.parametrize(
+    ("value", "has_image_attachment", "expected"),
+    (
+        ("", False, "新任务"),
+        (" \n\t", True, "图片任务"),
+        ("<@123> @everyone \x00", True, "新任务"),
+    ),
+)
+def test_thread_title_summary_uses_deterministic_fallbacks(
+    value: str,
+    has_image_attachment: bool,
+    expected: str,
+) -> None:
+    assert (
+        safe_thread_title_summary(
+            value,
+            has_image_attachment=has_image_attachment,
+        )
+        == expected
     )
 
 

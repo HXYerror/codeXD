@@ -51,7 +51,11 @@ _HOME_PATHS = (
     re.compile(r"(?<![\w.-])/home/[^/\s]+"),
     re.compile(r"(?i)\b[A-Z]:\\Users\\[^\\\s]+"),
 )
-_CONTROL_CHARACTERS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_CONTROL_CHARACTERS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+_DISCORD_ENTITY_MENTION = re.compile(r"<(?:@!?\d+|@&\d+|#\d+)>")
+_DISCORD_BROADCAST_MENTION = re.compile(r"@(?:everyone|here)\b", re.IGNORECASE)
+_NON_TEXT_SUMMARY = "[non-text input]"
+_THREAD_TITLE_SUMMARY_MAX_CHARS = 72
 _DIFF_PATH_HEADER = re.compile(
     r"^(?P<prefix>--- |\+\+\+ |rename from |rename to )"
     r"(?P<path>[^\t]+)(?P<suffix>\t.*)?$"
@@ -98,10 +102,29 @@ def redacted_summary(
         raise ValueError("max_chars must be at least 4")
     summary = " ".join(redact_text(value, project_root=project_root).split())
     if not summary:
-        return "[non-text input]"
+        return _NON_TEXT_SUMMARY
     if len(summary) <= max_chars:
         return summary
     return f"{summary[: max_chars - 3].rstrip()}..."
+
+
+def safe_thread_title_summary(
+    value: str,
+    *,
+    project_root: Path | None = None,
+    has_image_attachment: bool = False,
+) -> str:
+    if not value.strip():
+        return "图片任务" if has_image_attachment else "新任务"
+    mention_stripped = _strip_discord_mentions(value)
+    redacted = redact_text(mention_stripped, project_root=project_root)
+    safe_summary = " ".join(_strip_discord_mentions(redacted).split())
+    if not safe_summary:
+        return "新任务"
+    return redacted_summary(
+        safe_summary,
+        max_chars=_THREAD_TITLE_SUMMARY_MAX_CHARS,
+    )
 
 
 def redact_value(value: Any, *, project_root: Path | None = None) -> Any:
@@ -145,6 +168,11 @@ def _redact_named_value(match: re.Match[str]) -> str:
     if len(value) >= 2 and value[0] in {"\"", "'"} and value[-1] == value[0]:
         replacement = f"{value[0]}<redacted>{value[0]}"
     return f"{match.group('prefix')}{replacement}"
+
+
+def _strip_discord_mentions(value: str) -> str:
+    without_entities = _DISCORD_ENTITY_MENTION.sub(" ", value)
+    return _DISCORD_BROADCAST_MENTION.sub(" ", without_entities)
 
 
 def _redact_basic_auth(match: re.Match[str]) -> str:
