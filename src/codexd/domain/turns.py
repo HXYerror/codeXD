@@ -12,7 +12,7 @@ from codexd.errors import InvariantError
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _DISCORD_MENTION = re.compile(
-    r"<(?:@!?|@&|#)\d+>|@(?:everyone|here)\b",
+    r"<(?:@!?|@&|#)\d+>|@(?:everyone|here)(?![A-Za-z0-9_])",
     re.IGNORECASE,
 )
 _MAX_FILE_DISPLAY_NAME_CHARS = 128

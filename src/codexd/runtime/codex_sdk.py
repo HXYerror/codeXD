@@ -2,17 +2,22 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
+import importlib
 import importlib.metadata
 import inspect
 import logging
+import os
 import re
+import stat
 import tomllib
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
+import openai_codex
 from openai_codex import (
     ApprovalMode,
     AsyncCodex,
@@ -24,7 +29,6 @@ from openai_codex import (
     InvalidRequestError,
     JsonRpcError,
     LocalImageInput,
-    MentionInput,
     MethodNotFoundError,
     ParseError,
     RetryLimitExceededError,
@@ -71,8 +75,8 @@ from codexd.domain.models import (
     ModelDescriptor,
     ServiceTierDescriptor,
 )
-from codexd.domain.turns import TurnIdentity, TurnInput
-from codexd.errors import InvariantError, NotFoundError
+from codexd.domain.turns import TurnFile, TurnIdentity, TurnInput
+from codexd.errors import AttachmentIntegrityError, InvariantError, NotFoundError
 from codexd.runtime.errors import (
     AdapterError,
     AdapterFailure,
@@ -91,6 +95,7 @@ from codexd.runtime.port import (
     StartedTurn,
     TurnStream,
 )
+from codexd.security import private_files
 from codexd.security.redaction import redact_diff, redact_text, redact_value
 
 SDK_DECLARED_RANGE = ">=0.144.4,<0.145"
@@ -103,6 +108,10 @@ _ARCHIVE_DIRECT_HANDLE_CONTRACT_VERIFIED = False
 _MIN_SDK_VERSION = (0, 144, 4)
 _MAX_SDK_VERSION = (0, 145, 0)
 _MENTION_INPUT_VERIFIED_SDK_VERSIONS = frozenset({"0.144.4"})
+try:
+    _FCNTL: Any | None = importlib.import_module("fcntl")
+except ImportError:
+    _FCNTL = None
 logger = logging.getLogger(__name__)
 _PENDING_STARTUP_CLEANUPS: set[asyncio.Task[None]] = set()
 _COMPAT_UNKNOWN_NOTIFICATION_METHODS = frozenset(
@@ -124,6 +133,28 @@ _COMPAT_UNKNOWN_NOTIFICATION_METHODS = frozenset(
         "turn/moderationMetadata",
     }
 )
+
+
+class _FileInputLeaseError(OSError):
+    pass
+
+
+class _FileInputLeases:
+    def __init__(self, descriptors: tuple[int, ...] = ()) -> None:
+        self._descriptors = descriptors
+
+    @property
+    def descriptors(self) -> tuple[int, ...]:
+        return self._descriptors
+
+    def close(self) -> None:
+        descriptors, self._descriptors = self._descriptors, ()
+        for descriptor in descriptors:
+            if _FCNTL is not None:
+                with suppress(OSError):
+                    _FCNTL.flock(descriptor, _FCNTL.LOCK_UN)
+            with suppress(OSError):
+                os.close(descriptor)
 
 
 def _schedule_cancelled_startup_cleanup(
@@ -220,6 +251,7 @@ class CodexSDKRuntime:
         self._manifest = manifest
         self._threads: dict[str, AsyncThread] = {}
         self._turn_handles: dict[str, AsyncTurnHandle] = {}
+        self._file_input_leases: dict[str, _FileInputLeases] = {}
         self._subagent_details: dict[str, dict[str, str]] = {}
         self._closed = False
         self._close_lock = asyncio.Lock()
@@ -527,7 +559,12 @@ class CodexSDKRuntime:
         input: TurnInput,
         config: TurnConfig,
     ) -> StartedTurn:
-        if input.files and self._manifest.optional.get("mention.input") is not True:
+        mention_input = _resolve_mention_input_constructor(self._manifest.sdk_version)
+        if input.files and (
+            self._manifest.optional.get("mention.input") is not True
+            or mention_input is None
+            or not _file_input_leasing_supported()
+        ):
             raise file_input_unsupported(
                 generation=self.generation,
                 thread_id=thread.thread_id,
@@ -545,18 +582,24 @@ class CodexSDKRuntime:
             (image.ordinal, LocalImageInput(str(image.canonical_path)))
             for image in input.images
         ]
-        attachment_input.extend(
-            (file.ordinal, MentionInput(file.display_name, str(file.canonical_path)))
-            for file in input.files
-        )
-        wire_input.extend(
-            item
-            for _ordinal, item in sorted(
-                attachment_input,
-                key=lambda entry: entry[0],
-            )
-        )
+        leases = _acquire_file_input_leases(input.files)
         try:
+            if input.files:
+                assert mention_input is not None
+                attachment_input.extend(
+                    (
+                        file.ordinal,
+                        mention_input(file.display_name, str(file.canonical_path)),
+                    )
+                    for file in input.files
+                )
+            wire_input.extend(
+                item
+                for _ordinal, item in sorted(
+                    attachment_input,
+                    key=lambda entry: entry[0],
+                )
+            )
             handle = await handle_thread.turn(
                 wire_input,
                 approval_mode=_approval(config.approval_mode),
@@ -570,6 +613,7 @@ class CodexSDKRuntime:
                 summary=_summary(config.reasoning_summary),
             )
         except CodexError as exc:
+            leases.close()
             raise _adapter_error(
                 exc,
                 operation="turn.start",
@@ -577,6 +621,14 @@ class CodexSDKRuntime:
                 thread_id=thread.thread_id,
                 turn_id=local_turn_id,
             ) from exc
+        except BaseException:
+            leases.close()
+            raise
+        if handle.id in self._file_input_leases:
+            leases.close()
+            raise InvariantError("Codex Turn handle already owns a file input lease")
+        if leases.descriptors:
+            self._file_input_leases[handle.id] = leases
         self._turn_handles[handle.id] = handle
         identity = TurnIdentity(local_turn_id, handle.id, self.generation)
 
@@ -604,6 +656,16 @@ class CodexSDKRuntime:
                         )
                         if detail:
                             event = replace(event, payload={**event.payload, **detail})
+                    terminal_event = event.kind in {
+                        "turn.completed",
+                        "turn.failed",
+                        "turn.interrupted",
+                    }
+                    if unknown_terminal or event.kind == "turn.terminal_unparseable":
+                        self._release_file_input_lease(handle.id)
+                    elif terminal_event:
+                        terminal_seen = True
+                        self._release_file_input_lease(handle.id)
                     yield event
                     if unknown_terminal or event.kind == "turn.terminal_unparseable":
                         raise _protocol_incompatible(
@@ -611,12 +673,7 @@ class CodexSDKRuntime:
                             thread_id=thread.thread_id,
                             turn_id=handle.id,
                         )
-                    if event.kind in {
-                        "turn.completed",
-                        "turn.failed",
-                        "turn.interrupted",
-                    }:
-                        terminal_seen = True
+                    if terminal_event:
                         break
             except CodexError as exc:
                 raise _adapter_error(
@@ -628,6 +685,7 @@ class CodexSDKRuntime:
                 ) from exc
             finally:
                 self._turn_handles.pop(handle.id, None)
+                self._release_file_input_lease(handle.id)
             if not terminal_seen:
                 failure = AdapterFailure(
                     code="stream_ended_unexpectedly",
@@ -757,7 +815,13 @@ class CodexSDKRuntime:
         async with self._close_lock:
             if self._closed:
                 return
-            await self._client.close()
+            try:
+                await self._client.close()
+            finally:
+                leases = tuple(self._file_input_leases.values())
+                self._file_input_leases.clear()
+                for lease in leases:
+                    lease.close()
             self._closed = True
             self._turn_handles.clear()
             self._threads.clear()
@@ -821,6 +885,11 @@ class CodexSDKRuntime:
             return self._turn_handles[turn.provider_turn_id]
         except KeyError as exc:
             raise NotFoundError("active Codex Turn handle not found") from exc
+
+    def _release_file_input_lease(self, provider_turn_id: str) -> None:
+        lease = self._file_input_leases.pop(provider_turn_id, None)
+        if lease is not None:
+            lease.close()
 
     def _ensure_open(self) -> None:
         if self._closed:
@@ -1029,15 +1098,23 @@ def _callable_accepts(
     return callable(candidate) and parameters <= set(inspect.signature(candidate).parameters)
 
 
-def _mention_input_contract_supported(sdk_version: str) -> bool:
+def _resolve_mention_input_constructor(
+    sdk_version: str,
+) -> Callable[[str, str], InputItem] | None:
     if sdk_version not in _MENTION_INPUT_VERIFIED_SDK_VERSIONS:
-        return False
+        return None
     try:
-        parameters = tuple(inspect.signature(MentionInput).parameters.values())
-        probe = MentionInput("contract-name", "contract-path")
-    except (TypeError, ValueError):
-        return False
-    return (
+        candidate = getattr(openai_codex, "MentionInput", None)
+    except Exception:
+        return None
+    if not callable(candidate):
+        return None
+    try:
+        parameters = tuple(inspect.signature(candidate).parameters.values())
+        probe = candidate("contract-name", "contract-path")
+    except Exception:
+        return None
+    if not (
         tuple(parameter.name for parameter in parameters) == ("name", "path")
         and all(
             parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
@@ -1046,7 +1123,145 @@ def _mention_input_contract_supported(sdk_version: str) -> bool:
         )
         and getattr(probe, "name", None) == "contract-name"
         and getattr(probe, "path", None) == "contract-path"
+    ):
+        return None
+    return cast(Callable[[str, str], InputItem], candidate)
+
+
+def _mention_input_contract_supported(sdk_version: str) -> bool:
+    return _resolve_mention_input_constructor(sdk_version) is not None
+
+
+def _file_input_supported(sdk_version: str) -> bool:
+    return _mention_input_contract_supported(sdk_version) and _file_input_leasing_supported()
+
+
+def _file_input_leasing_supported() -> bool:
+    return bool(
+        private_files.private_file_security_supported()
+        and os.name == "posix"
+        and _FCNTL is not None
+        and getattr(os, "O_NOFOLLOW", 0)
+        and getattr(os, "O_DIRECTORY", 0)
+        and os.open in os.supports_dir_fd
     )
+
+
+def _acquire_file_input_leases(files: tuple[TurnFile, ...]) -> _FileInputLeases:
+    if not files:
+        return _FileInputLeases()
+    descriptors: list[int] = []
+    current: TurnFile | None = None
+    try:
+        for current in files:
+            descriptors.append(_acquire_file_input_lease(current))
+    except _FileInputLeaseError:
+        _FileInputLeases(tuple(descriptors)).close()
+        attachment_id = current.attachment_id if current is not None else "unknown"
+        raise AttachmentIntegrityError(
+            "ordinary file attachment failed final integrity validation: "
+            f"{attachment_id}"
+        ) from None
+    return _FileInputLeases(tuple(descriptors))
+
+
+def _acquire_file_input_lease(file: TurnFile) -> int:
+    if not _file_input_leasing_supported():
+        raise _FileInputLeaseError("secure file leasing is unavailable")
+    path = file.canonical_path
+    descriptor = -1
+    try:
+        _validate_file_lease_path(path)
+        descriptor = _open_file_lease_descriptor(path)
+        assert _FCNTL is not None
+        _FCNTL.flock(descriptor, _FCNTL.LOCK_SH | _FCNTL.LOCK_NB)
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise _FileInputLeaseError("leased target is not a regular file")
+        private_files.validate_private_file_metadata(before)
+        if before.st_size != file.size_bytes:
+            raise _FileInputLeaseError("leased file size changed")
+
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        digest = hashlib.sha256()
+        observed_size = 0
+        while observed_size <= file.size_bytes:
+            chunk = os.read(
+                descriptor,
+                min(1024 * 1024, file.size_bytes + 1 - observed_size),
+            )
+            if not chunk:
+                break
+            observed_size += len(chunk)
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        if (
+            before.st_dev != after.st_dev
+            or before.st_ino != after.st_ino
+            or before.st_size != after.st_size
+            or observed_size != after.st_size
+        ):
+            raise _FileInputLeaseError("leased file changed while hashing")
+        if observed_size != file.size_bytes or not hmac.compare_digest(
+            digest.hexdigest(), file.sha256
+        ):
+            raise _FileInputLeaseError("leased file content changed")
+
+        _validate_file_lease_path(path)
+        named = path.lstat()
+        if (
+            stat.S_ISLNK(named.st_mode)
+            or not stat.S_ISREG(named.st_mode)
+            or named.st_dev != after.st_dev
+            or named.st_ino != after.st_ino
+            or named.st_size != after.st_size
+        ):
+            raise _FileInputLeaseError("leased file no longer matches its named path")
+        private_files.validate_private_file_metadata(named)
+        return descriptor
+    except (OSError, ValueError):
+        if descriptor >= 0:
+            _FileInputLeases((descriptor,)).close()
+        raise _FileInputLeaseError("file lease validation failed") from None
+
+
+def _validate_file_lease_path(path: Path) -> None:
+    if not path.is_absolute() or ".." in path.parts or path.name in {"", ".", ".."}:
+        raise _FileInputLeaseError("file lease path is invalid")
+    if path.parent.name != "input" or path.parent.parent.name != "attachments":
+        raise _FileInputLeaseError("file lease path is outside private attachment storage")
+
+    current = Path(path.anchor)
+    for part in path.parts[1:-1]:
+        current /= part
+        metadata = current.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise _FileInputLeaseError("file lease path contains an unsafe parent")
+
+    for directory in (path.parent.parent.parent, path.parent.parent, path.parent):
+        private_files.validate_private_directory_metadata(directory.lstat())
+
+
+def _open_file_lease_descriptor(path: Path) -> int:
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | nofollow | getattr(os, "O_CLOEXEC", 0)
+    directory_descriptor = os.open(path.anchor, directory_flags)
+    try:
+        for part in path.parts[1:-1]:
+            child = os.open(
+                part,
+                directory_flags,
+                dir_fd=directory_descriptor,
+            )
+            os.close(directory_descriptor)
+            directory_descriptor = child
+        return os.open(
+            path.name,
+            os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=directory_descriptor,
+        )
+    finally:
+        os.close(directory_descriptor)
 
 
 def _verify_public_contract() -> None:
@@ -1211,7 +1426,7 @@ def capability_manifest(*, runtime_version: str | None = None) -> CapabilityMani
             "web_search.item": EventCapability.SUPPORTED,
             "web_search.config": True,
             "skill.input": True,
-            "mention.input": _mention_input_contract_supported(sdk_version),
+            "mention.input": _file_input_supported(sdk_version),
             "mcp.item": EventCapability.SUPPORTED_NOT_OBSERVED,
             "dynamic_tool.item": EventCapability.SUPPORTED_NOT_OBSERVED,
             "collab.item": EventCapability.SUPPORTED_NOT_OBSERVED,

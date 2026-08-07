@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import sqlite3
 from dataclasses import FrozenInstanceError
@@ -21,8 +22,14 @@ from codexd.domain.turns import (
     TurnSkill,
     TurnSource,
 )
-from codexd.errors import ConfigurationError, ConflictError, InvariantError
+from codexd.errors import (
+    AttachmentIntegrityError,
+    ConfigurationError,
+    ConflictError,
+    InvariantError,
+)
 from codexd.paths import AppPaths
+from codexd.security import private_files
 from codexd.storage.repository import Repository
 from codexd.storage.retention import run_retention
 from codexd.storage.sqlite import SQLiteStore
@@ -137,6 +144,8 @@ def test_turn_input_rejects_duplicate_ordinals_across_images_and_files(
         "bad\x00name",
         "<@123>.txt",
         "@everyone.txt",
+        "@everyone资料.txt",
+        "@here資料.txt",
         "x" * 129,
     ],
 )
@@ -614,3 +623,81 @@ def test_retention_removes_terminal_file_and_unreferenced_file_orphan(
     assert result.orphan_artifacts == 1
     assert not file.canonical_path.exists()
     assert not orphan.exists()
+
+
+def test_repository_windows_permission_facade_never_skips_file_verification(
+    storage_context: StorageContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file = _turn_file(storage_context.store.path.parent)
+    turn = storage_context.repository.enqueue_turn(
+        conversation_id=storage_context.conversation.id,
+        source=TurnSource.DISCORD,
+        turn_input=TurnInput(files=(file,)),
+        input_message_id="windows-private-permission-facade",
+    )
+    monkeypatch.setattr(private_files, "_platform_name", lambda: "nt")
+
+    with pytest.raises(AttachmentIntegrityError) as failure:
+        storage_context.repository.load_turn_input(turn.id)
+
+    assert failure.value.code == "attachment_integrity_failed"
+    assert str(file.canonical_path) not in str(failure.value)
+
+
+def test_retention_unlink_failure_log_is_path_safe_and_keeps_metadata(
+    storage_context: StorageContext,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    file = _turn_file(
+        storage_context.store.path.parent,
+        attachment_id="unlink-failure-file",
+        retention_until=1,
+    )
+    turn = storage_context.repository.enqueue_turn(
+        conversation_id=storage_context.conversation.id,
+        source=TurnSource.DISCORD,
+        turn_input=TurnInput(files=(file,)),
+        input_message_id="unlink-failure-message",
+    )
+    storage_context.repository.request_cancel(turn.id, origin=InterruptOrigin.USER)
+    original_unlink = Path.unlink
+
+    def fail_target_unlink(path: Path, *, missing_ok: bool = False) -> None:
+        if path == file.canonical_path:
+            raise OSError(f"cannot unlink private path {path}")
+        original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", fail_target_unlink)
+    caplog.set_level(logging.WARNING, logger="codexd.storage.retention")
+
+    result = run_retention(
+        storage_context.store,
+        AppPaths(
+            storage_context.store.path.parent,
+            storage_context.store.path.parent / "logs",
+        ),
+        RetentionConfig(),
+        now_ms=1_000_000_000,
+    )
+
+    assert result.input_attachments == 0
+    assert file.canonical_path.exists()
+    assert storage_context.store.query_one(
+        "SELECT id FROM attachments WHERE id = ?",
+        (file.attachment_id,),
+    ) is not None
+    records = [
+        record
+        for record in caplog.records
+        if getattr(record, "stable_code", None)
+        == "retention_artifact_unlink_failed"
+    ]
+    assert len(records) == 1
+    record = records[0]
+    assert record.artifact_id == file.attachment_id
+    assert record.exc_info is None
+    assert record.exc_text is None
+    assert record.args == ()
+    assert str(file.canonical_path) not in record.getMessage()

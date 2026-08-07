@@ -647,6 +647,7 @@ async def test_post_commit_wake_failure_keeps_durably_owned_artifact(
         ("attachment_download_failed", "attachment download failed"),
         ("attachment_download_timeout", "attachment download timed out"),
         ("attachment_integrity_failed", "attachment integrity check failed"),
+        ("file_input_unsupported", "attachment storage is unavailable"),
         ("image_decode_failed", "image attachment could not be decoded"),
     ),
 )

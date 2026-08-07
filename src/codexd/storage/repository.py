@@ -44,6 +44,12 @@ from codexd.errors import (
     SecurityError,
     StorageError,
 )
+from codexd.security.private_files import (
+    validate_private_directory_metadata as _validate_owner_only_directory,
+)
+from codexd.security.private_files import (
+    validate_private_file_metadata as _validate_owner_only_file,
+)
 from codexd.security.redaction import redacted_summary
 from codexd.storage.progress import (
     insert_initial_progress,
@@ -5958,17 +5964,19 @@ def _open_input_artifact(root: Path, relative: Path) -> int:
 
 
 def _validate_private_directory_metadata(metadata: os.stat_result) -> None:
-    if os.name == "nt":
-        return
-    if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != 0o700:
-        raise _InvalidInputArtifact("input directory ownership or mode is unsafe")
+    try:
+        _validate_owner_only_directory(metadata)
+    except OSError:
+        raise _InvalidInputArtifact(
+            "input directory ownership or mode is unsafe"
+        ) from None
 
 
 def _validate_private_file_metadata(metadata: os.stat_result) -> None:
-    if os.name == "nt":
-        return
-    if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != 0o600:
-        raise _InvalidInputArtifact("input file ownership or mode is unsafe")
+    try:
+        _validate_owner_only_file(metadata)
+    except OSError:
+        raise _InvalidInputArtifact("input file ownership or mode is unsafe") from None
 
 
 def _assert_conversation_mutable(

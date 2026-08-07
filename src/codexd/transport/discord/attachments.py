@@ -4,7 +4,6 @@ import asyncio
 import hashlib
 import os
 import re
-import stat
 import unicodedata
 import uuid
 from collections.abc import Iterable, Sequence
@@ -22,6 +21,11 @@ from codexd.errors import CodexDError
 from codexd.rendering.media_worker import (
     AttachmentMediaResult,
     MediaWorker,
+)
+from codexd.security.private_files import (
+    PrivateFileSecurityUnavailable,
+    ensure_private_directory,
+    secure_private_file,
 )
 
 _CDN_HOSTS = frozenset(
@@ -54,10 +58,81 @@ _IMAGE_EXTENSIONS = frozenset(
     }
 )
 _DISCORD_MENTION = re.compile(
-    r"<(?:@!?|@&|#)\d+>|@(?:everyone|here)\b",
+    r"<(?:@!?|@&|#)\d+>|@(?:everyone|here)(?![A-Za-z0-9_])",
     re.IGNORECASE,
 )
 _SHORT_EXTENSION = re.compile(r"\.[A-Za-z0-9]{1,16}")
+_EXECUTABLE_EXTENSIONS = frozenset(
+    {
+        ".ade",
+        ".adp",
+        ".app",
+        ".application",
+        ".appref-ms",
+        ".asp",
+        ".aspx",
+        ".bash",
+        ".bat",
+        ".cgi",
+        ".chm",
+        ".cmd",
+        ".com",
+        ".command",
+        ".cpl",
+        ".csh",
+        ".desktop",
+        ".dll",
+        ".drv",
+        ".exe",
+        ".fish",
+        ".fon",
+        ".gadget",
+        ".hlp",
+        ".hta",
+        ".inf",
+        ".ins",
+        ".isp",
+        ".jar",
+        ".js",
+        ".jse",
+        ".ksh",
+        ".lnk",
+        ".msc",
+        ".msi",
+        ".msp",
+        ".mst",
+        ".ocx",
+        ".pif",
+        ".pl",
+        ".py",
+        ".ps1",
+        ".ps1xml",
+        ".ps2",
+        ".ps2xml",
+        ".psc1",
+        ".psc2",
+        ".pyw",
+        ".reg",
+        ".rb",
+        ".run",
+        ".scf",
+        ".scr",
+        ".sct",
+        ".sh",
+        ".shb",
+        ".sys",
+        ".url",
+        ".vb",
+        ".vbe",
+        ".vbs",
+        ".ws",
+        ".wsc",
+        ".wsf",
+        ".wsh",
+        ".xll",
+        ".zsh",
+    }
+)
 _MAX_DISPLAY_NAME_CHARS = 128
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 _MAX_REDIRECTS = 4
@@ -203,7 +278,7 @@ class DiscordAttachmentIngestor:
         source = quarantine / f"{attachment_id}.download"
         staging = quarantine / f"{attachment_id}.normalized"
         image_final = inputs / f"{attachment_id}.png"
-        file_final = inputs / f"{attachment_id}{_validated_extension(display_name)}"
+        file_final = inputs / f"{attachment_id}{_storage_extension(display_name)}"
         committed: Path | None = None
         try:
             downloaded_result = await self._download(attachment.url, source)
@@ -413,8 +488,7 @@ class DiscordAttachmentIngestor:
                         "attachment download was empty or incomplete",
                         code="attachment_integrity_failed",
                     )
-                if os.name != "nt":
-                    await asyncio.to_thread(destination.chmod, 0o600)
+                await asyncio.to_thread(secure_private_file, destination)
                 return _DownloadedAttachment(
                     size_bytes=size,
                     sha256=digest.hexdigest(),
@@ -597,14 +671,19 @@ def _validated_extension(display_name: str) -> str:
     return extension.casefold()
 
 
+def _storage_extension(display_name: str) -> str:
+    extension = _validated_extension(display_name)
+    return "" if extension in _EXECUTABLE_EXTENSIONS else extension
+
+
 def _ensure_private_directory(path: Path) -> None:
     try:
-        path.mkdir(mode=0o700, parents=True, exist_ok=True)
-        metadata = path.lstat()
-        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-            raise OSError("attachment directory is not a regular directory")
-        if os.name != "nt":
-            path.chmod(0o700)
+        ensure_private_directory(path)
+    except PrivateFileSecurityUnavailable as exc:
+        raise AttachmentError(
+            "attachment storage is unavailable on this platform",
+            code="file_input_unsupported",
+        ) from exc
     except OSError as exc:
         raise AttachmentError(
             "attachment storage directory is unsafe",
@@ -617,8 +696,7 @@ def _commit_file(source: Path, destination: Path) -> None:
         raise OSError("attachment destination already exists")
     os.replace(source, destination)
     try:
-        if os.name != "nt":
-            destination.chmod(0o600)
+        secure_private_file(destination)
     except OSError:
         destination.unlink(missing_ok=True)
         raise

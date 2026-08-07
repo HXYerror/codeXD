@@ -1142,10 +1142,11 @@ SDK 对其配套 `openai-codex-cli-bin` 的依赖关系由官方 SDK 包管理�
 
 补丁版本在声明范围内默认可安装；若启动检查发现 required capability 缺失，
 仍然 fail closed。Optional capability 按实际 manifest 注册，不按版本号猜测。
-`mention.input` 当前只在 public export、`MentionInput(name, path)` constructor 与
-`{"type":"mention","name":...,"path":...}` wire serialization 均通过 contract
-test 的 SDK `0.144.4` 上报告 `true`；范围内其他 patch 保持文字/图片兼容，但文件
-Turn fail closed，直到对应 patch 加入 compatibility matrix。
+`mention.input` 当前只在 public export、`MentionInput(name, path)` constructor、
+`{"type":"mention","name":...,"path":...}` wire serialization 与平台 secure-lease
+contract 均通过的 SDK `0.144.4`/POSIX 组合上报告 `true`；范围内其他 patch 或缺少
+安全 lease 的平台保持文字/图片兼容，但文件 Turn fail closed，直到对应组合加入
+compatibility matrix。
 
 启动时记录：
 
@@ -2054,6 +2055,10 @@ Windows：
 ├── instance.lock
 └── logs\codexd.jsonl
 ```
+
+当前版本尚未提供经验证的 owner-only DACL 与 no-reparse/no-write-delete-sharing
+handle 组合，因此 Windows attachment ingestion 与 ordinary-file capability 均以
+`file_input_unsupported` fail closed；不得把普通 NTFS mode 检查冒充上述保证。
 
 数据目录与 project root 分离。任何 Discord attachment 都不能直接写入项目根。
 数据库中的 attachment path 始终相对 data dir；CDN URL、文件内容和公开绝对本地
@@ -4175,6 +4180,11 @@ enqueue 和每次 provider start 前都执行同一 fail-closed 校验：
    期间发生 inode/size/path replacement 也视为失败；
 5. 任一文件失败则 provider 不启动；错误与 diagnostics 只含稳定 code/内部
    attachment ID，不含 display name、绝对路径、CDN URL 或文件内容。
+
+capability/catalog await 完成后、构造 SDK `MentionInput` 前执行最后一次校验，并在
+POSIX 上持有 shared descriptor lock 到 Turn terminal/stream finally/runtime close；
+retention 删除前使用 non-blocking exclusive lock。Windows 在等价 handle contract
+实现并验证前不报告 `mention.input=true`。
 
 文件 retention 与图片同为 7 天。terminal deadline 到期后删除；任何
 queued/starting/running/cancelling Turn 引用期间均保留。orphan sweep 同时覆盖

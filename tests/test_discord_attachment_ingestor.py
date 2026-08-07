@@ -17,10 +17,12 @@ import pytest
 from PIL import Image
 
 from codexd.rendering.media_worker import MediaWorker, MediaWorkerError
+from codexd.security import private_files
 from codexd.transport.discord.attachments import (
     AttachmentError,
     DiscordAttachmentIngestor,
     DiscordAttachmentIngestResult,
+    _ensure_private_directory,
 )
 
 
@@ -210,6 +212,79 @@ async def test_ordinary_document_formats_remain_opaque_files(
     assert result.files[0].display_name == filename
     assert result.files[0].canonical_path.read_bytes() == content
     ingestor.cleanup(result)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "filename",
+    (
+        "payload.exe",
+        "tool.COM",
+        "run.bat",
+        "run.cmd",
+        "setup.ps1",
+        "installer.msi",
+        "saver.scr",
+    ),
+)
+async def test_executable_extensions_are_not_preserved_in_storage_paths(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    content = b"opaque executable-looking bytes"
+    ingestor = _ingestor(
+        tmp_path,
+        _FakeSession(_FakeResponse(chunks=(content,))),
+    )
+
+    result = await ingestor.ingest(
+        [_attachment(content, filename=filename, content_type="application/octet-stream")]
+    )
+
+    assert result.files[0].display_name == filename
+    assert result.files[0].canonical_path.suffix == ""
+    uuid.UUID(result.files[0].canonical_path.name)
+    ingestor.cleanup(result)
+
+
+@pytest.mark.asyncio
+async def test_broadcast_mention_before_cjk_is_sanitized(tmp_path: Path) -> None:
+    content = b"ordinary"
+    ingestor = _ingestor(
+        tmp_path,
+        _FakeSession(_FakeResponse(chunks=(content,))),
+    )
+
+    result = await ingestor.ingest(
+        [_attachment(content, filename="@everyone资料.txt", content_type="text/plain")]
+    )
+
+    assert "@everyone" not in result.files[0].display_name.casefold()
+    ingestor.cleanup(result)
+
+
+def test_windows_private_storage_facade_fails_closed_on_this_host(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(private_files, "_platform_name", lambda: "nt")
+
+    with pytest.raises(AttachmentError) as failure:
+        _ensure_private_directory(tmp_path / "attachments")
+
+    assert failure.value.code == "file_input_unsupported"
+    assert str(tmp_path) not in str(failure.value)
+    assert not (tmp_path / "attachments").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows semantics")
+def test_windows_attachment_storage_is_explicitly_unavailable_without_dacl_support(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(AttachmentError) as failure:
+        _ensure_private_directory(tmp_path / "attachments")
+
+    assert failure.value.code == "file_input_unsupported"
 
 
 @pytest.mark.asyncio

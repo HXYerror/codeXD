@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import importlib
 import json
 import logging
+import os
 import sqlite3
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from codexd.config import RetentionConfig
 from codexd.domain.ids import utc_now_ms
@@ -21,6 +25,10 @@ _TERMINAL_TURNS = (
     "interrupted",
 )
 logger = logging.getLogger(__name__)
+try:
+    _FCNTL: Any | None = importlib.import_module("fcntl")
+except ImportError:
+    _FCNTL = None
 
 
 @dataclass(frozen=True)
@@ -82,8 +90,14 @@ class RetentionWorker:
         while not self._stop.is_set():
             try:
                 await self.run_once()
-            except (OSError, sqlite3.Error, StorageError):
-                logger.exception("Retention cleanup failed")
+            except (OSError, sqlite3.Error, StorageError) as exc:
+                logger.error(
+                    "Retention cleanup failed",
+                    extra={
+                        "stable_code": "retention_cleanup_failed",
+                        "exception_type": type(exc).__name__,
+                    },
+                )
             with suppress(TimeoutError):
                 await asyncio.wait_for(self._stop.wait(), timeout=self._poll_seconds)
 
@@ -96,8 +110,8 @@ def run_retention(
     now_ms: int | None = None,
 ) -> RetentionResult:
     now = utc_now_ms() if now_ms is None else now_ms
-    input_paths: list[Path] = []
-    render_paths: list[Path] = []
+    input_artifacts: list[tuple[str, Path]] = []
+    render_artifacts: list[tuple[str, tuple[Path, ...]]] = []
     with store.transaction() as connection:
         attachment_rows = connection.execute(
             f"""
@@ -117,8 +131,11 @@ def run_retention(
             (now, *_TERMINAL_TURNS),
         ).fetchall()
         for row in attachment_rows:
-            input_paths.append(
-                _safe_relative_path(paths.data_dir, str(row["relative_path"]))
+            input_artifacts.append(
+                (
+                    str(row["id"]),
+                    _safe_relative_path(paths.data_dir, str(row["relative_path"])),
+                )
             )
 
         render_rows = connection.execute(
@@ -136,14 +153,13 @@ def run_retention(
             """,
             (now,),
         ).fetchall()
-        render_turn_ids: list[str] = []
         for row in render_rows:
             paths_for_plan = _render_plan_paths(
                 paths.attachments / "render",
                 str(row["plan_json"]),
             )
-            render_paths.extend(paths_for_plan)
-            render_turn_ids.append(str(row["turn_id"]))
+            turn_id = str(row["turn_id"])
+            render_artifacts.append((turn_id, paths_for_plan))
         event_cutoff = now - config.events_days * 24 * 60 * 60 * 1000
         tool_output_cutoff = now - 30 * 24 * 60 * 60 * 1000
         content_cutoff = now - 180 * 24 * 60 * 60 * 1000
@@ -463,18 +479,39 @@ def run_retention(
             "DELETE FROM audit_log WHERE occurred_at < ?",
             (content_cutoff,),
         ).rowcount
-    for path in (*input_paths, *render_paths):
-        _unlink_artifact(path)
+    removed_attachment_ids = tuple(
+        attachment_id
+        for attachment_id, path in input_artifacts
+        if _unlink_artifact(
+            path,
+            artifact_id=attachment_id,
+            artifact_kind="input_attachment",
+        )
+    )
+    removed_render_turn_ids: list[str] = []
+    for turn_id, artifact_paths in render_artifacts:
+        removed_all = True
+        for index, path in enumerate(artifact_paths):
+            removed_all = (
+                _unlink_artifact(
+                    path,
+                    artifact_id=f"{turn_id}:{index}",
+                    artifact_kind="render_attachment",
+                )
+                and removed_all
+            )
+        if removed_all:
+            removed_render_turn_ids.append(turn_id)
     with store.transaction() as connection:
-        if attachment_rows:
+        if removed_attachment_ids:
             connection.executemany(
                 "DELETE FROM attachments WHERE id = ?",
-                ((row["id"],) for row in attachment_rows),
+                ((attachment_id,) for attachment_id in removed_attachment_ids),
             )
-        if render_turn_ids:
+        if removed_render_turn_ids:
             connection.executemany(
                 "DELETE FROM discord_render_plans WHERE turn_id = ?",
-                ((turn_id,) for turn_id in render_turn_ids),
+                ((turn_id,) for turn_id in removed_render_turn_ids),
             )
     terminal_turns, linked_schedule_fires = _delete_expired_terminal_turns(
         store,
@@ -490,8 +527,8 @@ def run_retention(
         older_than_ms=now - config.logs_days * 24 * 60 * 60 * 1000,
     )
     return RetentionResult(
-        input_attachments=len(attachment_rows),
-        render_plans=len(render_turn_ids),
+        input_attachments=len(removed_attachment_ids),
+        render_plans=len(removed_render_turn_ids),
         events=events,
         event_tombstones=event_tombstones,
         terminal_turn_tombstones=terminal_turn_tombstones,
@@ -621,12 +658,53 @@ def _safe_relative_path(root: Path, value: str) -> Path:
     return candidate
 
 
-def _unlink_artifact(path: Path) -> None:
+def _unlink_artifact(
+    path: Path,
+    *,
+    artifact_id: str,
+    artifact_kind: str,
+) -> bool:
+    descriptor = -1
     try:
-        if path.is_symlink() or path.is_file():
+        if path.is_symlink():
             path.unlink()
+            return True
+        if not path.is_file():
+            return True
+        if _FCNTL is not None and hasattr(os, "O_NOFOLLOW"):
+            descriptor = os.open(
+                path,
+                os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+            )
+            _FCNTL.flock(descriptor, _FCNTL.LOCK_EX | _FCNTL.LOCK_NB)
+            opened = os.fstat(descriptor)
+            named = path.lstat()
+            if opened.st_dev != named.st_dev or opened.st_ino != named.st_ino:
+                return False
+        path.unlink()
+        return True
+    except FileNotFoundError:
+        return True
+    except BlockingIOError:
+        return False
     except OSError as exc:
-        raise StorageError(f"cannot remove expired artifact: {exc}") from exc
+        logger.warning(
+            "Retention artifact removal failed",
+            extra={
+                "stable_code": "retention_artifact_unlink_failed",
+                "artifact_id": artifact_id,
+                "artifact_kind": artifact_kind,
+                "exception_type": type(exc).__name__,
+            },
+        )
+        return False
+    finally:
+        if descriptor >= 0:
+            if _FCNTL is not None:
+                with suppress(OSError):
+                    _FCNTL.flock(descriptor, _FCNTL.LOCK_UN)
+            with suppress(OSError):
+                os.close(descriptor)
 
 
 def _remove_old_logs(path: Path, *, older_than_ms: int) -> int:
@@ -637,8 +715,13 @@ def _remove_old_logs(path: Path, *, older_than_ms: int) -> int:
             and not candidate.is_symlink()
             and int(candidate.stat().st_mtime * 1000) < older_than_ms
         ):
-            candidate.unlink()
-            removed += 1
+            artifact_id = hashlib.sha256(candidate.name.encode()).hexdigest()[:16]
+            if _unlink_artifact(
+                candidate,
+                artifact_id=artifact_id,
+                artifact_kind="log",
+            ):
+                removed += 1
     return removed
 
 
@@ -678,8 +761,15 @@ def _sweep_orphan_artifacts(
                 and candidate not in referenced
                 and int(candidate.lstat().st_mtime * 1000) < older_than_ms
             ):
-                _unlink_artifact(candidate)
-                removed += 1
+                artifact_id = hashlib.sha256(
+                    str(candidate.relative_to(root)).encode()
+                ).hexdigest()[:16]
+                if _unlink_artifact(
+                    candidate,
+                    artifact_id=artifact_id,
+                    artifact_kind="orphan_attachment",
+                ):
+                    removed += 1
     return removed
 
 
