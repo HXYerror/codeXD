@@ -76,17 +76,29 @@ def create_process_containment() -> ProcessContainment:
             ("PeakJobMemoryUsed", ctypes.c_size_t),
         ]
 
-    kernel32 = ctypes.WinDLL(  # type: ignore[attr-defined]
+    kernel32 = ctypes.WinDLL(
         "kernel32",
         use_last_error=True,
     )
+    kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
     kernel32.CreateJobObjectW.restype = ctypes.c_void_p
+    kernel32.SetInformationJobObject.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+    ]
+    kernel32.SetInformationJobObject.restype = ctypes.c_int
+    kernel32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    kernel32.AssignProcessToJobObject.restype = ctypes.c_int
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
     kernel32.GetCurrentProcess.restype = ctypes.c_void_p
     handle_value = kernel32.CreateJobObjectW(None, None)
     if not handle_value:
         raise SecurityError(
             "cannot create Windows containment Job Object: "
-            f"{ctypes.get_last_error()}"  # type: ignore[attr-defined]
+            f"{ctypes.get_last_error()}"
         )
     handle = int(handle_value)
     limits = ExtendedLimitInformation()
@@ -98,7 +110,7 @@ def create_process_containment() -> ProcessContainment:
         ctypes.sizeof(limits),
     )
     if not configured:
-        error = ctypes.get_last_error()  # type: ignore[attr-defined]
+        error = ctypes.get_last_error()
         kernel32.CloseHandle(ctypes.c_void_p(handle))
         raise SecurityError(f"cannot configure Windows Job Object: {error}")
     assigned = kernel32.AssignProcessToJobObject(
@@ -106,7 +118,7 @@ def create_process_containment() -> ProcessContainment:
         kernel32.GetCurrentProcess(),
     )
     if not assigned:
-        error = ctypes.get_last_error()  # type: ignore[attr-defined]
+        error = ctypes.get_last_error()
         kernel32.CloseHandle(ctypes.c_void_p(handle))
         raise SecurityError(
             f"cannot assign codexD to Windows Job Object: {error}"
