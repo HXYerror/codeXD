@@ -4410,7 +4410,8 @@ class Repository:
                             remote_message_seen_at, ?
                         ),
                         updated_at = ?
-                    WHERE turn_id = ? AND cleanup_state = 'active'
+                    WHERE turn_id = ?
+                      AND cleanup_state IN ('active', 'legacy_ineligible')
                     """,
                     (discord_message_id, now, now, turn_progress_id),
                 ).rowcount
@@ -4800,7 +4801,8 @@ class Repository:
                         remote_message_seen_at, ?
                     ),
                     updated_at = ?
-                WHERE turn_id = ? AND cleanup_state = 'active'
+                WHERE turn_id = ?
+                  AND cleanup_state IN ('active', 'legacy_ineligible')
                 """,
                 (message_id, now, now, turn_id),
             ).rowcount

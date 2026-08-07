@@ -985,7 +985,7 @@ def test_terminal_progress_cleanup_migration_preserves_rollout_boundary(
                 UPDATE turn_progress_views
                 SET discord_message_id = CASE turn_id
                         WHEN ? THEN 'active-legacy-remote-progress'
-                        ELSE 'terminal-legacy-remote-progress'
+                        ELSE discord_message_id
                     END,
                     state = CASE turn_id
                         WHEN ? THEN state
@@ -1015,13 +1015,17 @@ def test_terminal_progress_cleanup_migration_preserves_rollout_boundary(
                 """
                 UPDATE discord_outbox
                 SET state = 'sent', updated_at = 42
-                WHERE dedupe_key IN (?, ?)
+                WHERE dedupe_key = ?
                 """,
-                (
-                    f"turn:{active_turn.id}:progress:1",
-                    f"turn:{terminal_turn.id}:progress:1",
-                ),
+                (f"turn:{active_turn.id}:progress:1",),
             )
+        terminal_progress_row = store.query_one(
+            "SELECT id, state FROM discord_outbox WHERE dedupe_key = ?",
+            (f"turn:{terminal_turn.id}:progress:1",),
+        )
+        assert terminal_progress_row is not None
+        assert terminal_progress_row["state"] == "pending"
+        terminal_progress_id = str(terminal_progress_row["id"])
         legacy_final_id = repository.enqueue_outbox(
             destination_key="thread:300",
             operation="send",
@@ -1032,6 +1036,7 @@ def test_terminal_progress_cleanup_migration_preserves_rollout_boundary(
             },
             dedupe_key=f"turn:{terminal_turn.id}:final",
             delivery_marker=f"turn-{terminal_turn.id[:8]}-final",
+            depends_on_outbox_id=terminal_progress_id,
         )
 
         monkeypatch.setattr(sqlite_module, "_load_migrations", lambda: migrations)
@@ -1063,11 +1068,36 @@ def test_terminal_progress_cleanup_migration_preserves_rollout_boundary(
         )
         assert terminal_row is not None
         assert dict(terminal_row) == {
-            "discord_message_id": "terminal-legacy-remote-progress",
-            "remote_message_seen_at": 42,
+            "discord_message_id": None,
+            "remote_message_seen_at": None,
             "cleanup_state": "legacy_ineligible",
             "deleted_at": None,
         }
+
+        legacy_progress = repository.claim_outbox(worker_id="legacy-progress-worker")
+        assert legacy_progress is not None
+        assert legacy_progress.id == terminal_progress_id
+        repository.ack_outbox(
+            legacy_progress.id,
+            lease_owner=legacy_progress.lease_owner,
+            lease_attempt=legacy_progress.attempts,
+            discord_message_id="terminal-legacy-remote-progress",
+            turn_progress_id=terminal_turn.id,
+        )
+        delivered_terminal_row = store.query_one(
+            """
+            SELECT discord_message_id, remote_message_seen_at, cleanup_state
+            FROM turn_progress_views
+            WHERE turn_id = ?
+            """,
+            (terminal_turn.id,),
+        )
+        assert delivered_terminal_row is not None
+        assert delivered_terminal_row["discord_message_id"] == (
+            "terminal-legacy-remote-progress"
+        )
+        assert delivered_terminal_row["remote_message_seen_at"] is not None
+        assert delivered_terminal_row["cleanup_state"] == "legacy_ineligible"
 
         legacy_final = repository.claim_outbox(worker_id="legacy-final-worker")
         assert legacy_final is not None
@@ -1080,6 +1110,13 @@ def test_terminal_progress_cleanup_migration_preserves_rollout_boundary(
         assert store.query_one(
             "SELECT 1 FROM discord_outbox WHERE dedupe_key = ?",
             (f"turn:{terminal_turn.id}:progress:delete",),
+        ) is None
+        assert store.query_one(
+            """
+            SELECT 1 FROM discord_outbox
+            WHERE state IN ('pending', 'retry', 'reconciling', 'sending')
+            LIMIT 1
+            """
         ) is None
 
         repository.request_cancel(active_turn.id, origin=InterruptOrigin.USER)
