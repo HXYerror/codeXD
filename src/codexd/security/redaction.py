@@ -168,12 +168,18 @@ def safe_thread_title_summary(
     if not value.strip():
         return "图片任务" if has_image_attachment else "新任务"
     mention_stripped = _strip_discord_mentions(value)
-    redacted = redact_text(mention_stripped, project_root=project_root)
+    redacted = _redact_thread_title_source(
+        mention_stripped,
+        project_root=project_root,
+    )
     safe_summary = " ".join(_strip_discord_mentions(redacted).split())
     if not _has_visible_character(safe_summary):
         return "新任务"
     truncated = _truncate_summary(safe_summary, _THREAD_TITLE_SUMMARY_MAX_CHARS)
-    redacted_again = redact_text(truncated, project_root=project_root)
+    redacted_again = _redact_thread_title_source(
+        truncated,
+        project_root=project_root,
+    )
     bounded_again = _truncate_summary(
         " ".join(redacted_again.split()),
         _THREAD_TITLE_SUMMARY_MAX_CHARS,
@@ -241,6 +247,26 @@ def _truncate_summary(value: str, max_chars: int) -> str:
     return f"{value[: max_chars - 3].rstrip()}..."
 
 
+def _redact_thread_title_source(
+    value: str,
+    *,
+    project_root: Path | None,
+) -> str:
+    detection_view = "".join(
+        character
+        for character in value
+        if not (
+            ord(character) <= 0x1F
+            or 0x7F <= ord(character) <= 0x9F
+            or _default_ignorable(character)
+        )
+    )
+    detected = redact_text(detection_view, project_root=project_root)
+    if detected != detection_view:
+        return detected
+    return redact_text(value, project_root=project_root)
+
+
 def _strip_unsafe_unicode_controls(value: str) -> str:
     candidates = "".join(
         character
@@ -254,7 +280,7 @@ def _strip_unsafe_unicode_controls(value: str) -> str:
         for index, character in enumerate(candidates)
         if (
             not _variation_selector(character)
-            or (index > 0 and _emoji_base(candidates[index - 1]))
+            or _valid_variation_selector(candidates, index)
         )
         and (
             character != "\u200d" or _valid_emoji_joiner(candidates, index)
@@ -277,7 +303,21 @@ def _valid_emoji_joiner(value: str, index: int) -> bool:
 
 
 def _emoji_base(value: str) -> bool:
-    return unicodedata.category(value) == "So" or value in "#*0123456789"
+    return unicodedata.category(value) == "So" or value in {"↔", "〰"}
+
+
+def _valid_variation_selector(value: str, index: int) -> bool:
+    if index == 0:
+        return False
+    previous = value[index - 1]
+    if _emoji_base(previous):
+        return True
+    return (
+        value[index] == "\ufe0f"
+        and previous in "#*0123456789"
+        and index + 1 < len(value)
+        and value[index + 1] == "\u20e3"
+    )
 
 
 def _default_ignorable(value: str) -> bool:

@@ -1982,14 +1982,24 @@ def test_thread_creation_title_is_redacted_bounded_and_only_persists_safe_name(
     }
 
 
-def test_thread_creation_title_redacts_credential_completed_by_truncation(
+def test_thread_creation_title_redacts_security_detection_bypasses(
     storage_context: StorageContext,
 ) -> None:
-    boundary_credential = "ghp_" + "a" * 36
-    prefix = "x" * (68 - len(boundary_credential)) + " "
-    raw_request = prefix + boundary_credential + "zzzz"
-    assert len(prefix + boundary_credential) == 69
-    assert len(raw_request) > 72
+    line_secret = "line-split-secret"
+    tab_secret = "tab-split-secret"
+    slack_token = "xoxb-1234567890-" + "a" * 24
+    obfuscated_token = slack_token.replace("23", "2\u200d3").replace(
+        "67", "6\ufe0f7"
+    )
+    raw_root = str(storage_context.root)
+    digit_index = next(
+        index for index, character in enumerate(raw_root) if character.isdigit()
+    )
+    obfuscated_root = f"{raw_root[: digit_index + 1]}\ufe0f{raw_root[digit_index + 1:]}"
+    raw_request = (
+        f"API_\nKEY={line_secret} API_KEY+\t={tab_secret} "
+        f"{obfuscated_token} {obfuscated_root} /Us\ufe0fers/alice"
+    )
 
     storage_context.repository.request_thread_creation(
         discord_message_id="307",
@@ -2007,9 +2017,22 @@ def test_thread_creation_title_redacts_credential_completed_by_truncation(
     outbox = storage_context.repository.claim_outbox(worker_id="worker")
     assert outbox is not None
     payload = json.loads(outbox.payload_json)
-    assert boundary_credential not in payload["name"]
-    assert "ghp_" not in payload["name"]
-    assert "<redacted>" in payload["name"]
+    summary, _ = payload["name"].rsplit(" · ", 1)
+    assert summary == (
+        "API_KEY=<redacted> API_KEY+=<redacted> "
+        "<redacted> <project> <home>"
+    )
+    assert all(
+        value not in payload["name"]
+        for value in (
+            line_secret,
+            tab_secret,
+            "xoxb-",
+            raw_root,
+            obfuscated_root,
+            "/Users/alice",
+        )
+    )
     assert raw_request not in outbox.payload_json
 
 

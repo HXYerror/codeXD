@@ -395,6 +395,8 @@ def test_thread_title_summary_default_ignorables_do_not_create_or_pad_title() ->
         "repair the 👩🏽‍💻 workflow",
         "keep ☀️‍☁️ visible",
         "keep 🐈‍⬛ visible",
+        "keep ↔️ and 〰️ visible",
+        "press 1️⃣ now",
     ),
 )
 def test_thread_title_summary_preserves_structural_emoji_sequences(
@@ -410,6 +412,8 @@ def test_thread_title_summary_requires_immediate_emoji_base_after_zwj() -> None:
     assert summary == "☀☁"
     assert "\u200d" not in summary
     assert safe_thread_title_summary("A\ufe0f") == "A"
+    assert safe_thread_title_summary("1\ufe0f") == "1"
+    assert safe_thread_title_summary("1\u200d2") == "12"
 
 
 def test_thread_title_summary_removes_dangling_zwj_after_truncation() -> None:
@@ -481,6 +485,55 @@ def test_thread_title_summary_redacts_control_interleaved_secret_name() -> None:
 
 
 @pytest.mark.parametrize(
+    ("value", "expected"),
+    (
+        ("OPENAI_API_\nKEY=line-secret", "OPENAI_API_KEY=<redacted>"),
+        ("OPENAI_API_\rKEY=cr-secret", "OPENAI_API_KEY=<redacted>"),
+        ("OPENAI_API_\x85KEY=c1-secret", "OPENAI_API_KEY=<redacted>"),
+        ("OPENAI_API_KEY+\t=tab-secret", "OPENAI_API_KEY+=<redacted>"),
+        (
+            "OPENAI_API_KEY1\ufe0f=selector-secret",
+            "OPENAI_API_KEY1=<redacted>",
+        ),
+        (
+            "xoxb-12345\u200d67890-" + "a" * 24,
+            "<redacted>",
+        ),
+        (
+            "xoxb-12345\ufe0f67890-" + "a" * 24,
+            "<redacted>",
+        ),
+    ),
+)
+def test_thread_title_summary_uses_aggressive_security_detection(
+    value: str,
+    expected: str,
+) -> None:
+    assert safe_thread_title_summary(value) == expected
+
+
+def test_thread_title_summary_preserves_prose_line_boundaries() -> None:
+    assert safe_thread_title_summary("fix login\nthen add tests") == (
+        "fix login then add tests"
+    )
+
+
+def test_thread_title_summary_detects_ignorable_split_paths(tmp_path: Path) -> None:
+    project_root = tmp_path / "project12"
+    raw_root = str(project_root)
+    obfuscated_root = raw_root.replace("12", "1\u200d2")
+
+    assert safe_thread_title_summary(
+        f"inspect {obfuscated_root}/src/main.py",
+        project_root=project_root,
+    ) == "inspect <project>/src/main.py"
+    assert (
+        safe_thread_title_summary("inspect /Us\ufe0fers/alice/private")
+        == "inspect <home>/private"
+    )
+
+
+@pytest.mark.parametrize(
     "invisible",
     (
         "\u034f",
@@ -534,6 +587,13 @@ def test_thread_title_summary_preserves_short_github_token_shape() -> None:
     short_shape = "ghp_" + "a" * 35
 
     assert safe_thread_title_summary(f"review {short_shape}") == f"review {short_shape}"
+
+
+def test_thread_title_summary_redacts_credential_completed_by_truncation() -> None:
+    credential = "ghp_" + "a" * 36
+    value = "x" * 28 + " " + credential + "_tail"
+
+    assert safe_thread_title_summary(value) == "x" * 28 + " <redacted>..."
 
 
 @pytest.mark.parametrize(
