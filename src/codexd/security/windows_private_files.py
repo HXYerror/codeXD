@@ -23,6 +23,7 @@ _ERROR_INSUFFICIENT_BUFFER = 122
 _GENERIC_READ = 0x80000000
 _READ_CONTROL = 0x00020000
 _WRITE_DAC = 0x00040000
+_WRITE_OWNER = 0x00080000
 _FILE_READ_ATTRIBUTES = 0x0080
 _FILE_SHARE_READ = 0x00000001
 _FILE_SHARE_WRITE = 0x00000002
@@ -429,18 +430,13 @@ def _secure_path(path: Path, *, directory: bool) -> None:
         share = _FILE_SHARE_READ
     handle = _open_path(
         path,
-        access=_READ_CONTROL | _WRITE_DAC | _FILE_READ_ATTRIBUTES,
+        access=_READ_CONTROL | _WRITE_DAC | _WRITE_OWNER | _FILE_READ_ATTRIBUTES,
         share=share,
         directory=directory,
     )
     try:
         api = _api()
-        current = _current_user_sid(api)
-        current_sid = _sid_to_string(api, current.pointer)
-        snapshot = _security_snapshot(api, handle)
-        if snapshot.owner_sid != current_sid:
-            raise OSError("private storage owner is not the service user")
-        _apply_owner_only_dacl(api, handle, directory=directory)
+        _apply_owner_only_security(api, handle, directory=directory)
         _validate_owner_only(handle, directory=directory)
     finally:
         _close_handle(handle)
@@ -530,7 +526,7 @@ def _current_user_sid(api: _API) -> _SIDBuffer:
         api.kernel32.CloseHandle(token)
 
 
-def _apply_owner_only_dacl(api: _API, handle: int, *, directory: bool) -> None:
+def _apply_owner_only_security(api: _API, handle: int, *, directory: bool) -> None:
     current = _current_user_sid(api)
     sid_length = int(api.advapi32.GetLengthSid(ctypes.c_void_p(current.pointer)))
     if sid_length <= 0:
@@ -558,8 +554,10 @@ def _apply_owner_only_dacl(api: _API, handle: int, *, directory: bool) -> None:
         api.advapi32.SetSecurityInfo(
             wintypes.HANDLE(handle),
             _SE_FILE_OBJECT,
-            _DACL_SECURITY_INFORMATION | _PROTECTED_DACL_SECURITY_INFORMATION,
-            None,
+            _OWNER_SECURITY_INFORMATION
+            | _DACL_SECURITY_INFORMATION
+            | _PROTECTED_DACL_SECURITY_INFORMATION,
+            ctypes.c_void_p(current.pointer),
             None,
             acl,
             None,
