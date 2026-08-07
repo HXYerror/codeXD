@@ -400,13 +400,19 @@ async def test_uncertain_file_start_force_terminates_before_descriptor_close(
         os.fstat(acquired[0])
         events.append("kill")
 
+    def wait(*, timeout: float) -> int:
+        assert timeout == codex_sdk._APP_SERVER_FORCE_WAIT_TIMEOUT_SECONDS
+        os.fstat(acquired[0])
+        events.append("wait")
+        return 0
+
     class FailingThread:
         async def turn(self, *_args: object, **_kwargs: object) -> object:
             if cancelled:
                 raise asyncio.CancelledError
             raise CodexError("start failed")
 
-    process = SimpleNamespace(kill=kill)
+    process = SimpleNamespace(kill=kill, wait=wait)
     sync_client = SimpleNamespace(_proc=process)
 
     async def close() -> None:
@@ -435,7 +441,7 @@ async def test_uncertain_file_start_force_terminates_before_descriptor_close(
             config=_turn_config(tmp_path),
         )
 
-    assert events == ["client-close", "kill", "fd-close"]
+    assert events == ["client-close", "kill", "wait", "fd-close"]
     assert runtime._closed
 
 
@@ -447,7 +453,8 @@ async def test_runtime_close_force_terminates_before_descriptor_close(
     monkeypatch: pytest.MonkeyPatch,
     cancelled: bool,
 ) -> None:
-    runtime = _runtime_for_input_capture(tmp_path, _InputCaptureThread())
+    capture = _InputCaptureThread()
+    runtime = _runtime_for_input_capture(tmp_path, capture)
     file = _turn_file(tmp_path / "leased.bin", ordinal=0, display_name="leased.txt")
     await runtime.start_turn(
         local_turn_id="closing",
@@ -468,7 +475,13 @@ async def test_runtime_close_force_terminates_before_descriptor_close(
         os.fstat(descriptor)
         events.append("kill")
 
-    process = SimpleNamespace(kill=kill)
+    def wait(*, timeout: float) -> int:
+        assert timeout == codex_sdk._APP_SERVER_FORCE_WAIT_TIMEOUT_SECONDS
+        os.fstat(descriptor)
+        events.append("wait")
+        return 0
+
+    process = SimpleNamespace(kill=kill, wait=wait)
     sync_client = SimpleNamespace(_proc=process)
 
     async def close() -> None:
@@ -491,8 +504,75 @@ async def test_runtime_close_force_terminates_before_descriptor_close(
     with pytest.raises(expected):
         await runtime.close()
 
-    assert events == ["client-close", "kill", "fd-close"]
+    assert events == ["client-close", "kill", "wait", "fd-close"]
     assert runtime._file_input_leases == {}
+    assert runtime._turn_handles == {}
+    assert runtime._threads == {}
+    assert runtime._closed
+    with pytest.raises(InvariantError, match="closed"):
+        await runtime.start_turn(
+            local_turn_id="after-close",
+            thread=ThreadIdentity("thread", None, "session", None, None, "test"),
+            input=TurnInput(text="must not start"),
+            config=_turn_config(tmp_path),
+        )
+    assert len(capture.inputs) == 1
+
+
+@pytest.mark.asyncio
+async def test_runtime_force_wait_failure_retains_file_leases(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime_for_input_capture(tmp_path, _InputCaptureThread())
+    path = tmp_path / "held.bin"
+    path.write_bytes(b"held")
+    descriptor = os.open(path, os.O_RDONLY)
+    runtime._file_input_leases["turn"] = codex_sdk._FileInputLeases((descriptor,))
+    events: list[str] = []
+
+    def kill() -> None:
+        events.append("kill")
+
+    def wait(*, timeout: float) -> int:
+        assert timeout == codex_sdk._APP_SERVER_FORCE_WAIT_TIMEOUT_SECONDS
+        events.append("wait")
+        raise TimeoutError("process did not exit")
+
+    async def close() -> None:
+        raise OSError("close failed")
+
+    runtime._client = cast(
+        Any,
+        SimpleNamespace(
+            close=close,
+            _client=SimpleNamespace(
+                _sync=SimpleNamespace(
+                    _proc=SimpleNamespace(kill=kill, wait=wait),
+                )
+            ),
+        ),
+    )
+
+    with pytest.raises(OSError, match="close failed"):
+        await runtime.close()
+
+    assert events == ["kill", "wait"]
+    assert not runtime._closed
+    assert runtime._file_lease_release_blocked
+    assert runtime._file_input_leases["turn"].descriptors == (descriptor,)
+    os.fstat(descriptor)
+    with pytest.raises(InvariantError, match="termination is unconfirmed"):
+        await runtime.start_turn(
+            local_turn_id="blocked",
+            thread=ThreadIdentity("thread", None, "session", None, None, "test"),
+            input=TurnInput(text="must not start"),
+            config=_turn_config(tmp_path),
+        )
+
+    runtime._client = cast(Any, SimpleNamespace(close=AsyncMock()))
+    await runtime.close()
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
 
 
 @pytest.mark.asyncio
@@ -1831,7 +1911,9 @@ def test_interrupt_error_is_operation_specific() -> None:
 
 
 @pytest.mark.asyncio
-async def test_runtime_close_can_retry_after_client_close_failure(tmp_path: Path) -> None:
+async def test_runtime_close_finalizes_after_client_close_failure_without_process(
+    tmp_path: Path,
+) -> None:
     class RetryCloseClient:
         def __init__(self) -> None:
             self.attempts = 0
@@ -1851,11 +1933,11 @@ async def test_runtime_close_can_retry_after_client_close_failure(tmp_path: Path
 
     with pytest.raises(OSError, match="close failed"):
         await runtime.close()
-    assert not runtime._closed
+    assert runtime._closed
 
     await runtime.close()
 
-    assert client.attempts == 2
+    assert client.attempts == 1
     assert runtime._closed
 
 

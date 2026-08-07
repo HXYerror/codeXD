@@ -104,6 +104,7 @@ _THREAD_COMPACT_START_TIMEOUT_SECONDS = 30.0
 _SUBAGENT_DETAIL_TIMEOUT_SECONDS = 2.0
 _CANCELLED_STARTUP_CLEANUP_TIMEOUT_SECONDS = 30.0
 _FILE_INPUT_RUNTIME_RETIRE_TIMEOUT_SECONDS = 30.0
+_APP_SERVER_FORCE_WAIT_TIMEOUT_SECONDS = 2.0
 _NEW_THREAD_PERSISTENCE_NAME = "codexD session"
 _ARCHIVE_DIRECT_HANDLE_CONTRACT_VERIFIED = False
 _MIN_SDK_VERSION = (0, 144, 4)
@@ -235,6 +236,16 @@ def _force_terminate_app_server(
         return True
     except Exception:
         logger.exception("Could not force-terminate Codex app-server process")
+        return False
+    wait = getattr(process, "wait", None)
+    if not callable(wait):
+        return True
+    try:
+        wait(timeout=_APP_SERVER_FORCE_WAIT_TIMEOUT_SECONDS)
+    except ProcessLookupError:
+        return True
+    except Exception:
+        logger.exception("Could not confirm Codex app-server process termination")
         return False
     return True
 
@@ -886,23 +897,17 @@ class CodexSDKRuntime:
             if self._closed:
                 return
             process = _app_server_process(self._client)
-            termination_confirmed = False
             self._file_lease_release_blocked = True
             try:
                 await self._client.close()
-                termination_confirmed = True
             except BaseException:
-                termination_confirmed = _force_terminate_app_server(
+                if _force_terminate_app_server(
                     self._client,
                     process=process,
-                )
+                ):
+                    self._finalize_closed_runtime()
                 raise
-            finally:
-                if termination_confirmed:
-                    self._release_all_file_input_leases()
-            self._closed = True
-            self._turn_handles.clear()
-            self._threads.clear()
+            self._finalize_closed_runtime()
 
     async def _retire_after_uncertain_file_start(self) -> BaseException | None:
         async with self._close_lock:
@@ -924,11 +929,14 @@ class CodexSDKRuntime:
                     process=process,
                 )
             if termination_confirmed:
-                self._release_all_file_input_leases()
-                self._closed = True
-                self._turn_handles.clear()
-                self._threads.clear()
+                self._finalize_closed_runtime()
             return close_error
+
+    def _finalize_closed_runtime(self) -> None:
+        self._release_all_file_input_leases()
+        self._closed = True
+        self._turn_handles.clear()
+        self._threads.clear()
 
     async def _identity(
         self,
@@ -1011,6 +1019,8 @@ class CodexSDKRuntime:
     def _ensure_open(self) -> None:
         if self._closed:
             raise InvariantError("Codex runtime is closed")
+        if self._file_lease_release_blocked:
+            raise InvariantError("Codex runtime termination is unconfirmed")
 
 
 def _sdk_config(slot: RuntimeSlotConfig, *, generation: int) -> CodexConfig:
