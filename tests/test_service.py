@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import plistlib
+import subprocess
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -405,6 +406,25 @@ def test_windows_job_handle_remains_open_until_process_exit() -> None:
 
     kernel32.CloseHandle.assert_not_called()
     assert containment.handle == 123
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows Job Object regression")
+def test_windows_job_object_accepts_current_process_handle() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from codexd.service.containment import create_process_containment; "
+                "create_process_containment()"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_registered_windows_task_is_validated(tmp_path: Path, monkeypatch) -> None:
