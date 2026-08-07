@@ -12,3 +12,11 @@ dist/
 uv.lock
 config.toml
 codexd-data/
+
+# Local credentials (never commit these files).
+env.txt
+envtoken
+envtoken.*
+.env
+.env.*
+!.env.example
