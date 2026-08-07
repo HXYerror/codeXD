@@ -285,6 +285,7 @@ async def test_broadcast_mention_before_cjk_is_sanitized(tmp_path: Path) -> None
     ingestor.cleanup(result)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="simulates an unavailable Windows backend")
 def test_windows_private_storage_facade_fails_closed_on_this_host(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -331,6 +332,7 @@ async def test_windows_platform_facade_keeps_content_detected_image_flow(
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(os.name == "nt", reason="simulates an unavailable Windows backend")
 async def test_windows_platform_facade_rejects_opaque_file_without_artifact(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

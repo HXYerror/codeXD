@@ -1599,6 +1599,7 @@ def test_mention_capability_rejects_an_incompatible_public_constructor(
     assert codex_sdk.capability_manifest().optional["mention.input"] is False
 
 
+@pytest.mark.skipif(os.name == "nt", reason="simulates an unavailable Windows backend")
 def test_windows_file_lease_facade_disables_mention_capability(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
