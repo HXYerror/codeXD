@@ -8,7 +8,7 @@ import logging
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Literal, Protocol, overload
 
 import discord
 
@@ -466,7 +466,12 @@ class DiscordOutboxTransport:
                 "turn_progress_delete_message_id_invalid",
                 permanent=True,
             )
-        channel = await self._destination(target.destination_key)
+        channel = await self._destination(
+            target.destination_key,
+            missing_ok=True,
+        )
+        if channel is None:
+            return DeliveryResult()
         try:
             message = await channel.fetch_message(parsed_message_id)
         except discord.NotFound:
@@ -568,9 +573,28 @@ class DiscordOutboxTransport:
             return fetched
         raise DeliveryError("thread_create_identity_collision", permanent=True)
 
+    @overload
     async def _destination(
-        self, destination_key: str
-    ) -> discord.TextChannel | discord.Thread:
+        self,
+        destination_key: str,
+        *,
+        missing_ok: Literal[False] = False,
+    ) -> discord.TextChannel | discord.Thread: ...
+
+    @overload
+    async def _destination(
+        self,
+        destination_key: str,
+        *,
+        missing_ok: Literal[True],
+    ) -> discord.TextChannel | discord.Thread | None: ...
+
+    async def _destination(
+        self,
+        destination_key: str,
+        *,
+        missing_ok: bool = False,
+    ) -> discord.TextChannel | discord.Thread | None:
         kind, separator, raw_id = destination_key.partition(":")
         if not separator or kind not in {"thread", "channel"}:
             raise DeliveryError("invalid_destination_key", permanent=True)
@@ -583,6 +607,8 @@ class DiscordOutboxTransport:
             try:
                 channel = await self._client.fetch_channel(channel_id)
             except discord.HTTPException as exc:
+                if missing_ok and exc.status == 404:
+                    return None
                 raise _discord_http_error(
                     exc,
                     code="discord_destination_lookup_failed",
@@ -591,7 +617,12 @@ class DiscordOutboxTransport:
         if not isinstance(channel, (discord.TextChannel, discord.Thread)):
             raise DeliveryError("invalid_destination_type", permanent=True)
         if isinstance(channel, discord.Thread) and channel.archived and not channel.locked:
-            await channel.edit(archived=False)
+            try:
+                await channel.edit(archived=False)
+            except discord.HTTPException as exc:
+                if missing_ok and exc.status == 404:
+                    return None
+                raise
         return channel
 
     async def _deliver_final(

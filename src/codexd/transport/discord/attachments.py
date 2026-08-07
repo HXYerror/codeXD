@@ -283,12 +283,7 @@ class DiscordAttachmentIngestor:
         committed: Path | None = None
         try:
             _ensure_image_ingest_directory(inputs)
-            downloaded_result = await self._download(attachment.url, source)
-            if isinstance(downloaded_result, _DownloadedAttachment):
-                downloaded = downloaded_result
-            else:
-                # Compatibility for existing test doubles that only write the destination.
-                downloaded = await asyncio.to_thread(_measure_file, source)
+            downloaded = await self._download(attachment.url, source)
             self._record_download(downloaded.size_bytes)
             if downloaded.size_bytes != reported_size:
                 raise AttachmentError(
@@ -522,60 +517,6 @@ class DiscordAttachmentIngestor:
             budget.total_bytes += size_bytes
 
 
-class DiscordImageIngestor(DiscordAttachmentIngestor):
-    """Compatibility adapter for the existing image-only bot wiring."""
-
-    def __init__(
-        self,
-        *,
-        session: aiohttp.ClientSession,
-        media_worker: MediaWorker,
-        attachments_dir: Path,
-        max_bytes: int,
-        max_pixels: int,
-        retention_days: int,
-        max_images: int = 10,
-    ) -> None:
-        super().__init__(
-            session=session,
-            media_worker=media_worker,
-            attachments_dir=attachments_dir,
-            image_max_bytes=max_bytes,
-            image_max_pixels=max_pixels,
-            file_max_bytes=max_bytes,
-            message_max_bytes=max_bytes * max_images,
-            retention_days=retention_days,
-            max_attachment_count=max_images,
-        )
-
-    async def ingest(  # type: ignore[override]
-        self,
-        attachments: Sequence[discord.Attachment],
-    ) -> tuple[TurnImage, ...]:
-        result = await super().ingest(attachments)
-        if result.files:
-            self.cleanup(result)
-            raise AttachmentError(
-                "image decode or normalization failed",
-                code="image_decode_failed",
-            )
-        return result.images
-
-    async def _classify_attachment(
-        self,
-        *,
-        source: Path,
-        output: Path,
-    ) -> AttachmentMediaResult:
-        normalized = await self._worker.normalize_image(
-            source=source,
-            output=output,
-            max_bytes=self._image_max_bytes,
-            max_pixels=self._image_max_pixels,
-        )
-        return AttachmentMediaResult(kind="image", normalized_image=normalized)
-
-
 def _validate_cdn_url(value: str) -> None:
     try:
         parsed = urlsplit(value)
@@ -790,16 +731,6 @@ def _commit_private_file(source: Path, destination: Path) -> None:
     except OSError:
         destination.unlink(missing_ok=True)
         raise
-
-
-def _measure_file(path: Path) -> _DownloadedAttachment:
-    digest = hashlib.sha256()
-    size = 0
-    with path.open("rb") as stream:
-        while chunk := stream.read(1024 * 1024):
-            size += len(chunk)
-            digest.update(chunk)
-    return _DownloadedAttachment(size_bytes=size, sha256=digest.hexdigest())
 
 
 def _retention_deadline(retention_days: int) -> int:

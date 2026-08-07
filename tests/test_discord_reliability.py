@@ -21,7 +21,7 @@ from codexd.application.session_coordinator import ResolvedProject, SessionCoord
 from codexd.config import AppConfig, DiscordConfig, SecurityConfig, load_config
 from codexd.domain.conversations import SandboxProfile, ThreadConfig, ThreadIdentity
 from codexd.domain.ids import canonical_json, sha256_text
-from codexd.domain.turns import InterruptOrigin, TurnImage, TurnInput, TurnSource, TurnState
+from codexd.domain.turns import InterruptOrigin, TurnInput, TurnSource, TurnState
 from codexd.errors import InvariantError
 from codexd.paths import AppPaths
 from codexd.rendering.discord import (
@@ -29,7 +29,6 @@ from codexd.rendering.discord import (
     DurableDiscordRenderPlan,
     DurableRenderedAttachment,
 )
-from codexd.rendering.media_worker import NormalizedImage
 from codexd.runtime.codex_sdk import capability_manifest
 from codexd.security.signing import ComponentSigner
 from codexd.storage.progress import insert_progress_update
@@ -39,11 +38,7 @@ from codexd.storage.records import (
     RenderPlanRecord,
     TurnProgressDeleteTarget,
 )
-from codexd.transport.discord.attachments import (
-    AttachmentError,
-    DiscordAttachmentIngestResult,
-    DiscordImageIngestor,
-)
+from codexd.transport.discord.attachments import DiscordAttachmentIngestResult
 from codexd.transport.discord.bot import (
     CodexDBot,
     _bounded_response,
@@ -284,101 +279,6 @@ async def test_outbox_stops_lease_renewal_before_slow_post_ack_callback(
 
     assert await worker.drain_once()
     assert callback_completed.is_set()
-
-
-@pytest.mark.asyncio
-async def test_partial_image_ingestion_removes_completed_files(
-    tmp_path: Path,
-) -> None:
-    canonical = tmp_path / "first.png"
-    canonical.write_bytes(b"normalized")
-    image = TurnImage(
-        attachment_id="first",
-        ordinal=0,
-        canonical_path=canonical,
-        media_type="image/png",
-        source_sha256="source",
-        sha256="normalized",
-        size_bytes=10,
-        width=1,
-        height=1,
-        source_name_sanitized="first.png",
-        retention_until=1,
-    )
-    ingestor = DiscordImageIngestor(
-        session=Mock(),
-        media_worker=Mock(),
-        attachments_dir=tmp_path,
-        max_bytes=1024,
-        max_pixels=1024,
-        retention_days=1,
-    )
-    ingestor._ingest_one = AsyncMock(  # type: ignore[method-assign]
-        side_effect=(image, AttachmentError("bad second image", code="bad_image"))
-    )
-
-    with pytest.raises(AttachmentError, match="bad second image"):
-        await ingestor.ingest([Mock(), Mock()])
-
-    assert not canonical.exists()
-
-
-@pytest.mark.asyncio
-async def test_image_ingestor_decodes_webp_despite_png_filename(
-    tmp_path: Path,
-) -> None:
-    worker = Mock()
-
-    async def normalize(
-        *,
-        source: Path,
-        output: Path,
-        max_bytes: int,
-        max_pixels: int,
-    ) -> NormalizedImage:
-        assert await asyncio.to_thread(source.read_bytes) == b"webp"
-        assert (max_bytes, max_pixels) == (1024, 1024)
-        await asyncio.to_thread(output.write_bytes, b"normalized-png")
-        return NormalizedImage(
-            output_path=output,
-            media_type="image/png",
-            source_sha256="source",
-            normalized_sha256="normalized",
-            size_bytes=14,
-            width=10,
-            height=8,
-        )
-
-    worker.normalize_image = AsyncMock(side_effect=normalize)
-    ingestor = DiscordImageIngestor(
-        session=Mock(),
-        media_worker=worker,
-        attachments_dir=tmp_path,
-        max_bytes=1024,
-        max_pixels=1024,
-        retention_days=1,
-    )
-
-    async def download(_url: str, destination: Path) -> None:
-        await asyncio.to_thread(destination.write_bytes, b"webp")
-
-    ingestor._download = AsyncMock(side_effect=download)  # type: ignore[method-assign]
-    attachment = cast(
-        discord.Attachment,
-        SimpleNamespace(
-            size=4,
-            content_type="image/webp",
-            filename="image.png",
-            url="https://cdn.discordapp.com/attachments/image.png",
-        ),
-    )
-
-    (image,) = await ingestor.ingest([attachment])
-
-    assert image.media_type == "image/png"
-    assert image.source_name_sanitized == "image.png"
-    assert await asyncio.to_thread(image.canonical_path.read_bytes) == b"normalized-png"
-    ingestor.cleanup([image])
 
 
 @pytest.mark.asyncio
@@ -1621,6 +1521,160 @@ async def test_turn_progress_delete_not_found_is_idempotent_success(
 
     assert result == DeliveryResult()
     thread.fetch_message.assert_awaited_once_with(601)
+
+
+@pytest.mark.asyncio
+async def test_turn_progress_delete_missing_destination_is_idempotent_success() -> None:
+    client = Mock(spec=discord.Client)
+    client.get_channel.return_value = None
+    client.fetch_channel = AsyncMock(
+        side_effect=discord.NotFound(
+            Mock(status=404, reason="deleted"),
+            "deleted",
+        )
+    )
+    repository = Mock()
+    repository.turn_progress_delete_target.return_value = (
+        TurnProgressDeleteTarget("thread:300", "601")
+    )
+
+    result = await DiscordOutboxTransport(
+        client=client,
+        repository=repository,
+        renderer=Mock(),
+        signer=Mock(),
+    ).deliver(
+        OutboxRecord(
+            id="progress-delete-missing-destination",
+            destination_key="thread:300",
+            operation="delete",
+            payload_json=canonical_json(
+                {
+                    "kind": "turn_progress_delete",
+                    "turn_id": "turn-delete",
+                }
+            ),
+            delivery_marker="progress-delete-missing-destination",
+            state="pending",
+            attempts=1,
+            lease_owner="worker",
+        )
+    )
+
+    assert result == DeliveryResult()
+    client.fetch_channel.assert_awaited_once_with(300)
+
+
+@pytest.mark.asyncio
+async def test_turn_progress_delete_deleted_archived_thread_is_idempotent_success() -> None:
+    thread = Mock(spec=discord.Thread)
+    thread.archived = True
+    thread.locked = False
+    thread.edit = AsyncMock(
+        side_effect=discord.NotFound(
+            Mock(status=404, reason="deleted"),
+            "deleted",
+        )
+    )
+    thread.fetch_message = AsyncMock()
+    client = Mock(spec=discord.Client)
+    client.get_channel.return_value = thread
+    repository = Mock()
+    repository.turn_progress_delete_target.return_value = (
+        TurnProgressDeleteTarget("thread:300", "601")
+    )
+
+    result = await DiscordOutboxTransport(
+        client=client,
+        repository=repository,
+        renderer=Mock(),
+        signer=Mock(),
+    ).deliver(
+        OutboxRecord(
+            id="progress-delete-deleted-thread",
+            destination_key="thread:300",
+            operation="delete",
+            payload_json=canonical_json(
+                {
+                    "kind": "turn_progress_delete",
+                    "turn_id": "turn-delete",
+                }
+            ),
+            delivery_marker="progress-delete-deleted-thread",
+            state="pending",
+            attempts=1,
+            lease_owner="worker",
+        )
+    )
+
+    assert result == DeliveryResult()
+    thread.edit.assert_awaited_once_with(archived=False)
+    thread.fetch_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resolution", ("lookup", "unarchive"))
+@pytest.mark.parametrize(
+    ("status", "permanent"),
+    ((403, True), (429, False), (503, False)),
+)
+async def test_turn_progress_delete_destination_resolution_classifies_failures(
+    resolution: str,
+    status: int,
+    permanent: bool,
+) -> None:
+    response = Mock(status=status, reason="resolution failed")
+    error: discord.HTTPException
+    if status == 403:
+        error = discord.Forbidden(response, "resolution forbidden")
+    else:
+        error = discord.HTTPException(response, "resolution failed")
+    if status == 429:
+        error.retry_after = 3.5
+
+    client = Mock(spec=discord.Client)
+    if resolution == "lookup":
+        client.get_channel.return_value = None
+        client.fetch_channel = AsyncMock(side_effect=error)
+    else:
+        thread = Mock(spec=discord.Thread)
+        thread.archived = True
+        thread.locked = False
+        thread.edit = AsyncMock(side_effect=error)
+        thread.fetch_message = AsyncMock()
+        client.get_channel.return_value = thread
+    repository = Mock()
+    repository.turn_progress_delete_target.return_value = (
+        TurnProgressDeleteTarget("thread:300", "601")
+    )
+
+    with pytest.raises(DeliveryError) as raised:
+        await DiscordOutboxTransport(
+            client=client,
+            repository=repository,
+            renderer=Mock(),
+            signer=Mock(),
+        ).deliver(
+            OutboxRecord(
+                id=f"progress-delete-{resolution}-{status}",
+                destination_key="thread:300",
+                operation="delete",
+                payload_json=canonical_json(
+                    {
+                        "kind": "turn_progress_delete",
+                        "turn_id": "turn-delete",
+                    }
+                ),
+                delivery_marker="progress-delete-resolution-failure",
+                state="pending",
+                attempts=1,
+                lease_owner="worker",
+            )
+        )
+
+    assert raised.value.permanent is permanent
+    if status == 429:
+        assert raised.value.retry_after == 3.5
 
 
 @pytest.mark.asyncio
