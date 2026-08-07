@@ -11,7 +11,7 @@ import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 from codexd.bootstrap import prepare_bootstrap
 from codexd.config import AppConfig
@@ -318,7 +318,7 @@ def _install_macos(config: AppConfig, config_path: Path | None) -> Path:
             f"{validation.stderr.strip() or validation.stdout.strip()}"
         )
     os.replace(temporary, path)
-    domain = f"gui/{os.getuid()}"
+    domain = f"gui/{int(cast(Any, os).getuid())}"
     if _manager_state(["launchctl", "print", f"{domain}/{_MAC_LABEL}"]) == "loaded":
         subprocess.run(
             ["launchctl", "bootout", f"{domain}/{_MAC_LABEL}"],

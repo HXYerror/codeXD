@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import os
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -45,6 +44,7 @@ from codexd.runtime.fake import FakeCodexRuntime
 from codexd.runtime.mailbox import MailboxRegistry
 from codexd.runtime.port import StartedTurn
 from codexd.runtime.supervisor import RuntimeFactory, RuntimeSupervisor
+from codexd.security import private_files
 from codexd.storage.projectors import ProjectingEventSink
 from codexd.storage.records import TurnRecord
 from codexd.storage.schedules import ScheduleRepository
@@ -1885,17 +1885,15 @@ def _stored_turn_file(
     name: str,
 ) -> TurnFile:
     data_root = storage_context.store.path.parent
-    input_root = data_root / "attachments" / "input"
-    input_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if os.name != "nt":
-        data_root.chmod(0o700)
-        input_root.parent.chmod(0o700)
-        input_root.chmod(0o700)
+    attachments = data_root / "attachments"
+    input_root = attachments / "input"
+    private_files.ensure_private_directory(data_root)
+    private_files.ensure_private_directory(attachments)
+    private_files.ensure_private_directory(input_root)
     content = b"opaque file bytes"
     path = input_root / "runtime-test-input.bin"
     path.write_bytes(content)
-    if os.name != "nt":
-        path.chmod(0o600)
+    private_files.secure_private_file(path)
     return TurnFile(
         attachment_id="runtime-test-file",
         ordinal=0,

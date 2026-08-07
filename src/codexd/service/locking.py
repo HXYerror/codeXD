@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import importlib
 import os
 import stat
 from pathlib import Path
-from typing import BinaryIO
+from typing import Any, BinaryIO
 
 from codexd.errors import ConflictError, SecurityError
 
@@ -55,7 +56,7 @@ class InstanceLock:
 
 
 if os.name == "nt":
-    import msvcrt
+    msvcrt: Any = importlib.import_module("msvcrt")
 
     def _lock(file: BinaryIO) -> None:
         file.seek(0, os.SEEK_END)
@@ -63,14 +64,14 @@ if os.name == "nt":
             file.write(b"\0")
             file.flush()
         file.seek(0)
-        msvcrt.locking(file.fileno(), msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
+        msvcrt.locking(file.fileno(), msvcrt.LK_NBLCK, 1)
 
     def _unlock(file: BinaryIO) -> None:
         file.seek(0)
-        msvcrt.locking(file.fileno(), msvcrt.LK_UNLCK, 1)  # type: ignore[attr-defined]
+        msvcrt.locking(file.fileno(), msvcrt.LK_UNLCK, 1)
 
 else:
-    import fcntl
+    fcntl: Any = importlib.import_module("fcntl")
 
     def _lock(file: BinaryIO) -> None:
         fcntl.flock(file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)

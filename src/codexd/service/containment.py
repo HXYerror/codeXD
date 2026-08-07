@@ -43,6 +43,8 @@ def create_process_containment() -> ProcessContainment:
     if os.name != "nt":
         return ProcessContainment()
 
+    ctypes_api: Any = ctypes
+
     class BasicLimitInformation(ctypes.Structure):
         _fields_ = [
             ("PerProcessUserTimeLimit", ctypes.c_int64),
@@ -76,7 +78,7 @@ def create_process_containment() -> ProcessContainment:
             ("PeakJobMemoryUsed", ctypes.c_size_t),
         ]
 
-    kernel32 = ctypes.WinDLL(
+    kernel32 = ctypes_api.WinDLL(
         "kernel32",
         use_last_error=True,
     )
@@ -98,7 +100,7 @@ def create_process_containment() -> ProcessContainment:
     if not handle_value:
         raise SecurityError(
             "cannot create Windows containment Job Object: "
-            f"{ctypes.get_last_error()}"
+            f"{ctypes_api.get_last_error()}"
         )
     handle = int(handle_value)
     limits = ExtendedLimitInformation()
@@ -110,7 +112,7 @@ def create_process_containment() -> ProcessContainment:
         ctypes.sizeof(limits),
     )
     if not configured:
-        error = ctypes.get_last_error()
+        error = ctypes_api.get_last_error()
         kernel32.CloseHandle(ctypes.c_void_p(handle))
         raise SecurityError(f"cannot configure Windows Job Object: {error}")
     assigned = kernel32.AssignProcessToJobObject(
@@ -118,7 +120,7 @@ def create_process_containment() -> ProcessContainment:
         kernel32.GetCurrentProcess(),
     )
     if not assigned:
-        error = ctypes.get_last_error()
+        error = ctypes_api.get_last_error()
         kernel32.CloseHandle(ctypes.c_void_p(handle))
         raise SecurityError(
             f"cannot assign codexD to Windows Job Object: {error}"

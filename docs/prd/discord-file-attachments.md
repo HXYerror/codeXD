@@ -30,8 +30,9 @@ Done
    canonical path、安全 display name、reported media type、SHA-256、实际大小和
    retention deadline。图片与文件 ordinal 必须唯一并保持 Discord 顺序。
 6. 普通文件最终保存到 `attachments/input/` 的随机 UUID 路径；用户文件名不得决定
-   目录。目录 0700、文件 0600，不可执行；Windows 等价 ACL/handle contract 未验证
-   前普通文件 fail closed，但既有的有界图片规范化入口保持可用。
+   目录。POSIX 目录 0700、文件 0600 且不可执行；Windows 使用受保护的 service-user
+   owner-only DACL、no-reparse handle 和 provider-lifetime no-write/delete-sharing
+   lease。任一平台安全能力初始化失败时普通文件 fail closed。
 7. display name 清除路径语义、分隔符、控制字符和 Discord mention，限制长度并尽量
    保留安全 Unicode/CJK；可保留经过验证的短扩展名帮助工具识别。
 8. 新 migration 允许 `attachments.kind='input_file'`。数据库只保存 data-dir 相对

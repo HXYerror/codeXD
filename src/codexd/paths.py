@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from codexd.errors import SecurityError
+from codexd.security import private_files
 
 
 @dataclass(frozen=True)
@@ -53,7 +54,13 @@ class AppPaths:
         ):
             if path.is_symlink():
                 raise SecurityError(f"codexD data path must not be a symlink: {path}")
-            path.mkdir(mode=0o700, parents=True, exist_ok=True)
+            try:
+                if os.name == "nt":
+                    private_files.ensure_private_directory(path)
+                else:
+                    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+            except OSError as exc:
+                raise SecurityError("codexD data path cannot be secured") from exc
             if not stat.S_ISDIR(path.lstat().st_mode):
                 raise SecurityError(f"codexD data path is not a directory: {path}")
             if os.name != "nt":

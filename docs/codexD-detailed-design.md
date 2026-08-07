@@ -2073,11 +2073,13 @@ Windows：
 └── logs\codexd.jsonl
 ```
 
-当前版本尚未提供经验证的 owner-only DACL 与 no-reparse/no-write-delete-sharing
-handle 组合，因此 Windows ordinary-file capability 以 `file_input_unsupported`
-fail closed；不得把普通 NTFS mode 检查冒充上述保证。既有图片入口仍可在独立的
-legacy 路径中执行有界下载、内容分类与 normalized PNG commit，但该路径绝不 commit
-opaque `TurnFile`，也不宣称提供 ordinary-file 的 owner-only contract。
+Windows ordinary-file storage 使用原生 Win32 security/handle contract：目录和文件
+DACL 关闭继承，只保留当前 service-user SID 的单一 Full Control ACE；owner、DACL 和
+ACE 在落盘及每次读取前复验。所有路径组件通过 `FILE_FLAG_OPEN_REPARSE_POINT` handle
+拒绝 symlink、junction 与其他 reparse point，UNC/network path 默认拒绝。provider
+Turn 存活期间保留只允许 `FILE_SHARE_READ` 的文件 handle，因此其他 handle 不能写入或
+删除该文件；runtime 终止被确认后才释放。原生能力初始化失败时仍以
+`file_input_unsupported` fail closed，不用普通 NTFS mode 冒充 DACL 保证。
 
 数据目录与 project root 分离。任何 Discord attachment 都不能直接写入项目根。
 数据库中的 attachment path 始终相对 data dir；CDN URL、文件内容和公开绝对本地

@@ -285,6 +285,7 @@ async def test_broadcast_mention_before_cjk_is_sanitized(tmp_path: Path) -> None
     ingestor.cleanup(result)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="simulates an unavailable Windows backend")
 def test_windows_private_storage_facade_fails_closed_on_this_host(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -331,6 +332,7 @@ async def test_windows_platform_facade_keeps_content_detected_image_flow(
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(os.name == "nt", reason="simulates an unavailable Windows backend")
 async def test_windows_platform_facade_rejects_opaque_file_without_artifact(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -359,13 +361,33 @@ async def test_windows_platform_facade_rejects_opaque_file_without_artifact(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires native Windows semantics")
-def test_windows_attachment_storage_is_explicitly_unavailable_without_dacl_support(
+def test_windows_attachment_storage_enforces_owner_only_dacl(
     tmp_path: Path,
 ) -> None:
-    with pytest.raises(AttachmentError) as failure:
-        _ensure_private_directory(tmp_path / "attachments")
+    directory = tmp_path / "attachments"
+    _ensure_private_directory(directory)
 
-    assert failure.value.code == "file_input_unsupported"
+    assert private_files.private_file_security_supported()
+    private_files.validate_private_directory(directory)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows semantics")
+async def test_windows_attachment_storage_accepts_opaque_files(tmp_path: Path) -> None:
+    content = b"native Windows ordinary attachment"
+    ingestor = _ingestor(
+        tmp_path,
+        _FakeSession(_FakeResponse(chunks=(content,))),
+    )
+
+    result = await ingestor.ingest(
+        [_attachment(content, filename="notes.txt", content_type="text/plain")]
+    )
+
+    assert len(result.files) == 1
+    assert result.files[0].canonical_path.read_bytes() == content
+    private_files.validate_private_file(result.files[0].canonical_path)
+    ingestor.cleanup(result)
 
 
 @pytest.mark.asyncio
