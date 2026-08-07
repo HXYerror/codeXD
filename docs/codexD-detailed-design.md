@@ -1673,6 +1673,10 @@ Outbox 与 Turn 独立：
 - Discord 发送失败不修改 Turn terminal state；
 - 同一 progress message 的 edit 可以合并；
 - final message 不得被 progress edit 覆盖；
+- terminal progress revision 必须先于 final；只有完整 final（含多段内容、附件与
+  footer）成功并 ack `sent` 后，才创建独立的 progress delete outbox；
+- progress delete 使用 `turn:<turn_id>:progress:delete` 唯一 dedupe key，不参与
+  progress coalescing；final retry/dead letter/superseded 都不能解锁 delete；
 - 每个 destination key 保序；
 - REST rate limit 使用 Discord 返回的 retry-after；
 - dead letter 生成 incident 和 `/diagnostics` 可见记录。
@@ -1694,6 +1698,14 @@ Discord REST 与 SQLite 无法组成原子 transaction，所以 outbox 提供
 6. 无法可靠关联时允许重发，并记录 `delivery_duplicate_possible`；
 7. 已知 message ID 的 edit/delete retry 继续使用该 ID；
 8. reconciliation 可清理同 marker 的明确重复消息。
+
+Turn progress delete 是特例：payload 只允许 `kind=turn_progress_delete` 与
+`turn_id`，transport 必须从 `turn_progress_views` 读取可信的 bot message ID，禁止
+payload 携带或覆盖任意 message ID。delete 不做 marker/history reconciliation；精确
+`fetch_message` 后删除，`NotFound`（包括手工删除或 REST 成功但 ack 前崩溃）视为
+幂等成功，429/5xx 保留 retry，403 进入永久失败 diagnostics。没有 message ID 时不
+调用 Discord，直接 ack 收敛。cleanup 永远不反写 Turn terminal state，也不重发
+final。
 
 `dedupe_key` 只能保证 codexD 不生成两个不同逻辑 outbox operation，不能让
 Discord upload/send 获得服务端幂等。TableBlock 的 canonical render 只保证
@@ -1754,7 +1766,11 @@ sequenceDiagram
         OB-->>DC: send/edit progress
     end
     EP->>DB: terminal event + final projection/outbox
-    OB-->>DC: final content
+    OB-->>DC: terminal progress edit
+    OB-->>DC: full final content + attachments + footer
+    OB->>DB: ack final + enqueue progress delete atomically
+    OB-->>DC: delete exact progress message
+    OB->>DB: ack delete + clear message ID / mark deleted
 ```
 
 ### 8.14 Discord 断线
@@ -1767,7 +1783,8 @@ Discord gateway disconnect：
 - EventPump 继续写 event journal；
 - outbox 保留 pending；
 - Discord adapter 自己按 library policy 重连；
-- 重连后 worker 先发送 terminal/final，再合并无意义的过期 progress；
+- 重连后按 destination 顺序完成 in-flight progress reconciliation、terminal edit、
+  full final ack，再执行精确 progress delete；
 - gateway watchdog 只能重建 Discord client，不能重启整个 daemon。
 
 ### 8.15 Runtime crash
@@ -2458,6 +2475,28 @@ UNIQUE(turn_id, provider_event_id) WHERE provider_event_id IS NOT NULL
 | `component_nonce_hash` | 防伪造与迟到 component |
 | `created_at`, `updated_at` | UTC ms |
 
+#### `turn_progress_views`
+
+| 字段 | 说明 |
+|---|---|
+| `turn_id` | PK/FK；progress view 与 Turn 一一对应 |
+| `destination_key` | 固定为该 Turn 的 Conversation thread |
+| `discord_message_id` | nullable；只能由 progress send/edit ack 回填，delete ack 清空 |
+| `content_revision` | queued/running/cancelling/terminal 的单调 revision |
+| `state` | queued/running/cancelling/terminal |
+| `cleanup_state` | active/legacy_ineligible/delete_pending/delete_failed/deleted；非 active 禁止新 revision |
+| `deleted_at` | nullable；delete ack 或从未创建远端消息的 final ack 收敛时间 |
+| `created_at`, `updated_at` | UTC ms |
+
+final ack 只在 view 当前有远端 message 时插入一次 delete outbox；没有 message ID
+时在同一 transaction 直接标记 `deleted`，不扫描历史 Turn。delete payload 不持久化
+message ID；transport 以 cleanup outbox ID 关联并校验 view、destination、已 sent 的
+final dependency 后才取得删除目标，避免把远端用户消息 ID 变成可注入的删除目标。
+
+升级到 migration 0015 时，已经 terminal 的 Turn view 标记为 `legacy_ineligible`，
+避免迟到的旧版 final ack 删除 rollout 前的 progress；升级时仍非 terminal 的 Turn
+保持 `active`，之后正常进入 cleanup 生命周期。
+
 #### `discord_outbox`
 
 | 字段 | 说明 |
@@ -2469,7 +2508,7 @@ UNIQUE(turn_id, provider_event_id) WHERE provider_event_id IS NOT NULL
 | `depends_on_outbox_id` | nullable FK；例如 send 等待 unarchive_thread sent |
 | `payload_json` | renderer output descriptor |
 | `dedupe_key` | unique idempotency |
-| `coalesce_key` | progress edit grouping |
+| `coalesce_key` | progress edit grouping；terminal progress delete 必须为 null |
 | `delivery_marker` | 远端 reconciliation 的稳定短标识 |
 | `state` | pending/sending/reconciling/retry/sent/dead_letter/superseded |
 | `attempts`, `next_attempt_at` | retry |
@@ -2543,7 +2582,8 @@ UNIQUE(turn_id, provider_event_id) WHERE provider_event_id IS NOT NULL
 6. session clear/new/fork 的 revision 切换；
 7. runtime crash + affected Turn interrupted + notices；
 8. claim/release outbox lease；
-9. Discord REST 成功后 ack outbox + 保存 message ID；
+9. Discord REST 成功后 ack outbox + 保存 message ID；final ack 同 transaction
+   幂等创建 progress delete，delete ack 清空可信 ID 并记录 deleted state/time；
 10. startup 将所有非终态 Turn 标记 interrupted；
 11. attachment metadata + projection reference。
 12. claim due Schedule + insert Schedule Fire + advance `next_due_at`；

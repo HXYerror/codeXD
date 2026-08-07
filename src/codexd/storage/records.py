@@ -109,6 +109,12 @@ class OutboxRecord:
 
 
 @dataclass(frozen=True)
+class TurnProgressDeleteTarget:
+    destination_key: str
+    discord_message_id: str | None
+
+
+@dataclass(frozen=True)
 class RenderPlanRecord:
     turn_id: str
     source_sha256: str
