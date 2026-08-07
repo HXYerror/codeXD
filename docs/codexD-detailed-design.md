@@ -61,10 +61,11 @@ v1。
 7. **表格是渲染层对象，不是 Codex 原生事件。**
    普通回答中的 Markdown 表格由 block assembler 解析成 `TableBlock`；
    Discord 输出 PNG，并附 Markdown 原文和复制按钮，失败时回退代码块。
-8. **图片输入是 v1 Core。**
-   Discord 图片不依赖文件名或 MIME allowlist；先安全下载，在隔离 MediaWorker
-   中按内容解码并规范化为 PNG，再映射到同一 Turn 的 SDK public image input；
-   支持文本+图片、多图和 image-only，不把 CDN URL 塞进 prompt。
+8. **Discord 输入附件使用统一的 v1 管线。**
+   每个附件只下载一次并由隔离 MediaWorker 按内容分类；图片规范化后映射为 SDK
+   image input，普通文件作为受控 opaque file 映射为 `MentionInput`。文本、图片和
+   文件可混合，image-only/file-only 都合法，CDN URL、本地路径和文件内容不进入
+   prompt 或公开状态。
 9. **v1 只走官方 Python SDK。**
    不把 `codex exec --json`、TypeScript SDK、私有 app-server RPC 或
    Codex TUI slash command 当作隐藏 fallback。
@@ -409,6 +410,7 @@ claudeD 曾经出现过的 task/tool 类型：
 | background | daemon 存活期间尽力而为 | 不虚构任务恢复 |
 | 子 Agent/task 展示 | 当前 Discord thread 内默认折叠卡片 | 不为 task 新建 Discord thread |
 | 图片输入 | v1 Core，Discord 图片映射到 SDK 原生 image input | 不做 OCR、不把图片 URL 塞进文本 prompt |
+| 普通文件输入 | 受控 opaque file 映射为 `MentionInput` | 不解析、不复制到 project；能力缺失时 `file_input_unsupported` |
 | 表格 | PNG + Markdown copy source + code fallback | 兼顾可读、可复制和故障降级；不生成 CSV |
 | 执行权限 | 固定 `full_access` | 单用户私有部署的明确产品选择；不是可变 profile，每次新会话醒目标示 |
 | 审批 | `ApprovalMode.auto_review`；不做 Discord 人工审批 | v1 只用 Python SDK public mode |
@@ -429,7 +431,7 @@ v1 包括：
 - streaming 状态、文本、工具、文件变更和错误渲染；
 - Turn 列表、详情、取消和 steer；
 - `/schedule` 的本地持久定时规则与普通 Turn 触发；
-- 文本与图片组合输入；
+- 文本、图片、普通文件及其组合输入，包括 image-only/file-only；
 - model/reasoning/personality/web-search 的稳定 SDK 配置面；
 - Markdown、代码块、引用、列表和表格渲染；
 - SQLite event journal、projection 和 Discord outbox；
@@ -2797,8 +2799,9 @@ Channel mention 的不可事务化 Discord side effect 必须先走 outbox：
 
 Channel mention 入口的 canonical text 由通过 hash 校验的原 message content 生成：
 只按 Discord parsed mention spans 移除当前 bot 自己的触发 mention，不用字符串替换
-删除其他 user/role mention，也不改写剩余文本。移除后无文本但有合格图片时是合法
-image-only Turn；文本和图片都为空则 ingress `rejected/empty_input`。
+删除其他 user/role mention，也不改写剩余文本。移除后无文本但有任一合格附件时是
+合法的 image-only/file-only Turn；文本和附件都为空则 ingress
+`rejected/empty_input`。
 
 已有主会话 thread 的消息从 `pending_preflight` 开始。随后统一处理：
 
@@ -2808,7 +2811,7 @@ image-only Turn；文本和图片都为空则 ingress `rejected/empty_input`。
    `ingress_message(pending_preflight)` 和 progress outbox；
 4. 普通 message 没有 interaction defer；outbox 在主会话 thread 发送 progress；
 5. 立即预检、下载、隔离并持久化允许的 attachment；
-6. 全部 attachment 成功后，transaction 复制 canonical text/config/image
+6. 全部 attachment 成功后，transaction 复制 canonical text/config 以及 image/file
    references 为 immutable queued snapshot、创建 Turn(`queued`) 并把 ingress 标记
    `ready`；
 7. attachment 失败时 ingress `rejected`，发送错误，不创建 Turn；
@@ -3182,8 +3185,8 @@ Conversation 创建者；每次触发创建一个正常 Codex Turn，结果仍�
   misfire: latest | skip | all
 ```
 
-- Discord modal 收集较长 prompt；v1 Schedule 输入仅为文本，普通消息的图片
-  输入能力不受影响；
+- Discord modal 收集较长 prompt；v1 Schedule 输入仅为文本，普通 Discord message
+  的图片和普通文件输入能力不受影响；
 - one-shot timestamp 必须带 offset，或同时提供 timezone；
 - cron 为标准 5-field minute precision，不接受 shell、自然语言日期或秒级字段；
 - timezone 省略时使用配置的明确 IANA default，最终 fallback 为 UTC；
@@ -4176,6 +4179,13 @@ enqueue 和每次 provider start 前都执行同一 fail-closed 校验：
 文件 retention 与图片同为 7 天。terminal deadline 到期后删除；任何
 queued/starting/running/cancelling Turn 引用期间均保留。orphan sweep 同时覆盖
 input_image/input_file，并对 symlink/path escape fail closed。
+
+公开的附件失败码固定为 `too_many_attachments`、`attachment_size_limit`、
+`attachment_total_size_limit`、`attachment_download_failed`、
+`attachment_download_timeout`、`attachment_integrity_failed`、
+`image_decode_failed` 和 `file_input_unsupported`。除图片 decode 失败外，用户文案
+统一称 attachment/file，不把普通文件误称为 image；Discord status/error、普通日志
+和 diagnostics 都不得包含 CDN URL、绝对本地路径或文件内容。
 
 ### 15.4 预登记 SkillInput
 
@@ -5203,10 +5213,20 @@ Golden fixtures：
 - WebP/GIF/PNG/JPEG 等可解码图片、图片-only 和多图顺序正确映射到一个 Turn；
 - non-Discord/off-policy redirect attachment URL 被拒绝，stream byte cap 不信任
   `Content-Length`；
-- MIME/扩展名不一致仍按真实内容解码；损坏图片、decompression bomb 和非图片被拒绝；
+- MIME/扩展名不一致仍按真实内容分类；损坏或声明为图片但无法 decode 的内容拒绝，
+  明确的普通文件作为 opaque input 接受；
 - MediaWorker OOM/timeout/crash 不影响 daemon，effective env 无 secret，worker
   protocol 不接收 project path；
 - 图片下载或规范化失败时不创建 provider Turn；
+- `.txt`、`.json`、PDF 和未知 binary 的 file-only/text+files/mixed ingress 都只创建
+  一个 Turn，并按原 Discord ordinal 与图片合并；
+- attachment count/单文件/总量/download timeout/integrity 失败使用稳定错误码，整条
+  ingress 回滚并清理该消息的新 artifact；durable enqueue 后 artifact ownership
+  转交 retention，不由 transport error path 删除；
+- 普通文件 enqueue/provider-start 前的 path/symlink/type/mode/size/hash 复验失败时
+  不启动 provider Turn，错误、日志和 diagnostics 不暴露路径、URL 或内容；
+- `mention.input` 缺失时 file Turn 以 `file_input_unsupported` fail closed，文字/图片
+  Turn 与既有 image modality gate 不受影响；
 - normalized commit 后原始 EXIF/GPS quarantine 被删除；
 - `imageGeneration` symlink/path-swap/越界文件不上传；
 - queued/active Turn 引用的图片不被 retention cleanup 删除；
@@ -5543,7 +5563,8 @@ Windows：
     必须醒目标示。
 23. secret 不进入 manager config、log、incident、diagnostics。
 24. optional capability 缺失不能用 CLI/private RPC fallback。
-25. 所有输入图片完成下载、验证、规范化和持久化后才能创建 provider Turn。
+25. 所有输入附件完成单次下载、分类、验证和持久化后才能创建 provider Turn；普通
+    文件还必须在 provider start 前再次通过 durable snapshot 完整性复验。
 26. 每个 Schedule UTC occurrence 最多一个 Schedule Fire，每个 Fire 最多关联
     一个 Turn。
 27. Schedule 只 materialize 普通 Turn，不直接调用 SDK，也不自动重放

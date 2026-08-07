@@ -181,6 +181,42 @@ async def test_missing_mention_capability_fails_file_turn_before_runtime_start(
 
 
 @pytest.mark.asyncio
+async def test_changed_file_fails_with_integrity_code_before_provider_turn(
+    storage_context: StorageContext,
+) -> None:
+    fake = FakeCodexRuntime()
+
+    async def factory(_slot: object, _generation: int) -> FakeCodexRuntime:
+        return fake
+
+    supervisor = _runtime_supervisor(storage_context, factory)
+    coordinator = _turn_coordinator(storage_context, supervisor)
+    file = _stored_turn_file(storage_context, name="private.txt")
+    turn = storage_context.repository.enqueue_turn(
+        conversation_id=storage_context.conversation.id,
+        source=TurnSource.DISCORD,
+        turn_input=TurnInput(files=(file,)),
+        input_message_id="changed-file-before-provider",
+    )
+    file.canonical_path.write_bytes(b"x" * file.size_bytes)
+    try:
+        await coordinator.wake(storage_context.conversation.id)
+        terminal = await _wait_for_terminal(storage_context, turn.id)
+
+        assert terminal.state is TurnState.FAILED
+        assert terminal.terminal_code == "attachment_integrity_failed"
+        assert terminal.error_code == "attachment_integrity_failed"
+        assert terminal.provider_turn_id is None
+        assert terminal.error_message_redacted is not None
+        assert str(file.canonical_path) not in terminal.error_message_redacted
+        assert fake.started_inputs == []
+        assert file.canonical_path.exists()
+    finally:
+        await coordinator.close(drain_seconds=1)
+        await supervisor.close()
+
+
+@pytest.mark.asyncio
 async def test_unexpected_stream_end_interrupts_turn_and_retires_runtime(
     storage_context: StorageContext,
 ) -> None:

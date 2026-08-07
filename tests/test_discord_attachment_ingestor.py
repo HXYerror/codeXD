@@ -182,6 +182,38 @@ async def test_ingestor_classifies_mixed_content_and_preserves_ordinals(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("filename", "content_type", "content"),
+    (
+        ("notes.txt", "text/plain", b"plain text"),
+        ("config.json", "application/json", b'{"enabled":true}'),
+        ("brief.pdf", "application/pdf", b"%PDF-1.7\nopaque test payload"),
+        ("payload.bin", "application/octet-stream", b"\x00\x01opaque\xff"),
+    ),
+)
+async def test_ordinary_document_formats_remain_opaque_files(
+    tmp_path: Path,
+    filename: str,
+    content_type: str,
+    content: bytes,
+) -> None:
+    ingestor = _ingestor(
+        tmp_path,
+        _FakeSession(_FakeResponse(chunks=(content,))),
+    )
+
+    result = await ingestor.ingest(
+        [_attachment(content, filename=filename, content_type=content_type)]
+    )
+
+    assert result.images == ()
+    assert len(result.files) == 1
+    assert result.files[0].display_name == filename
+    assert result.files[0].canonical_path.read_bytes() == content
+    ingestor.cleanup(result)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("filename", "content_type"),
     (("broken.png", "application/octet-stream"), ("broken.bin", "image/png")),
 )
