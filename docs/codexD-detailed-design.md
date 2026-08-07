@@ -4184,9 +4184,10 @@ enqueue 和每次 provider start 前都执行同一 fail-closed 校验：
    attachment ID，不含 display name、绝对路径、CDN URL 或文件内容。
 
 capability/catalog await 完成后、构造 SDK `MentionInput` 前执行最后一次校验，并在
-POSIX 上持有 shared descriptor lock 到 Turn terminal/stream finally/runtime close；
-retention 删除前使用 non-blocking exclusive lock。Windows 在等价 handle contract
-实现并验证前不报告 `mention.input=true`。
+POSIX 上持有 shared descriptor lock 到 provider terminal 或 confirmed runtime
+termination；非 terminal stream 异常、取消或意外结束不会释放。retention 删除前使用
+non-blocking exclusive lock。Windows 在等价 handle contract 实现并验证前不报告
+`mention.input=true`。
 
 该边界明确把 same-service-UID 进程视为 trusted：descriptor lease 防御其他
 principal、retention cleanup 与遵守 lease 协议的协作 mutation；它不声称能防御已经

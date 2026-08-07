@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, Mock
 
 import openai_codex
 import pytest
+from conftest import StorageContext
 from openai_codex import (
     CodexConfig,
     CodexError,
@@ -38,6 +39,7 @@ from openai_codex.generated.v2_all import (
 from openai_codex.models import Notification, UnknownNotification
 from openai_codex.types import TurnStatus
 
+from codexd.config import RetentionConfig
 from codexd.domain.capabilities import CapabilityManifest
 from codexd.domain.conversations import (
     ApprovalPolicy,
@@ -46,8 +48,16 @@ from codexd.domain.conversations import (
     ThreadIdentity,
     TurnConfig,
 )
-from codexd.domain.turns import TurnFile, TurnImage, TurnInput, TurnSkill
+from codexd.domain.turns import (
+    TurnFile,
+    TurnImage,
+    TurnInput,
+    TurnSkill,
+    TurnSource,
+    TurnState,
+)
 from codexd.errors import AttachmentIntegrityError, InvariantError
+from codexd.paths import AppPaths
 from codexd.runtime import codex_sdk
 from codexd.runtime.codex_sdk import (
     CodexSDKRuntime,
@@ -73,6 +83,7 @@ from codexd.runtime.errors import (
 )
 from codexd.runtime.port import RuntimeSlotConfig
 from codexd.security import private_files
+from codexd.storage.retention import run_retention
 
 
 def test_official_sdk_public_contract_and_required_manifest() -> None:
@@ -261,29 +272,90 @@ async def test_runtime_file_lease_rejects_symlinked_private_parent(
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(os.name != "posix", reason="secure file leasing requires POSIX")
-async def test_runtime_holds_file_lease_until_stream_finally(tmp_path: Path) -> None:
+async def test_abnormal_stream_retains_file_lease_until_confirmed_runtime_close(
+    storage_context: StorageContext,
+) -> None:
     capture = _InputCaptureThread()
-    runtime = _runtime_for_input_capture(tmp_path, capture)
-    file = _turn_file(tmp_path / "leased.bin", ordinal=0, display_name="leased.txt")
+    runtime = _runtime_for_input_capture(storage_context.root, capture)
+    file = replace(
+        _turn_file(
+            storage_context.store.path.parent / "leased.bin",
+            ordinal=0,
+            display_name="leased.txt",
+        ),
+        retention_until=1,
+    )
+    turn = storage_context.repository.enqueue_turn(
+        conversation_id=storage_context.conversation.id,
+        source=TurnSource.DISCORD,
+        turn_input=TurnInput(files=(file,)),
+        input_message_id="abnormal-file-stream",
+    )
+    process = SimpleNamespace(exited=False)
+    process.poll = lambda: 0 if process.exited else None
+
+    async def close() -> None:
+        process.exited = True
+
+    runtime._client = cast(
+        Any,
+        SimpleNamespace(
+            close=close,
+            _client=SimpleNamespace(_sync=SimpleNamespace(_proc=process)),
+        ),
+    )
 
     started = await runtime.start_turn(
         local_turn_id="local",
         thread=ThreadIdentity("thread", None, "session", None, None, "test"),
         input=TurnInput(files=(file,)),
-        config=_turn_config(tmp_path),
+        config=_turn_config(storage_context.root),
     )
     descriptor = runtime._file_input_leases["turn"].descriptors[0]
-    os.fstat(descriptor)
-    _assert_exclusive_lock(file.canonical_path, available=False)
 
     with pytest.raises(RuntimeUnavailable, match="terminal event"):
         async for _event in started.stream:
             pass
 
+    terminal = storage_context.repository.terminal_turn(
+        turn.id,
+        target=TurnState.INTERRUPTED,
+        terminal_code="stream_ended_without_terminal",
+    )
+    assert terminal.state is TurnState.INTERRUPTED
+    assert runtime._file_input_leases["turn"].descriptors == (descriptor,)
+    assert "turn" in runtime._turn_handles
+    os.fstat(descriptor)
+    _assert_exclusive_lock(file.canonical_path, available=False)
+
+    paths = AppPaths(
+        storage_context.store.path.parent,
+        storage_context.store.path.parent / "logs",
+    )
+    retained = run_retention(
+        storage_context.store,
+        paths,
+        RetentionConfig(),
+        now_ms=1_000_000_000,
+    )
+    assert retained.input_attachments == 0
+    assert file.canonical_path.exists()
+
+    await runtime.close()
+
     assert runtime._file_input_leases == {}
+    assert runtime._turn_handles == {}
     with pytest.raises(OSError):
         os.fstat(descriptor)
     _assert_exclusive_lock(file.canonical_path, available=True)
+    removed = run_retention(
+        storage_context.store,
+        paths,
+        RetentionConfig(),
+        now_ms=1_000_000_000,
+    )
+    assert removed.input_attachments == 1
+    assert not file.canonical_path.exists()
 
 
 @pytest.mark.asyncio
@@ -529,26 +601,30 @@ async def test_runtime_force_wait_failure_retains_file_leases(
     descriptor = os.open(path, os.O_RDONLY)
     runtime._file_input_leases["turn"] = codex_sdk._FileInputLeases((descriptor,))
     events: list[str] = []
+    wait_attempts = 0
 
     def kill() -> None:
         events.append("kill")
 
     def wait(*, timeout: float) -> int:
+        nonlocal wait_attempts
         assert timeout == codex_sdk._APP_SERVER_FORCE_WAIT_TIMEOUT_SECONDS
-        events.append("wait")
-        raise TimeoutError("process did not exit")
+        wait_attempts += 1
+        events.append(f"wait-{wait_attempts}")
+        if wait_attempts == 1:
+            raise TimeoutError("process did not exit")
+        return 0
 
     async def close() -> None:
         raise OSError("close failed")
 
+    process = SimpleNamespace(kill=kill, wait=wait)
     runtime._client = cast(
         Any,
         SimpleNamespace(
             close=close,
             _client=SimpleNamespace(
-                _sync=SimpleNamespace(
-                    _proc=SimpleNamespace(kill=kill, wait=wait),
-                )
+                _sync=SimpleNamespace(_proc=process)
             ),
         ),
     )
@@ -556,9 +632,10 @@ async def test_runtime_force_wait_failure_retains_file_leases(
     with pytest.raises(OSError, match="close failed"):
         await runtime.close()
 
-    assert events == ["kill", "wait"]
+    assert events == ["kill", "wait-1"]
     assert not runtime._closed
     assert runtime._file_lease_release_blocked
+    assert runtime._file_lease_process is process
     assert runtime._file_input_leases["turn"].descriptors == (descriptor,)
     os.fstat(descriptor)
     with pytest.raises(InvariantError, match="termination is unconfirmed"):
@@ -571,6 +648,8 @@ async def test_runtime_force_wait_failure_retains_file_leases(
 
     runtime._client = cast(Any, SimpleNamespace(close=AsyncMock()))
     await runtime.close()
+    assert events == ["kill", "wait-1", "wait-2"]
+    assert runtime._file_lease_process is None
     with pytest.raises(OSError):
         os.fstat(descriptor)
 

@@ -237,15 +237,32 @@ def _force_terminate_app_server(
     except Exception:
         logger.exception("Could not force-terminate Codex app-server process")
         return False
+    if _confirm_app_server_exit(process):
+        return True
+    logger.error("Could not confirm Codex app-server process termination")
+    return False
+
+
+def _confirm_app_server_exit(process: Any | None) -> bool:
+    if process is None:
+        return True
+    poll = getattr(process, "poll", None)
+    if callable(poll):
+        try:
+            if poll() is not None:
+                return True
+        except ProcessLookupError:
+            return True
+        except Exception:
+            return False
     wait = getattr(process, "wait", None)
     if not callable(wait):
-        return True
+        return False
     try:
         wait(timeout=_APP_SERVER_FORCE_WAIT_TIMEOUT_SECONDS)
     except ProcessLookupError:
         return True
     except Exception:
-        logger.exception("Could not confirm Codex app-server process termination")
         return False
     return True
 
@@ -291,6 +308,7 @@ class CodexSDKRuntime:
         self._file_input_leases: dict[str, _FileInputLeases] = {}
         self._pending_file_input_leases: set[_FileInputLeases] = set()
         self._file_lease_release_blocked = False
+        self._file_lease_process: Any | None = None
         self._subagent_details: dict[str, dict[str, str]] = {}
         self._closed = False
         self._close_lock = asyncio.Lock()
@@ -642,6 +660,7 @@ class CodexSDKRuntime:
             )
             if leases.descriptors:
                 self._pending_file_input_leases.add(leases)
+                self._remember_app_server_process()
             provider_start_attempted = True
             handle = await handle_thread.turn(
                 wire_input,
@@ -742,10 +761,14 @@ class CodexSDKRuntime:
                         "turn.failed",
                         "turn.interrupted",
                     }
-                    if unknown_terminal or event.kind == "turn.terminal_unparseable":
-                        self._release_file_input_lease(handle.id)
-                    elif terminal_event:
+                    provider_terminal = (
+                        unknown_terminal
+                        or event.kind == "turn.terminal_unparseable"
+                        or terminal_event
+                    )
+                    if provider_terminal:
                         terminal_seen = True
+                        self._turn_handles.pop(handle.id, None)
                         self._release_file_input_lease(handle.id)
                     yield event
                     if unknown_terminal or event.kind == "turn.terminal_unparseable":
@@ -764,9 +787,6 @@ class CodexSDKRuntime:
                     thread_id=thread.thread_id,
                     turn_id=handle.id,
                 ) from exc
-            finally:
-                self._turn_handles.pop(handle.id, None)
-                self._release_file_input_lease(handle.id)
             if not terminal_seen:
                 failure = AdapterFailure(
                     code="stream_ended_unexpectedly",
@@ -896,7 +916,7 @@ class CodexSDKRuntime:
         async with self._close_lock:
             if self._closed:
                 return
-            process = _app_server_process(self._client)
+            process = self._remember_app_server_process()
             self._file_lease_release_blocked = True
             try:
                 await self._client.close()
@@ -907,6 +927,11 @@ class CodexSDKRuntime:
                 ):
                     self._finalize_closed_runtime()
                 raise
+            if not _confirm_app_server_exit(process) and not _force_terminate_app_server(
+                self._client,
+                process=process,
+            ):
+                raise OSError("Codex app-server termination could not be confirmed")
             self._finalize_closed_runtime()
 
     async def _retire_after_uncertain_file_start(self) -> BaseException | None:
@@ -914,7 +939,7 @@ class CodexSDKRuntime:
             if self._closed:
                 self._release_all_file_input_leases()
                 return None
-            process = _app_server_process(self._client)
+            process = self._remember_app_server_process()
             close_error: BaseException | None = None
             termination_confirmed = False
             self._file_lease_release_blocked = True
@@ -928,12 +953,29 @@ class CodexSDKRuntime:
                     self._client,
                     process=process,
                 )
+            else:
+                termination_confirmed = _confirm_app_server_exit(process)
+                if not termination_confirmed:
+                    termination_confirmed = _force_terminate_app_server(
+                        self._client,
+                        process=process,
+                    )
+                if not termination_confirmed:
+                    close_error = OSError(
+                        "Codex app-server termination could not be confirmed"
+                    )
             if termination_confirmed:
                 self._finalize_closed_runtime()
             return close_error
 
+    def _remember_app_server_process(self) -> Any | None:
+        if self._file_lease_process is None:
+            self._file_lease_process = _app_server_process(self._client)
+        return self._file_lease_process
+
     def _finalize_closed_runtime(self) -> None:
         self._release_all_file_input_leases()
+        self._file_lease_process = None
         self._closed = True
         self._turn_handles.clear()
         self._threads.clear()
@@ -1004,6 +1046,8 @@ class CodexSDKRuntime:
         lease = self._file_input_leases.pop(provider_turn_id, None)
         if lease is not None:
             lease.close()
+        if not self._file_input_leases and not self._pending_file_input_leases:
+            self._file_lease_process = None
 
     def _release_all_file_input_leases(self) -> None:
         leases = (
