@@ -78,6 +78,14 @@ def run_doctor(
             else "guild/owner/allowed user missing"
         ),
     }
+    checks["attachment_limits"] = {
+        "state": "ok",
+        "value": (
+            f"count={config.discord.max_attachment_count}, "
+            f"file_bytes={config.discord.file_max_bytes}, "
+            f"message_bytes={config.discord.message_max_bytes}"
+        ),
+    }
     print(json.dumps(checks, ensure_ascii=False, indent=2, sort_keys=True))
     blocking = {
         name

@@ -953,6 +953,7 @@ internal invariant error，而不是让两个 task 竞争 SDK stream。
 TurnInput
   text?
   images[]
+  files[]
   skill_inputs[]
 
 TurnImage
@@ -963,6 +964,16 @@ TurnImage
   sha256
   width
   height
+
+TurnFile
+  attachment_id
+  ordinal
+  canonical_path
+  display_name
+  reported_media_type?
+  sha256
+  size_bytes
+  retention_until
 
 TurnSkill
   name
@@ -1999,6 +2010,8 @@ macOS：
 ~/Library/Application Support/codexD/
 ├── codexd.sqlite3
 ├── attachments/
+│   ├── input/             # 0700；随机 daemon-owned name，文件 0600
+│   └── .quarantine/       # 0700；未提交的临时下载
 ├── diagnostics/
 ├── health.json
 └── instance.lock
@@ -2013,6 +2026,8 @@ Windows：
 %LOCALAPPDATA%\codexD\
 ├── codexd.sqlite3
 ├── attachments\
+│   ├── input\             # service-user-only ACL
+│   └── .quarantine\       # service-user-only ACL
 ├── diagnostics\
 ├── health.json
 ├── instance.lock
@@ -2020,6 +2035,8 @@ Windows：
 ```
 
 数据目录与 project root 分离。任何 Discord attachment 都不能直接写入项目根。
+数据库中的 attachment path 始终相对 data dir；CDN URL、文件内容和公开绝对本地
+路径不进入数据库、doctor 或 diagnostics。
 
 ### 10.3 ID 与时间
 
@@ -2439,12 +2456,12 @@ UNIQUE(turn_id, provider_event_id) WHERE provider_event_id IS NOT NULL
 | `id` | PK UUID |
 | `ingress_id` | nullable FK，Turn 创建前的 attachment owner |
 | `turn_id` | nullable FK |
-| `kind` | input_image/table_md/table_png/diagnostic |
-| `ordinal` | nullable；同一 Turn 内的图片顺序 |
+| `kind` | input_image/input_file/table_md/table_csv/table_png/diagnostic |
+| `ordinal` | nullable；同一 Turn 内 input_image/input_file 全局唯一的 Discord 顺序 |
 | `relative_path` | data dir relative path |
-| `source_sha256`, `normalized_sha256` | 原始与规范化图片 integrity |
-| `size_bytes`, `mime_type`, `width`, `height` | validated metadata |
-| `source_name_sanitized` | no path traversal |
+| `source_sha256`, `normalized_sha256` | 图片的原始/规范化 integrity；opaque file 两者相同 |
+| `size_bytes`, `mime_type`, `width`, `height` | validated metadata；file 的 `mime_type` 是 nullable reported media type，dimensions 为 null |
+| `source_name_sanitized` | 图片安全 source name / 文件安全 display name；不参与本地路径生成 |
 | `retention_until` | cleanup |
 | `created_at` | UTC ms |
 
@@ -2628,7 +2645,7 @@ Schedule recovery 随后：
 | final message projection | 180 天 |
 | tool output delta | 30 天，之后做 storage compaction，仅保留 summary |
 | table source/PNG | 30 天 |
-| input attachment | 7 天 |
+| input image / ordinary file | 7 天 |
 | Schedule definition | active definition 到显式删除；delete 立即清除 prompt，只保留 tombstone/audit metadata |
 | Schedule Fire | 与关联 Turn 同期；无 Turn 的 fire 90 天 |
 | logs | 14 天滚动 |
@@ -2638,6 +2655,9 @@ Schedule recovery 随后：
 
 - 只删除 terminal Turn 的可压缩 detail；
 - 不删除 current thread revision metadata；
+- input_image/input_file 只有在 Turn terminal 且 deadline 到期后才删除；
+  queued/starting/running/cancelling 引用一律保留；
+- orphan sweep 同时把两个 input kind 的相对路径视为引用，且绝不沿 symlink 删除；
 - attachment 必须先确认无 projection/outbox 引用；
 - DB backup 前执行 WAL checkpoint；
 - 备份不包含 Codex 自己的 `$CODEX_HOME`，两者分别处理；
@@ -4062,7 +4082,8 @@ delivery 仍是 at-least-once；ack crash window 中允许同一文件重复上�
 
 ### 15.1 v1 保证
 
-v1 同时保证文本与图片输入。`turn.image_input` 是 required capability：
+v1 同时保证文本、图片与 ordinary file 输入；file-only 消息合法，混合附件按同一
+Discord ordinal 合并到一个 Turn。`turn.image_input` 是 required capability：
 受支持 SDK 组合若无法通过 release/installation image-input contract test，
 daemon `startup_failed`，Discord client 不登录。用户未登录或网络暂不可达按
 operational degraded 状态处理，不改写 capability 结论。
@@ -4073,12 +4094,8 @@ operational degraded 状态处理，不改写 capability 结论。
 image 时，图片 ingress 在
 provider 调用前拒绝并提示 `/model set`；绝不静默丢图或自动切换 model。
 
-其他 Discord attachment：
-
-- 不自动复制到 project root；
-- 不把下载 URL 直接交给 Codex；
-- 不把任意 binary 转成 prompt；
-- 提示用户将相关文件放入已绑定 project root。
+普通文件使用独立的 `mention.input` capability；能力缺失时在 provider start 前以
+`file_input_unsupported` fail closed，不得静默丢弃文件。
 
 ### 15.2 图片输入
 
@@ -4114,7 +4131,34 @@ retention cleanup 不得删除 queued/starting/running Turn 仍引用的图片�
 或 SDK 映射失败时，ingress 转 `rejected`，返回稳定错误码，不创建 provider
 Turn。
 
-### 15.3 预登记 SkillInput
+### 15.3 普通文件 durable contract
+
+普通文件是 opaque bytes；codexD 不解析、解压、执行、OCR，也不把内容、URL 或
+路径字符串拼入 prompt。最终文件只写入 `attachments/input/` 的随机名称，安全
+`display_name` 仅作为 `MentionInput.name` metadata，绝不决定目录或文件名。
+
+`TurnFile` 是 immutable snapshot，包含 attachment ID、原 ordinal、canonical
+path、安全 display name、nullable reported media type、SHA-256、实际大小和
+retention deadline。enqueue transaction 只保存 data-dir-relative path；opaque
+file 的 `source_sha256 == normalized_sha256 == TurnFile.sha256`。
+
+enqueue 和每次 provider start 前都执行同一 fail-closed 校验：
+
+1. DB path 必须是无 `.`/`..`/absolute syntax 的 data-dir-relative path，且固定在
+   `attachments/input/`；
+2. data dir 到目标的所有父目录都必须为 daemon-owned 非 symlink directory；POSIX
+   mode 为 0700；
+3. leaf 必须是 daemon-owned、0600、不可执行 regular file，且不能是 symlink；
+4. 通过 no-follow descriptor 重算实际大小与 SHA-256，并与 snapshot 比较；读文件
+   期间发生 inode/size/path replacement 也视为失败；
+5. 任一文件失败则 provider 不启动；错误与 diagnostics 只含稳定 code/内部
+   attachment ID，不含 display name、绝对路径、CDN URL 或文件内容。
+
+文件 retention 与图片同为 7 天。terminal deadline 到期后删除；任何
+queued/starting/running/cancelling Turn 引用期间均保留。orphan sweep 同时覆盖
+input_image/input_file，并对 symlink/path escape fail closed。
+
+### 15.4 预登记 SkillInput
 
 若 `skill.input=true`，owner 可在本机配置中预登记：
 
@@ -4158,6 +4202,9 @@ guild_id = "..."
 owner_user_id = "..."
 allowed_user_ids = ["..."]
 command_scope = "guild"
+max_attachment_count = 10
+file_max_bytes = 26214400
+message_max_bytes = 52428800
 
 [runtime]
 sdk_version_policy = "compatible_range"
