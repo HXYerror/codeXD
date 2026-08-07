@@ -8,6 +8,7 @@ import sys
 from collections.abc import Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, cast
 from urllib.parse import urlsplit
 
 from codexd.errors import SecurityError
@@ -136,7 +137,7 @@ def load_service_environment(path: Path) -> dict[str, str]:
             raise SecurityError("service environment must be a regular non-symlink file")
         stat = path.stat()
         if os.name != "nt" and (
-            stat.st_uid != os.getuid() or stat.st_mode & 0o077
+            stat.st_uid != _current_uid() or stat.st_mode & 0o077
         ):
             raise SecurityError("service environment ownership or mode is unsafe")
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -158,6 +159,10 @@ def load_service_environment(path: Path) -> dict[str, str]:
             raise SecurityError("service environment contains an unsafe entry")
         result[name] = value
     return result
+
+
+def _current_uid() -> int:
+    return int(cast(Any, os).getuid())
 
 
 def _validate_proxy_or_certificate(name: str, value: str) -> None:

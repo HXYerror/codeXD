@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import stat
 from pathlib import Path
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 
 
 class _WindowsBackend(Protocol):
@@ -164,7 +164,7 @@ def validate_private_directory_metadata(metadata: os.stat_result) -> None:
         raise PrivateFileSecurityUnavailable(
             "Windows private directory validation requires a path handle"
         )
-    if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != 0o700:
+    if metadata.st_uid != _current_uid() or stat.S_IMODE(metadata.st_mode) != 0o700:
         raise OSError("private directory ownership or mode is unsafe")
 
 
@@ -174,7 +174,7 @@ def validate_private_file_metadata(metadata: os.stat_result) -> None:
         raise PrivateFileSecurityUnavailable(
             "Windows private file validation requires a path handle"
         )
-    if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != 0o600:
+    if metadata.st_uid != _current_uid() or stat.S_IMODE(metadata.st_mode) != 0o600:
         raise OSError("private file ownership or mode is unsafe")
 
 
@@ -187,6 +187,10 @@ def _require_supported() -> None:
 
 def _platform_name() -> str:
     return os.name
+
+
+def _current_uid() -> int:
+    return int(cast(Any, os).getuid())
 
 
 def _windows_backend() -> _WindowsBackend:

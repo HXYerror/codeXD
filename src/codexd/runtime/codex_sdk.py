@@ -1426,7 +1426,12 @@ def _open_file_lease_descriptor(path: Path) -> int:
             deny_write_delete=True,
         )
     nofollow = getattr(os, "O_NOFOLLOW", 0)
-    directory_flags = os.O_RDONLY | os.O_DIRECTORY | nofollow | getattr(os, "O_CLOEXEC", 0)
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | nofollow
+        | getattr(os, "O_CLOEXEC", 0)
+    )
     directory_descriptor = os.open(path.anchor, directory_flags)
     try:
         for part in path.parts[1:-1]:
