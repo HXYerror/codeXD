@@ -37,6 +37,7 @@ from codexd.domain.turns import (
     assert_turn_transition,
 )
 from codexd.errors import (
+    AttachmentIntegrityError,
     ConflictError,
     InvariantError,
     NotFoundError,
@@ -2752,7 +2753,7 @@ class Repository:
                         require_private_permissions=False,
                     )
                 except _InvalidInputArtifact as exc:
-                    raise InvariantError(
+                    raise AttachmentIntegrityError(
                         "input image must be stored safely inside the codexD data "
                         f"directory and match its snapshot: {exc}"
                     ) from exc
@@ -2791,7 +2792,7 @@ class Repository:
                         require_private_permissions=True,
                     )
                 except _InvalidInputArtifact as exc:
-                    raise InvariantError(
+                    raise AttachmentIntegrityError(
                         "input file must be stored safely inside the codexD input "
                         f"attachment directory and match its snapshot: {exc}"
                     ) from exc
@@ -2931,7 +2932,7 @@ class Repository:
                     require_private_permissions=False,
                 )
             except _InvalidInputArtifact as exc:
-                raise ConflictError(
+                raise AttachmentIntegrityError(
                     f"queued image attachment is invalid ({exc}): {row['id']}"
                 ) from exc
             images.append(
@@ -2969,7 +2970,7 @@ class Repository:
                     require_private_permissions=True,
                 )
             except _InvalidInputArtifact as exc:
-                raise ConflictError(
+                raise AttachmentIntegrityError(
                     f"queued file attachment is invalid ({exc}): {row['id']}"
                 ) from exc
             media_type_raw = row["mime_type"]
@@ -2994,6 +2995,10 @@ class Repository:
             skill_inputs=tuple(skills),
         )
         if not _turn_input_hash_matches(turn_input, turn.input_hash):
+            if images or files:
+                raise AttachmentIntegrityError(
+                    "queued attachment input snapshot hash changed"
+                )
             raise ConflictError("queued Turn input snapshot hash changed")
         return turn_input
 

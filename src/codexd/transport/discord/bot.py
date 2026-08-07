@@ -28,7 +28,7 @@ from codexd.domain.capabilities import CapabilityManifest, EventCapability
 from codexd.domain.ids import canonical_json, sha256_text, utc_now_ms
 from codexd.domain.models import ModelDescriptor
 from codexd.domain.schedules import ScheduleAuditContext, ScheduleModalSubmission
-from codexd.domain.turns import TurnImage, TurnInput, TurnSource
+from codexd.domain.turns import TurnInput, TurnSource
 from codexd.errors import CodexDError, ConflictError, InvariantError, SecurityError
 from codexd.rendering.discord import (
     DiscordRenderPlanner,
@@ -50,7 +50,11 @@ from codexd.storage.records import (
 )
 from codexd.storage.repository import Repository
 from codexd.storage.schedules import ScheduleRepository
-from codexd.transport.discord.attachments import AttachmentError, DiscordImageIngestor
+from codexd.transport.discord.attachments import (
+    AttachmentError,
+    DiscordAttachmentIngestor,
+    DiscordAttachmentIngestResult,
+)
 from codexd.transport.discord.outbox import (
     DiscordOutboxTransport,
     OutboxWorker,
@@ -181,7 +185,7 @@ class CodexDBot(discord.Client):
         self._discord_status = discord_status or (lambda _status: None)
         self._codex_auth_status = codex_auth_status or (lambda _status: None)
         self._http_session: aiohttp.ClientSession | None = None
-        self._image_ingestor: DiscordImageIngestor | None = None
+        self._attachment_ingestor: DiscordAttachmentIngestor | None = None
         self._outbox: OutboxWorker | None = None
         self._command_sync_task: asyncio.Task[None] | None = None
         self._startup_recovery_task: asyncio.Task[None] | None = None
@@ -212,13 +216,16 @@ class CodexDBot(discord.Client):
 
     async def setup_hook(self) -> None:
         self._http_session = aiohttp.ClientSession()
-        self._image_ingestor = DiscordImageIngestor(
+        self._attachment_ingestor = DiscordAttachmentIngestor(
             session=self._http_session,
             media_worker=self.media_worker,
             attachments_dir=self.config.paths.attachments,
-            max_bytes=self.config.rendering.image_max_bytes,
-            max_pixels=self.config.rendering.image_max_pixels,
+            image_max_bytes=self.config.rendering.image_max_bytes,
+            image_max_pixels=self.config.rendering.image_max_pixels,
+            file_max_bytes=self.config.discord.file_max_bytes,
+            message_max_bytes=self.config.discord.message_max_bytes,
             retention_days=self.config.retention.input_attachments_days,
+            max_attachment_count=self.config.discord.max_attachment_count,
         )
         transport = DiscordOutboxTransport(
             client=self,
@@ -1065,10 +1072,10 @@ class CodexDBot(discord.Client):
                 )
                 project = resolved.project
                 content = _remove_bot_mention(message, self.user.id)
-                image_attachments = _image_attachments(message)
-                if not content.strip() and not image_attachments:
+                attachments = _message_attachments(message)
+                if not content.strip() and not attachments:
                     raise AttachmentError(
-                        "A prompt or image attachment is required.",
+                        "A prompt or attachment is required.",
                         code="empty_input",
                     )
                 await asyncio.to_thread(
@@ -1076,7 +1083,7 @@ class CodexDBot(discord.Client):
                     discord_message_id=str(message.id),
                     content_hash=sha256_text(content),
                     attachment_manifest_hash=_attachment_manifest_hash(
-                        image_attachments
+                        attachments
                     ),
                     project_id=project.id,
                     discord_guild_id=message.guild.id,
@@ -1178,10 +1185,10 @@ class CodexDBot(discord.Client):
             ):
                 raise SecurityError("initial Discord message scope changed before preflight")
             content = _remove_bot_mention(message, self.user.id)
-            image_attachments = _image_attachments(message)
+            attachments = _message_attachments(message)
             if (
                 sha256_text(content) != ingress.accepted_content_hash
-                or _attachment_manifest_hash(image_attachments)
+                or _attachment_manifest_hash(attachments)
                 != ingress.accepted_attachment_manifest_hash
             ):
                 raise ConflictError(
@@ -1242,10 +1249,10 @@ class CodexDBot(discord.Client):
         content: str,
         preclaimed: bool,
     ) -> None:
-        image_attachments = _image_attachments(message)
-        if not content.strip() and not image_attachments:
+        attachments = _message_attachments(message)
+        if not content.strip() and not attachments:
             raise AttachmentError(
-                "A prompt or image attachment is required.",
+                "A prompt or attachment is required.",
                 code="empty_input",
             )
         if not preclaimed:
@@ -1254,7 +1261,7 @@ class CodexDBot(discord.Client):
                 discord_message_id=str(message.id),
                 content_hash=sha256_text(content),
                 attachment_manifest_hash=_attachment_manifest_hash(
-                    image_attachments
+                    attachments
                 ),
                 project_id=conversation.project_id,
                 conversation_id=conversation.id,
@@ -1264,14 +1271,18 @@ class CodexDBot(discord.Client):
             )
             if not claimed:
                 return
-        assert self._image_ingestor is not None
-        images: tuple[TurnImage, ...] = ()
+        assert self._attachment_ingestor is not None
+        ingested = DiscordAttachmentIngestResult()
         try:
-            images = await self._image_ingestor.ingest(image_attachments)
+            ingested = await self._attachment_ingestor.ingest(attachments)
             await self.turns.enqueue(
                 conversation_id=conversation.id,
                 source=TurnSource.DISCORD,
-                turn_input=TurnInput(text=content, images=images),
+                turn_input=TurnInput(
+                    text=content,
+                    images=ingested.images,
+                    files=ingested.files,
+                ),
                 input_message_id=str(message.id),
                 ingress_message_id=str(message.id),
             )
@@ -1280,7 +1291,7 @@ class CodexDBot(discord.Client):
                 self.repository.get_ingress_message, str(message.id)
             )
             if ingress.state != "ready":
-                self._image_ingestor.cleanup(images)
+                self._attachment_ingestor.cleanup(ingested)
                 await asyncio.to_thread(
                     self.repository.reject_ingress_message,
                     discord_message_id=str(message.id),
@@ -3520,9 +3531,9 @@ def _remove_bot_mention(message: discord.Message, user_id: int) -> str:
     return (message.content[: match.start()] + message.content[match.end() :]).strip()
 
 
-def _image_attachments(message: discord.Message) -> list[discord.Attachment]:
-    # Discord's filename and Content-Type can disagree after client-side conversion.
-    # Treat every attachment as an image candidate and trust only bounded decode.
+def _message_attachments(message: discord.Message) -> list[discord.Attachment]:
+    # Filename and Content-Type are untrusted classification hints. The unified
+    # ingestor downloads each item once and classifies its bounded content.
     return list(message.attachments)
 
 

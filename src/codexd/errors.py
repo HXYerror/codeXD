@@ -27,6 +27,11 @@ class ConflictError(CodexDError):
     code = "conflict"
 
 
+class AttachmentIntegrityError(ConflictError, InvariantError):
+    """A durable attachment no longer matches its validated snapshot."""
+
+    code = "attachment_integrity_failed"
+
+
 class NotFoundError(CodexDError):
     code = "not_found"
-
