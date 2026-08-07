@@ -1078,6 +1078,8 @@ class CodexDBot(discord.Client):
                     attachment_manifest_hash=_attachment_manifest_hash(
                         image_attachments
                     ),
+                    first_request_text=content,
+                    has_image_attachment=bool(image_attachments),
                     project_id=project.id,
                     discord_guild_id=message.guild.id,
                     discord_channel_id=message.channel.id,

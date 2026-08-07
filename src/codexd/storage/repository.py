@@ -40,7 +40,7 @@ from codexd.errors import (
     SecurityError,
     StorageError,
 )
-from codexd.security.redaction import redacted_summary
+from codexd.security.redaction import redacted_summary, safe_thread_title_summary
 from codexd.storage.progress import (
     insert_initial_progress,
     insert_progress_update,
@@ -915,6 +915,8 @@ class Repository:
         discord_message_id: str,
         content_hash: str,
         attachment_manifest_hash: str,
+        first_request_text: str,
+        has_image_attachment: bool,
         project_id: str,
         discord_guild_id: int,
         discord_channel_id: int,
@@ -953,13 +955,21 @@ class Repository:
                 return False, str(outbox_id)
             ingress_id = new_id()
             outbox_id = new_id()
+            title_summary = safe_thread_title_summary(
+                first_request_text,
+                project_root=Path(str(project["root_path"])),
+                has_image_attachment=has_image_attachment,
+            )
+            thread_name = f"{title_summary} · {ingress_id[:4]}"
+            if not 1 <= len(thread_name) <= 100:
+                raise InvariantError("generated Discord thread name is out of bounds")
             payload = {
                 "kind": "create_thread",
                 "starter_message_id": discord_message_id,
                 "expected_thread_id": discord_message_id,
                 "project_id": project_id,
                 "owner_user_id": owner_user_id,
-                "name": f"codex-{ingress_id[:8]}",
+                "name": thread_name,
             }
             connection.execute(
                 """

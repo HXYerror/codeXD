@@ -2740,9 +2740,11 @@ Channel mention 的不可事务化 Discord side effect 必须先走 outbox：
    `discord.thread_creation_requested` event 和 `create_thread` outbox；
 2. worker **从原 mention message 创建 thread**，使 starter message 成为远端
    correlation key，而不是发起无锚点的 standalone create；初始 title 使用
-   `codex-<ingress short id>` 一类确定性安全名称，不截取 raw prompt，之后可用
-   `/session rename`；Discord 的 start-thread-from-message contract 下 expected
-   thread ID 等于 starter message ID，必须校验 response；
+   `<脱敏且最多 72 字符的首条请求摘要> · <ingress id 前 4 位>` 的本地确定性安全
+   名称，只使用经过脱敏、mention 清理和截断的 prompt，禁止使用未经脱敏、未经
+   截断的 raw prompt，之后可用 `/session rename`；Discord 的
+   start-thread-from-message contract 下 expected thread ID 等于 starter message
+   ID，必须校验 response；
 3. Discord create 成功但本地 ack 前 crash 时，reconciliation 查询该 starter
    message 的 expected thread ID/已有 thread 并回填，不能再次创建 Conversation；
 4. transaction 创建 `full_access` Conversation、回填 `conversation_id`，将
