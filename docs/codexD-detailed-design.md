@@ -247,7 +247,7 @@ codexD 只选择 Python SDK 能稳定映射的 Codex 原生动作。CLI 有但 S
 | 结构化 Item 流 | commandExecution、fileChange、plan、MCP、dynamic tool、webSearch、image generation、subagent 等 | 按正式类型自动渲染或安全降级，不要求用户先执行命令 |
 | Web search | Codex config + `webSearch` Item | Native Optional，显式 mode 与风险提示 |
 | Skills | public `SkillInput(name, path)` | 仅预登记 path 或 Codex 自发现；不造 `/skills` 管理器 |
-| 文件/资源 mention | public `MentionInput(name, path)` | API 已确认，但 Discord 安全语法未定，v1 Gated |
+| 普通文件输入 | public `MentionInput(name, path)` | 仅把已持久化并复验的受控文件交给同一 Turn；能力缺失时 `file_input_unsupported` |
 | 多 Agent 可观察性 | 正式 `collabAgentToolCall` 与 `subAgentActivity` Item | 只做当前主会话内折叠卡片；控制面 Gated |
 | 本机账号 | `account()`、API key/browser/device-code login、`logout()` | `/status` 只读 auth 状态；`codexd auth codex ...` 只允许本机运维，不进入 Discord |
 | Typed error/retry helper | public `CodexError` hierarchy、`is_retryable_error()`、同步 `retry_on_overload()` | 只给幂等 read/local CLI 做 bounded retry；不包裹 Turn/lifecycle mutation，也不在 async event loop 调同步 helper |
@@ -547,19 +547,20 @@ codexD 是单用户本机服务，但不能把“单用户”理解为“无边�
 | `usage.notification` | `/usage` provider counters | 显示 not reported，不影响 Turn |
 | `item.command_file_diff_plan` | rich tool/file/diff/plan cards | 已知类型走安全 generic card |
 | `web_search.config` | `/websearch` + `webSearch` Item | 不注册命令；沿用 provider default，并标 `uncontrolled` |
-
-`thread.set_name` 的产品 capability 只控制用户可见的 `/session rename`。如果当前
-SDK 的 non-ephemeral `thread_start` 在首个 Turn 前不会自行持久化，adapter 可以把一次
-固定内部名称写入作为 empty-Thread persistence handshake；该 fallback 必须由真实
-close/reopen/resume contract 证明，失败按 `thread.start` outcome unknown 处理，且不能
-单凭内部 handshake 绕过 capability gate 暴露 `/session rename`。
 | `skill.input` | 预登记 SkillInput | 作为普通文本输入并提示未注入 |
+| `mention.input` | 受控 ordinary file 的 `MentionInput` | 文件 Turn 在 provider start 前以 `file_input_unsupported` 失败；文字/图片 Turn 不受影响 |
 | `mcp.item` | 已配置 MCP 的自动工具卡 | 不影响无 MCP 的 Turn |
 | `dynamic_tool.item` | dynamic tool card | safe generic metadata |
 | `collab.item` | `collabAgentToolCall` / `subAgentActivity` TaskCardBlock | 不展示 agent card，不猜测 |
 | `image_generation.item` | 生成图片附件 | safe metadata fallback |
 | `account.read` | `/status` auth 摘要 | 显示 unknown，要求本机 doctor |
 | `account.auth` | 本机 `codexd auth codex login-api-key/login-chatgpt/login-device-code/logout` | 本机命令返回 unsupported；不影响已认证 runtime |
+
+`thread.set_name` 的产品 capability 只控制用户可见的 `/session rename`。如果当前
+SDK 的 non-ephemeral `thread_start` 在首个 Turn 前不会自行持久化，adapter 可以把一次
+固定内部名称写入作为 empty-Thread persistence handshake；该 fallback 必须由真实
+close/reopen/resume contract 证明，失败按 `thread.start` outcome unknown 处理，且不能
+单凭内部 handshake 绕过 capability gate 暴露 `/session rename`。
 
 Optional event capability 表示 adapter 对该公开类型有经过 fixture 验证的 parser，
 不是“启动时必须观察到一次该事件”。`not_observed` 与 `unsupported` 必须是两个
@@ -593,7 +594,6 @@ Optional event capability 表示 adapter 对该公开类型有经过 fixture 验
 | thread goal/time budget | generated/low-level protocol 有 goal 类型，`AsyncThread` 高层对象无 goal 方法 |
 | multi-agent mode | generated config 有 mode 类型，高层 API 无 typed control；不通过任意 config 猜 key |
 | realtime/remote control | generated types/notifications 存在，高层 API 无对应稳定控制面或全局 stream |
-| resource mention UX | `MentionInput(name, path)` 已公开，但 Discord 路径选择、ACL 与语法尚无 v1 设计 |
 | named permission profiles | 产品合同固定 full_access；Python SDK preset 不构成可变产品 profile |
 | command process network policy | 高层 API 没有可验证的 typed network sandbox 配置；与 web search mode 不是同一边界 |
 | realtime account rate limits | generated notification 存在，高层 API 无全局 stream |
@@ -855,6 +855,7 @@ mailbox 把 queued Turn 转为 `starting` 前，还要用幂等
   client；
 - 将 domain request 转换为 SDK 参数；
 - 将 SDK thread/turn/item 转换为 normalized event；
+- 将受信任的 `TurnFile` 映射为 public `MentionInput`，不读取文件内容或生成替代 prompt；
 - 捕获 thread ID、turn ID 和 runtime version；
 - 实现 interrupt、steer、fork、archive/unarchive 等 capability；
 - 统一 SDK exception；
@@ -1040,13 +1041,21 @@ personality，codexD 不能宣称它一定继承；desired override 在 fork 后
 `Thread.turn(personality=...)` 重新显式应用。若未来
 要使用上述字段，必须独立设计版本化语义与 contract test。
 
-`text` 与 `images` 至少一项存在。adapter 按用户附件顺序映射到 SDK public
-image input；不做 OCR，不生成替代 prompt，也不把 Discord CDN URL 传给
-Codex。图片文件至少保留到 SDK 接受输入并收到 `turn.started`，之后仍按输入
-附件 retention policy 保存，以便审计和故障诊断。
+`text`、`images` 与 `files` 至少一项存在。adapter 不做 OCR，不生成替代 prompt，
+也不把 Discord CDN URL 传给 Codex。图片文件至少保留到 SDK 接受输入并收到
+`turn.started`，之后仍按输入附件 retention policy 保存，以便审计和故障诊断。
 wire list 的 deterministic 顺序为可选 `TextInput`、按 prompt 首次出现顺序去重的
-预登记 `SkillInput`、再按 Discord ordinal 的 image inputs；同一 immutable
-snapshot/retry-free provider call 始终产生相同顺序。
+预登记 `SkillInput`、再把 image/file 按共享的 Discord ordinal 合并：`TurnImage`
+映射为 `LocalImageInput(canonical_path)`，`TurnFile` 映射为
+`MentionInput(display_name, canonical_path)`。adapter 不读取或内嵌 ordinary file
+bytes，不把 URL/path 拼入 `TextInput`；同一 immutable snapshot/retry-free provider
+call 始终产生一个相同顺序的 wire input，file-only Turn 也不补隐式文字。
+
+`TurnFile.canonical_path` 只来自 storage load 时完成 path/symlink/type/mode/size/hash
+复验的 snapshot；runtime 不接受 Discord 文本、URL 或调用者另传的路径 channel。
+`mention.input` 不为 `true` 时，coordinator 与 SDK adapter 都必须在调用
+`Thread.turn()` 前返回稳定的 `file_input_unsupported`，错误和日志不包含 display
+name 或绝对路径。ordinary file 不参与 image modality 检查。
 
 model、reasoning effort、service tier、image modality 与 personality support
 必须来自 `Codex.models()` 的当前 catalog。配置或 Schedule 触发时若选择值已不
@@ -1131,6 +1140,10 @@ SDK 对其配套 `openai-codex-cli-bin` 的依赖关系由官方 SDK 包管理�
 
 补丁版本在声明范围内默认可安装；若启动检查发现 required capability 缺失，
 仍然 fail closed。Optional capability 按实际 manifest 注册，不按版本号猜测。
+`mention.input` 当前只在 public export、`MentionInput(name, path)` constructor 与
+`{"type":"mention","name":...,"path":...}` wire serialization 均通过 contract
+test 的 SDK `0.144.4` 上报告 `true`；范围内其他 patch 保持文字/图片兼容，但文件
+Turn fail closed，直到对应 patch 加入 compatibility matrix。
 
 启动时记录：
 
@@ -1205,6 +1218,7 @@ Manifest 是 adapter 的显式输出，不通过 `hasattr` 散落判断：
     "item.command_file_diff_plan": "supported",
     "web_search.config": true,
     "skill.input": true,
+    "mention.input": true,
     "mcp.item": "supported_not_observed",
     "dynamic_tool.item": "supported_not_observed",
     "collab.item": "supported_not_observed",
@@ -1231,6 +1245,11 @@ fail-closed operational state，不能把“能解析 Python 类型”冒充图�
 `next_cursor` 非空且当前页尚未找到 image-capable model，错误是
 `model_catalog_incomplete`，不能误报为 provider 明确不支持；只有 complete
 catalog 才可报 `required_capability_unavailable`。
+
+`mention.input` 是稳定的 optional capability ID，不是对任意本机路径开放的入口。
+它只表示当前 SDK version 的 public constructor/wire contract 已验证；具体文件在
+每次 provider start 前仍须通过 storage snapshot 复验。capability 为 false/missing
+时不得删除 `MentionInput`、改成 `TextInput(path)` 或只发送同 Turn 的其余输入。
 
 ### 7.6 Runtime 配置
 
@@ -5440,7 +5459,8 @@ Windows：
 - pre-registered SkillInput；
 - passive MCP cards；
 - dynamic tool/image-generation cards；
-- `MentionInput` 仅在 Discord 安全引用 UX 另案通过后启用。
+- ordinary file `MentionInput` 已按 §15 的受控 attachment contract 启用；任意本机
+  resource picker/路径引用仍需独立 proposal。
 
 `review`、plan mode、agent control、background terminals 和 plugin management
 仍留在 Gated；没有 Python 高层 API 时不能通过 implementation phase 绕过。
@@ -5691,8 +5711,8 @@ Windows：
    Codex v1 差异化能力；
 6. archive/fork/rename/compact/personality/web search/usage/diff/SkillInput/MCP/
    dynamic tool/collab Item 与本机 Codex auth 作为 Native Optional 是否合理；
-7. review、plan/multi-agent mode、agent control、MentionInput UX 留在 Gated
-   是否合理；
+7. review、plan/multi-agent mode、agent control 与任意本机 resource mention UX
+   留在 Gated 是否合理；
 8. 新 Conversation 默认 `Sandbox.full_access + ApprovalMode.auto_review`
    是否符合预期；
 9. 子 Agent/task 默认折叠、原位更新且不创建 Discord thread 是否符合预期；

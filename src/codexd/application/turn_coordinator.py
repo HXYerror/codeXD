@@ -30,6 +30,7 @@ from codexd.runtime.errors import (
     EventJournalError,
     ProviderOutcomeUnknown,
     RuntimeUnavailable,
+    file_input_unsupported,
 )
 from codexd.runtime.event_pump import EventPump
 from codexd.runtime.mailbox import MailboxRegistry
@@ -984,6 +985,13 @@ class TurnCoordinator:
         turn: TurnRecord,
         turn_input: TurnInput,
     ) -> ModelDescriptor:
+        if turn_input.files:
+            manifest = await runtime.capabilities()
+            if manifest.optional.get("mention.input") is not True:
+                raise file_input_unsupported(
+                    generation=runtime.generation,
+                    turn_id=turn.id,
+                )
         catalog = await runtime.list_models()
         descriptor = _effective_model(catalog, turn.effective_model)
         if turn_input.images and "image" not in descriptor.input_modalities:

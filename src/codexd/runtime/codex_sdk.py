@@ -18,11 +18,13 @@ from openai_codex import (
     AsyncCodex,
     CodexConfig,
     CodexError,
+    InputItem,
     InternalRpcError,
     InvalidParamsError,
     InvalidRequestError,
     JsonRpcError,
     LocalImageInput,
+    MentionInput,
     MethodNotFoundError,
     ParseError,
     RetryLimitExceededError,
@@ -81,6 +83,7 @@ from codexd.runtime.errors import (
     ProviderRejected,
     RuntimeUnavailable,
     UnsupportedCapability,
+    file_input_unsupported,
 )
 from codexd.runtime.port import (
     CompactStartResult,
@@ -99,6 +102,7 @@ _NEW_THREAD_PERSISTENCE_NAME = "codexD session"
 _ARCHIVE_DIRECT_HANDLE_CONTRACT_VERIFIED = False
 _MIN_SDK_VERSION = (0, 144, 4)
 _MAX_SDK_VERSION = (0, 145, 0)
+_MENTION_INPUT_VERIFIED_SDK_VERSIONS = frozenset({"0.144.4"})
 logger = logging.getLogger(__name__)
 _PENDING_STARTUP_CLEANUPS: set[asyncio.Task[None]] = set()
 _COMPAT_UNKNOWN_NOTIFICATION_METHODS = frozenset(
@@ -523,15 +527,35 @@ class CodexSDKRuntime:
         input: TurnInput,
         config: TurnConfig,
     ) -> StartedTurn:
+        if input.files and self._manifest.optional.get("mention.input") is not True:
+            raise file_input_unsupported(
+                generation=self.generation,
+                thread_id=thread.thread_id,
+                turn_id=local_turn_id,
+            )
         handle_thread = self._thread(thread.thread_id)
-        wire_input: list[Any] = []
+        wire_input: list[InputItem] = []
         if input.text:
             wire_input.append(TextInput(input.text))
         wire_input.extend(
             SkillInput(skill.name, str(skill.canonical_path))
             for skill in input.skill_inputs
         )
-        wire_input.extend(LocalImageInput(str(image.canonical_path)) for image in input.images)
+        attachment_input: list[tuple[int, InputItem]] = [
+            (image.ordinal, LocalImageInput(str(image.canonical_path)))
+            for image in input.images
+        ]
+        attachment_input.extend(
+            (file.ordinal, MentionInput(file.display_name, str(file.canonical_path)))
+            for file in input.files
+        )
+        wire_input.extend(
+            item
+            for _ordinal, item in sorted(
+                attachment_input,
+                key=lambda entry: entry[0],
+            )
+        )
         try:
             handle = await handle_thread.turn(
                 wire_input,
@@ -1005,6 +1029,26 @@ def _callable_accepts(
     return callable(candidate) and parameters <= set(inspect.signature(candidate).parameters)
 
 
+def _mention_input_contract_supported(sdk_version: str) -> bool:
+    if sdk_version not in _MENTION_INPUT_VERIFIED_SDK_VERSIONS:
+        return False
+    try:
+        parameters = tuple(inspect.signature(MentionInput).parameters.values())
+        probe = MentionInput("contract-name", "contract-path")
+    except (TypeError, ValueError):
+        return False
+    return (
+        tuple(parameter.name for parameter in parameters) == ("name", "path")
+        and all(
+            parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+            and parameter.default is inspect.Parameter.empty
+            for parameter in parameters
+        )
+        and getattr(probe, "name", None) == "contract-name"
+        and getattr(probe, "path", None) == "contract-path"
+    )
+
+
 def _verify_public_contract() -> None:
     required_parameters: dict[Any, set[str]] = {
         CodexConfig: {"cwd", "env", "experimental_api"},
@@ -1167,6 +1211,7 @@ def capability_manifest(*, runtime_version: str | None = None) -> CapabilityMani
             "web_search.item": EventCapability.SUPPORTED,
             "web_search.config": True,
             "skill.input": True,
+            "mention.input": _mention_input_contract_supported(sdk_version),
             "mcp.item": EventCapability.SUPPORTED_NOT_OBSERVED,
             "dynamic_tool.item": EventCapability.SUPPORTED_NOT_OBSERVED,
             "collab.item": EventCapability.SUPPORTED_NOT_OBSERVED,

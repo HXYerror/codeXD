@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import os
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -20,10 +22,11 @@ from codexd.domain.conversations import (
 )
 from codexd.domain.events import NormalizedEvent
 from codexd.domain.ids import sha256_file
-from codexd.domain.models import AccountStatus, ModelCatalogSnapshot
+from codexd.domain.models import AccountStatus, ModelCatalogSnapshot, ModelDescriptor
 from codexd.domain.schedules import MisfirePolicy, ScheduleKind
 from codexd.domain.turns import (
     InterruptOrigin,
+    TurnFile,
     TurnIdentity,
     TurnInput,
     TurnSource,
@@ -99,6 +102,79 @@ async def test_fake_runtime_turn_is_durable_end_to_end(
         assert outbox is not None
         assert outbox["operation"] == "send"
         assert outbox["state"] == "pending"
+    finally:
+        await coordinator.close(drain_seconds=1)
+        await supervisor.close()
+
+
+@pytest.mark.asyncio
+async def test_file_only_turn_does_not_require_image_model_modality(
+    storage_context: StorageContext,
+) -> None:
+    class TextDefaultRuntime(FakeCodexRuntime):
+        async def list_models(self) -> ModelCatalogSnapshot:
+            return ModelCatalogSnapshot(
+                models=(
+                    _model("text-only", is_default=True, modalities=("text",)),
+                    _model("image-capable", is_default=False, modalities=("text", "image")),
+                ),
+                complete=True,
+                next_cursor=None,
+            )
+
+    fake = TextDefaultRuntime()
+
+    async def factory(_slot: object, _generation: int) -> FakeCodexRuntime:
+        return fake
+
+    supervisor = _runtime_supervisor(storage_context, factory)
+    coordinator = _turn_coordinator(storage_context, supervisor)
+    file = _stored_turn_file(storage_context, name="notes.txt")
+    try:
+        turn = await coordinator.enqueue(
+            conversation_id=storage_context.conversation.id,
+            source=TurnSource.DISCORD,
+            turn_input=TurnInput(files=(file,)),
+            input_message_id="file-only-text-model",
+        )
+        terminal = await _wait_for_terminal(storage_context, turn.id)
+
+        assert terminal.state is TurnState.COMPLETED
+        assert len(fake.started_inputs) == 1
+        assert fake.started_inputs[0].text is None
+        assert fake.started_inputs[0].files == (file,)
+    finally:
+        await coordinator.close(drain_seconds=1)
+        await supervisor.close()
+
+
+@pytest.mark.asyncio
+async def test_missing_mention_capability_fails_file_turn_before_runtime_start(
+    storage_context: StorageContext,
+) -> None:
+    fake = FakeCodexRuntime(mention_input_supported=False)
+
+    async def factory(_slot: object, _generation: int) -> FakeCodexRuntime:
+        return fake
+
+    supervisor = _runtime_supervisor(storage_context, factory)
+    coordinator = _turn_coordinator(storage_context, supervisor)
+    file = _stored_turn_file(storage_context, name="private.txt")
+    try:
+        turn = await coordinator.enqueue(
+            conversation_id=storage_context.conversation.id,
+            source=TurnSource.DISCORD,
+            turn_input=TurnInput(files=(file,)),
+            input_message_id="unsupported-file-input",
+        )
+        terminal = await _wait_for_terminal(storage_context, turn.id)
+
+        assert terminal.state is TurnState.FAILED
+        assert terminal.terminal_code == "file_input_unsupported"
+        assert terminal.error_code == "file_input_unsupported"
+        assert terminal.error_message_redacted is not None
+        assert str(file.canonical_path) not in terminal.error_message_redacted
+        assert fake.started_inputs == []
     finally:
         await coordinator.close(drain_seconds=1)
         await supervisor.close()
@@ -1745,6 +1821,55 @@ def _materialize_queued_schedule_turn(
     )
     assert result.turn_id is not None
     return result.turn_id
+
+
+def _model(
+    name: str,
+    *,
+    is_default: bool,
+    modalities: tuple[str, ...],
+) -> ModelDescriptor:
+    return ModelDescriptor(
+        id=name,
+        model=name,
+        is_default=is_default,
+        input_modalities=modalities,
+        supported_reasoning_efforts=("medium",),
+        default_reasoning_effort="medium",
+        supports_personality=True,
+        service_tiers=(),
+        default_service_tier=None,
+        upgrade=None,
+    )
+
+
+def _stored_turn_file(
+    storage_context: StorageContext,
+    *,
+    name: str,
+) -> TurnFile:
+    data_root = storage_context.store.path.parent
+    input_root = data_root / "attachments" / "input"
+    input_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if os.name != "nt":
+        data_root.chmod(0o700)
+        input_root.parent.chmod(0o700)
+        input_root.chmod(0o700)
+    content = b"opaque file bytes"
+    path = input_root / "runtime-test-input.bin"
+    path.write_bytes(content)
+    if os.name != "nt":
+        path.chmod(0o600)
+    return TurnFile(
+        attachment_id="runtime-test-file",
+        ordinal=0,
+        canonical_path=path.resolve(strict=True),
+        display_name=name,
+        reported_media_type="text/plain",
+        sha256=hashlib.sha256(content).hexdigest(),
+        size_bytes=len(content),
+        retention_until=9_999_999_999_999,
+    )
 
 
 def _runtime_supervisor(

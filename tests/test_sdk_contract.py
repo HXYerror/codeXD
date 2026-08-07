@@ -4,11 +4,13 @@ import asyncio
 import hashlib
 import importlib.metadata
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, Mock
 
+import openai_codex
 import pytest
 from openai_codex import (
     CodexConfig,
@@ -17,10 +19,14 @@ from openai_codex import (
     InvalidParamsError,
     InvalidRequestError,
     JsonRpcError,
+    LocalImageInput,
+    MentionInput,
     MethodNotFoundError,
     ParseError,
     RetryLimitExceededError,
     ServerBusyError,
+    SkillInput,
+    TextInput,
     TransportClosedError,
 )
 from openai_codex.generated.v2_all import (
@@ -39,7 +45,7 @@ from codexd.domain.conversations import (
     ThreadIdentity,
     TurnConfig,
 )
-from codexd.domain.turns import TurnInput
+from codexd.domain.turns import TurnFile, TurnImage, TurnInput, TurnSkill
 from codexd.errors import InvariantError
 from codexd.runtime import codex_sdk
 from codexd.runtime.codex_sdk import (
@@ -56,6 +62,7 @@ from codexd.runtime.codex_sdk import (
 from codexd.runtime.errors import (
     AdapterError,
     AdapterInvariantError,
+    FileInputUnsupported,
     InterruptFailed,
     ProviderOutcomeUnknown,
     ProviderRateLimited,
@@ -73,6 +80,145 @@ def test_official_sdk_public_contract_and_required_manifest() -> None:
     manifest.assert_required()
     assert manifest.adapter == "openai_codex"
     assert "local_path" in manifest.image_input_modes
+    assert manifest.optional["mention.input"] is (manifest.sdk_version == "0.144.4")
+
+
+@pytest.mark.asyncio
+async def test_sdk_0144_4_public_mention_constructor_and_exact_wire_contract() -> None:
+    assert openai_codex.MentionInput is MentionInput
+    assert codex_sdk._mention_input_contract_supported("0.144.4")
+    assert not codex_sdk._mention_input_contract_supported("0.144.5")
+
+    class CaptureWireClient:
+        def __init__(self) -> None:
+            self.input: list[dict[str, object]] | None = None
+
+        async def turn_start(
+            self,
+            thread_id: str,
+            input: list[dict[str, object]],
+            *,
+            params: object,
+        ) -> SimpleNamespace:
+            del params
+            assert thread_id == "thread"
+            self.input = input
+            return SimpleNamespace(turn=SimpleNamespace(id="turn"))
+
+    class CaptureCodex:
+        def __init__(self) -> None:
+            self._client = CaptureWireClient()
+
+        async def _ensure_initialized(self) -> None:
+            return None
+
+    client = CaptureCodex()
+    mention = MentionInput("资料.md", "/validated/opaque.bin")
+    handle = await openai_codex.AsyncThread(cast(Any, client), "thread").turn(mention)
+
+    assert (mention.name, mention.path) == ("资料.md", "/validated/opaque.bin")
+    assert handle.id == "turn"
+    assert client._client.input == [
+        {
+            "type": "mention",
+            "name": "资料.md",
+            "path": "/validated/opaque.bin",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runtime_maps_mixed_attachments_by_ordinal_without_prompt_downgrade(
+    tmp_path: Path,
+) -> None:
+    capture = _InputCaptureThread()
+    runtime = _runtime_for_input_capture(tmp_path, capture)
+    skill = TurnSkill("review", tmp_path / "SKILL.md", "skill-hash")
+    images = (
+        _turn_image(tmp_path / "late.png", ordinal=3, attachment_id="late-image"),
+        _turn_image(tmp_path / "middle.png", ordinal=1, attachment_id="middle-image"),
+    )
+    files = (
+        _turn_file(tmp_path / "late.bin", ordinal=2, display_name="late.pdf"),
+        _turn_file(tmp_path / "first.bin", ordinal=0, display_name="资料.txt"),
+    )
+
+    await runtime.start_turn(
+        local_turn_id="local",
+        thread=ThreadIdentity("thread", None, "session", None, None, "test"),
+        input=TurnInput(
+            text="inspect attachments",
+            images=images,
+            files=files,
+            skill_inputs=(skill,),
+        ),
+        config=_turn_config(tmp_path),
+    )
+
+    assert capture.inputs == [
+        [
+            TextInput("inspect attachments"),
+            SkillInput("review", str(tmp_path / "SKILL.md")),
+            MentionInput("资料.txt", str(tmp_path / "first.bin")),
+            LocalImageInput(str(tmp_path / "middle.png")),
+            MentionInput("late.pdf", str(tmp_path / "late.bin")),
+            LocalImageInput(str(tmp_path / "late.png")),
+        ]
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runtime_starts_file_only_turn_with_one_mention(tmp_path: Path) -> None:
+    capture = _InputCaptureThread()
+    runtime = _runtime_for_input_capture(tmp_path, capture)
+    file = _turn_file(tmp_path / "only.bin", ordinal=0, display_name="only.zip")
+
+    await runtime.start_turn(
+        local_turn_id="local",
+        thread=ThreadIdentity("thread", None, "session", None, None, "test"),
+        input=TurnInput(files=(file,)),
+        config=_turn_config(tmp_path),
+    )
+
+    assert capture.inputs == [[MentionInput("only.zip", str(file.canonical_path))]]
+
+
+@pytest.mark.asyncio
+async def test_runtime_rejects_files_before_provider_when_mention_capability_is_missing(
+    tmp_path: Path,
+) -> None:
+    capture = _InputCaptureThread()
+    manifest = _capability_manifest()
+    unsupported = replace(
+        manifest,
+        optional={**manifest.optional, "mention.input": False},
+    )
+    runtime = CodexSDKRuntime(
+        client=cast(Any, object()),
+        slot=_runtime_slot(tmp_path),
+        generation=7,
+        manifest=unsupported,
+    )
+    runtime._threads["thread"] = cast(Any, capture)
+    file = _turn_file(
+        tmp_path / "private-location.bin",
+        ordinal=0,
+        display_name="safe.txt",
+    )
+
+    with pytest.raises(FileInputUnsupported) as error:
+        await runtime.start_turn(
+            local_turn_id="local",
+            thread=ThreadIdentity("thread", None, "session", None, None, "test"),
+            input=TurnInput(files=(file,)),
+            config=_turn_config(tmp_path),
+        )
+
+    assert error.value.code == "file_input_unsupported"
+    assert error.value.failure.code == "file_input_unsupported"
+    assert not error.value.failure.retryable
+    assert str(file.canonical_path) not in error.value.failure.message
+    assert capture.inputs == []
 
 
 @pytest.mark.asyncio
@@ -966,6 +1112,19 @@ def test_in_range_patch_uses_verified_public_contract(
     assert manifest.optional["thread.compact"] is True
     assert manifest.optional["thread.archive"] is False
     assert manifest.optional["thread.unarchive"] is False
+    assert manifest.optional["mention.input"] is False
+
+
+def test_mention_capability_rejects_an_incompatible_public_constructor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class IncompatibleMentionInput:
+        def __init__(self, resource: str) -> None:
+            self.resource = resource
+
+    monkeypatch.setattr(codex_sdk, "MentionInput", IncompatibleMentionInput)
+
+    assert not codex_sdk._mention_input_contract_supported("0.144.4")
 
 
 def test_codex_home_is_propagated_and_conflicts_fail(tmp_path: Path) -> None:
@@ -1368,6 +1527,19 @@ class _NotificationThread:
         return self._handle
 
 
+class _InputCaptureThread:
+    def __init__(self) -> None:
+        self.inputs: list[list[object]] = []
+
+    async def turn(
+        self,
+        input: list[object],
+        **_kwargs: object,
+    ) -> _NotificationHandle:
+        self.inputs.append(input)
+        return _NotificationHandle(())
+
+
 class _MutationThread:
     id = "mutated-thread"
 
@@ -1457,6 +1629,20 @@ def _runtime_for_notifications(
     return runtime
 
 
+def _runtime_for_input_capture(
+    root: Path,
+    capture: _InputCaptureThread,
+) -> CodexSDKRuntime:
+    runtime = CodexSDKRuntime(
+        client=cast(Any, object()),
+        slot=_runtime_slot(root),
+        generation=1,
+        manifest=_capability_manifest(),
+    )
+    runtime._threads["thread"] = cast(Any, capture)
+    return runtime
+
+
 def _runtime_for_mutations(
     root: Path,
     client: _MutationClient,
@@ -1474,4 +1660,49 @@ def _thread_config() -> ThreadConfig:
         model=None,
         personality=None,
         sandbox=SandboxProfile.READ_ONLY,
+    )
+
+
+def _turn_config(root: Path) -> TurnConfig:
+    return TurnConfig(
+        cwd=root,
+        sandbox=SandboxProfile.READ_ONLY,
+        approval_mode=ApprovalPolicy.AUTO_REVIEW,
+    )
+
+
+def _turn_file(
+    path: Path,
+    *,
+    ordinal: int,
+    display_name: str,
+) -> TurnFile:
+    content = f"opaque:{display_name}".encode()
+    path.write_bytes(content)
+    return TurnFile(
+        attachment_id=f"file-{ordinal}",
+        ordinal=ordinal,
+        canonical_path=path.resolve(strict=True),
+        display_name=display_name,
+        reported_media_type="application/octet-stream",
+        sha256=hashlib.sha256(content).hexdigest(),
+        size_bytes=len(content),
+        retention_until=9_999_999_999_999,
+    )
+
+
+def _turn_image(path: Path, *, ordinal: int, attachment_id: str) -> TurnImage:
+    path.write_bytes(b"normalized-image")
+    return TurnImage(
+        attachment_id=attachment_id,
+        ordinal=ordinal,
+        canonical_path=path.resolve(strict=True),
+        media_type="image/png",
+        source_sha256="source-image-hash",
+        sha256="normalized-image-hash",
+        size_bytes=16,
+        width=1,
+        height=1,
+        source_name_sanitized=path.name,
+        retention_until=9_999_999_999_999,
     )
