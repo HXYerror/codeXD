@@ -25,7 +25,12 @@ from codexd.domain.ids import utc_now_ms
 from codexd.errors import SecurityError
 from codexd.observability.logging import JsonFormatter
 from codexd.paths import AppPaths
-from codexd.security.redaction import redact_diff, redact_text, redact_value
+from codexd.security.redaction import (
+    redact_diff,
+    redact_text,
+    redact_value,
+    safe_thread_title_summary,
+)
 from codexd.security.secrets import SecretStore
 from codexd.service.process import current_process_identity
 
@@ -333,6 +338,409 @@ def test_redaction_preserves_ordinary_basic_and_bearer_prose() -> None:
     assert (
         redact_text("Send bearer eyJhbGciOiJIUzI1NiJ9.payload.signature")
         == "Send bearer <redacted>"
+    )
+
+
+def test_thread_title_summary_removes_discord_mentions_and_controls() -> None:
+    summary = safe_thread_title_summary(
+        "修复\x00\n <@123> <@!234> <@&345> <#456> @everyone @HERE 登录"
+    )
+
+    assert summary == "修复 登录"
+    assert all(
+        not (ord(character) < 32 or 127 <= ord(character) <= 159)
+        for character in summary
+    )
+
+
+def test_thread_title_summary_removes_unsafe_unicode_formats() -> None:
+    assert safe_thread_title_summary("\u200b\u200c\u200d\ufeff") == "新任务"
+    assert (
+        safe_thread_title_summary("\u202efix\u2069 \u2066login\u2069")
+        == "fix login"
+    )
+
+
+def test_thread_title_summary_strips_default_ignorables_before_matching(
+    tmp_path: Path,
+) -> None:
+    project_root = tmp_path / "private-project"
+    raw_root = str(project_root)
+    midpoint = len(raw_root) // 2
+    value = (
+        "https://example.invalid/?access_to\u034fken=url-secret "
+        "Authori\u3164zation: Bearer auth-secret "
+        f"{raw_root[:midpoint]}\u115f{raw_root[midpoint:]}"
+    )
+
+    redacted = redact_text(value, project_root=project_root)
+
+    assert "url-secret" not in redacted
+    assert "auth-secret" not in redacted
+    assert raw_root not in redacted
+    assert "<project>" in redacted
+
+
+def test_thread_title_summary_default_ignorables_do_not_create_or_pad_title() -> None:
+    invisible = "\u034f\u115f\u1160\u3164\uffa0\u2800\u2066\ufe0f\U000e0100"
+
+    assert safe_thread_title_summary(invisible, has_image_attachment=True) == "新任务"
+    assert safe_thread_title_summary(invisible * 12 + "x" * 72) == "x" * 72
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        "repair the 👩‍💻 workflow",
+        "repair the 👩🏽‍💻 workflow",
+        "keep ☀️‍☁️ visible",
+        "keep 🐈‍⬛ visible",
+        "keep ↔️ and 〰️ visible",
+        "press 1️⃣ now",
+    ),
+)
+def test_thread_title_summary_preserves_structural_emoji_sequences(
+    value: str,
+) -> None:
+
+    assert safe_thread_title_summary(value) == value
+
+
+def test_thread_title_summary_requires_immediate_emoji_base_after_zwj() -> None:
+    summary = safe_thread_title_summary("☀\u200d\ufe0f☁")
+
+    assert summary == "☀☁"
+    assert "\u200d" not in summary
+    assert safe_thread_title_summary("A\ufe0f") == "A"
+    assert safe_thread_title_summary("1\ufe0f") == "1"
+    assert safe_thread_title_summary("1\u200d2") == "12"
+
+
+def test_thread_title_summary_removes_dangling_zwj_after_truncation() -> None:
+    summary = safe_thread_title_summary("x" * 67 + "👩‍💻 tail")
+
+    assert summary == "x" * 67 + "👩..."
+    assert "\u200d" not in summary
+
+
+@pytest.mark.parametrize(
+    ("value", "forbidden"),
+    (
+        ("OPENAI_API_KEY=provider-secret fix auth", "provider-secret"),
+        (
+            "Authorization: Bearer abcdefghijklmnopqrstuvwxyz fix auth",
+            "abcdefghijklmnopqrstuvwxyz",
+        ),
+        ("inspect /Users/alice/private/file.py", "/Users/alice"),
+    ),
+)
+def test_thread_title_summary_redacts_sensitive_values(
+    value: str,
+    forbidden: str,
+) -> None:
+    summary = safe_thread_title_summary(value)
+
+    assert forbidden not in summary
+    assert 1 <= len(summary) <= 72
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    (
+        ("请轮换sk-aaaaaaaaaaaaaaaaaaaa密钥", "请轮换<redacted>密钥"),
+        (
+            "请用Bearer abcdefghijklmnopqrstuvwxyz",
+            "请用Bearer <redacted>",
+        ),
+        (
+            "请用Authorization: Token authorization-secret",
+            "请用Authorization: <redacted> <redacted>",
+        ),
+        ("请用Basic dXNlcjpwYXNz登录", "请用Basic <redacted>登录"),
+        (
+            "检查aaaaaaaaaaaaaaaaaaaa.bbbbbb.cccccccccccccccccccc密钥",
+            "检查<redacted>密钥",
+        ),
+        (
+            "检查mfa.abcdefghijklmnopqrstuvwxyz密钥",
+            "检查<redacted>密钥",
+        ),
+        (
+            "请用Set-Cookie: theme=private-value",
+            "请用Set-Cookie: <redacted>",
+        ),
+        ("检查/Users/alice/private", "检查<home>/private"),
+        ("检查/home/alice/private", "检查<home>/private"),
+        (r"检查C:\Users\alice\private", r"检查<home>\private"),
+        ("提醒@everyone修复", "提醒 修复"),
+        ("提醒@here修复", "提醒 修复"),
+    ),
+)
+def test_thread_title_summary_uses_ascii_security_boundaries(
+    value: str,
+    expected: str,
+) -> None:
+    assert safe_thread_title_summary(value) == expected
+
+
+def test_ascii_security_boundaries_preserve_identifiers_and_urls() -> None:
+    values = (
+        "notbearer abcdefghijklmnopqrstuvwxyz",
+        "databaseBasic dXNlcjpwYXNz",
+        "read https://example.invalid/Users/alice/guide",
+    )
+
+    assert tuple(safe_thread_title_summary(value) for value in values) == values
+
+
+def test_thread_title_summary_redacts_full_project_root(tmp_path: Path) -> None:
+    project_root = tmp_path / "private-project"
+
+    summary = safe_thread_title_summary(
+        f"inspect {project_root}/src/main.py",
+        project_root=project_root,
+    )
+
+    assert str(project_root) not in summary
+    assert "<project>/src/main.py" in summary
+
+
+def test_thread_title_summary_redacts_control_interleaved_project_root(
+    tmp_path: Path,
+) -> None:
+    project_root = tmp_path / "private-project"
+    raw_root = str(project_root)
+    midpoint = len(raw_root) // 2
+    interleaved_root = f"{raw_root[:midpoint]}\x00{raw_root[midpoint:]}"
+
+    summary = safe_thread_title_summary(
+        f"inspect {interleaved_root}/src/main.py",
+        project_root=project_root,
+    )
+
+    assert raw_root not in summary
+    assert "<project>/src/main.py" in summary
+
+
+def test_thread_title_summary_redacts_control_interleaved_secret_name() -> None:
+    secret = "control-interleaved-secret"
+
+    summary = safe_thread_title_summary(
+        f"OPENAI_API_KE\u200bY={secret} fix authentication"
+    )
+
+    assert secret not in summary
+    assert "<redacted>" in summary
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    (
+        ("OPENAI_API_\nKEY=line-secret", "OPENAI_API_KEY=<redacted>"),
+        ("OPENAI_API_\rKEY=cr-secret", "OPENAI_API_KEY=<redacted>"),
+        ("OPENAI_API_\x85KEY=c1-secret", "OPENAI_API_KEY=<redacted>"),
+        ("OPENAI_API_KEY+\t=tab-secret", "OPENAI_API_KEY+=<redacted>"),
+        (
+            "OPENAI_API_KEY1\ufe0f=selector-secret",
+            "OPENAI_API_KEY1=<redacted>",
+        ),
+        (
+            "xoxb-12345\u200d67890-" + "a" * 24,
+            "<redacted>",
+        ),
+        (
+            "xoxb-12345\ufe0f67890-" + "a" * 24,
+            "<redacted>",
+        ),
+    ),
+)
+def test_thread_title_summary_uses_aggressive_security_detection(
+    value: str,
+    expected: str,
+) -> None:
+    assert safe_thread_title_summary(value) == expected
+
+
+def test_thread_title_summary_preserves_prose_line_boundaries() -> None:
+    assert safe_thread_title_summary("fix login\nthen add tests") == (
+        "fix login then add tests"
+    )
+
+
+def test_thread_title_summary_detects_ignorable_split_paths(tmp_path: Path) -> None:
+    project_root = tmp_path / "project12"
+    raw_root = str(project_root)
+    obfuscated_root = raw_root.replace("12", "1\u200d2")
+
+    assert safe_thread_title_summary(
+        f"inspect {obfuscated_root}/src/main.py",
+        project_root=project_root,
+    ) == "inspect <project>/src/main.py"
+    assert (
+        safe_thread_title_summary("inspect /Us\ufe0fers/alice/private")
+        == "inspect <home>/private"
+    )
+
+
+@pytest.mark.parametrize(
+    "invisible",
+    (
+        "\u034f",
+        "\u115f",
+        "\u1160",
+        "\u2800",
+        "\u3164",
+        "\uffa0",
+        "\U000e007f",
+    ),
+)
+def test_thread_title_summary_redacts_default_ignorable_interleaved_secret_name(
+    invisible: str,
+) -> None:
+    secret = "default-ignorable-secret"
+
+    summary = safe_thread_title_summary(
+        f"OPENAI_API_KE{invisible}Y={secret} fix authentication"
+    )
+
+    assert secret not in summary
+    assert "<redacted>" in summary
+
+
+@pytest.mark.parametrize(
+    "credential",
+    (
+        "ghp_" + "a" * 36,
+        "github_pat_" + "a" * 22 + "_" + "b" * 59,
+        "xoxb-" + "1234567890-" + "a" * 24,
+        "xapp-" + "1-" + "a" * 24,
+        "xoxe-" + "1-" + "a" * 24,
+        "xoxe.xoxp-" + "1-" + "a" * 24,
+        "AKIA" + "A" * 16,
+        "ASIA" + "A" * 16,
+        "AIza" + "a" * 35,
+        "sk_live_" + "a" * 24,
+        "rk_live_" + "a" * 24,
+    ),
+)
+def test_thread_title_summary_redacts_recognizable_credentials(
+    credential: str,
+) -> None:
+    summary = safe_thread_title_summary(f"rotate {credential} now")
+
+    assert credential not in summary
+    assert "<redacted>" in summary
+
+
+def test_thread_title_summary_preserves_short_github_token_shape() -> None:
+    short_shape = "ghp_" + "a" * 35
+
+    assert safe_thread_title_summary(f"review {short_shape}") == f"review {short_shape}"
+
+
+def test_thread_title_summary_redacts_credential_completed_by_truncation() -> None:
+    credential = "ghp_" + "a" * 36
+    value = "x" * 28 + " " + credential + "_tail"
+
+    assert safe_thread_title_summary(value) == "x" * 28 + " <redacted>..."
+
+
+@pytest.mark.parametrize(
+    ("value", "secret"),
+    (
+        ("Cookie: session_id=cookie-header-secret; theme=dark", "cookie-header-secret"),
+        (
+            "Set-Cookie: session_id=set-cookie-secret; HttpOnly",
+            "set-cookie-secret",
+        ),
+        ("session_id=session-assignment-secret", "session-assignment-secret"),
+        ("cookie=cookie-assignment-secret", "cookie-assignment-secret"),
+        ("PHPSESSID=php-session-secret", "php-session-secret"),
+        ("connect.sid=express-session-secret", "express-session-secret"),
+    ),
+)
+def test_thread_title_summary_redacts_cookie_and_session_values(
+    value: str,
+    secret: str,
+) -> None:
+    summary = safe_thread_title_summary(value)
+
+    assert secret not in summary
+    assert "<redacted>" in summary
+
+
+@pytest.mark.parametrize(
+    "operator",
+    (":=", "+=", "-=", "*=", "/=", "%=", "?=", ".="),
+)
+def test_thread_title_summary_redacts_compound_secret_assignments(
+    operator: str,
+) -> None:
+    secret = "compound-assignment-secret"
+
+    summary = safe_thread_title_summary(f"OPENAI_API_KEY{operator}{secret}")
+
+    assert secret not in summary
+    assert f"OPENAI_API_KEY{operator}<redacted>" == summary
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        "修复登录后刷新白屏",
+        "Fix the blank page after login",
+        "修复登录 👩‍💻🚀",
+    ),
+)
+def test_thread_title_summary_preserves_readable_unicode(value: str) -> None:
+    assert safe_thread_title_summary(value) == value
+
+
+def test_thread_title_summary_is_bounded_in_unicode_characters() -> None:
+    summary = safe_thread_title_summary("界🙂" * 100)
+
+    assert len(summary) == 72
+    assert summary.endswith("...")
+    assert summary.encode("utf-8")
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    (
+        ("x" * 60 + "@everyonexxx tail", "x" * 60 + " ..."),
+        ("x" * 64 + "@herexxx tail", "x" * 64 + " ..."),
+    ),
+)
+def test_thread_title_summary_resanitizes_mentions_created_by_truncation(
+    value: str,
+    expected: str,
+) -> None:
+    summary = safe_thread_title_summary(value)
+
+    assert summary == expected
+    assert "@everyone" not in summary.casefold()
+    assert "@here" not in summary.casefold()
+
+
+@pytest.mark.parametrize(
+    ("value", "has_image_attachment", "expected"),
+    (
+        ("", False, "新任务"),
+        (" \n\t", True, "图片任务"),
+        ("<@123> @everyone \x00", True, "新任务"),
+    ),
+)
+def test_thread_title_summary_uses_deterministic_fallbacks(
+    value: str,
+    has_image_attachment: bool,
+    expected: str,
+) -> None:
+    assert (
+        safe_thread_title_summary(
+            value,
+            has_image_attachment=has_image_attachment,
+        )
+        == expected
     )
 
 

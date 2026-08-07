@@ -1457,6 +1457,8 @@ def test_reclaimed_thread_creation_rejects_stale_permanent_failure(
         discord_message_id="fenced-thread",
         content_hash="content",
         attachment_manifest_hash="attachments",
+        first_request_text="reclaimed request",
+        has_image_attachment=False,
         project_id=storage_context.project.id,
         discord_guild_id=100,
         discord_channel_id=200,
@@ -1838,6 +1840,8 @@ def test_thread_creation_intent_is_durable_and_idempotent(
         discord_message_id="301",
         content_hash="content",
         attachment_manifest_hash="attachments",
+        first_request_text="inspect durable storage",
+        has_image_attachment=False,
         project_id=storage_context.project.id,
         discord_guild_id=100,
         discord_channel_id=200,
@@ -1853,7 +1857,17 @@ def test_thread_creation_intent_is_durable_and_idempotent(
     assert outbox is not None
     assert outbox.id == outbox_id
     assert outbox.operation == "create_thread"
-    assert "content" not in json.loads(outbox.payload_json)
+    payload = json.loads(outbox.payload_json)
+    assert set(payload) == {
+        "expected_thread_id",
+        "kind",
+        "name",
+        "owner_user_id",
+        "project_id",
+        "starter_message_id",
+    }
+    assert payload["name"] == f"inspect durable storage · {ingress.id[:4]}"
+    assert 1 <= len(payload["name"]) <= 100
 
     conversation = repository.finalize_thread_creation(
         discord_message_id="301",
@@ -1868,6 +1882,8 @@ def test_thread_creation_intent_is_durable_and_idempotent(
         discord_message_id="301",
         content_hash="content",
         attachment_manifest_hash="attachments",
+        first_request_text="this duplicate must not replace the original title",
+        has_image_attachment=True,
         project_id=storage_context.project.id,
         discord_guild_id=100,
         discord_channel_id=200,
@@ -1876,6 +1892,12 @@ def test_thread_creation_intent_is_durable_and_idempotent(
     )
     assert not duplicate
     assert duplicate_outbox == outbox_id
+    persisted = storage_context.store.query_one(
+        "SELECT payload_json FROM discord_outbox WHERE id = ?",
+        (outbox_id,),
+    )
+    assert persisted is not None
+    assert persisted["payload_json"] == outbox.payload_json
     assert (
         repository.finalize_thread_creation(
             discord_message_id="301",
@@ -1886,6 +1908,172 @@ def test_thread_creation_intent_is_durable_and_idempotent(
     )
 
 
+def test_fresh_image_only_thread_creation_uses_image_title(
+    storage_context: StorageContext,
+) -> None:
+    repository = storage_context.repository
+
+    created, _ = repository.request_thread_creation(
+        discord_message_id="306",
+        content_hash="content",
+        attachment_manifest_hash="image-attachments",
+        first_request_text="",
+        has_image_attachment=True,
+        project_id=storage_context.project.id,
+        discord_guild_id=100,
+        discord_channel_id=200,
+        owner_user_id=400,
+        boot_id="boot",
+    )
+
+    assert created
+    ingress = repository.get_ingress_message("306")
+    outbox = repository.claim_outbox(worker_id="worker")
+    assert outbox is not None
+    payload = json.loads(outbox.payload_json)
+    assert payload["name"] == f"图片任务 · {ingress.id[:4]}"
+
+
+def test_thread_creation_title_is_redacted_bounded_and_only_persists_safe_name(
+    storage_context: StorageContext,
+) -> None:
+    repository = storage_context.repository
+    secret = "provider-secret-value"
+    github_pat = "github_pat_" + "a" * 22 + "_" + "b" * 59
+    raw_request = (
+        f"rotate {github_pat} inspect {storage_context.root}/private "
+        f"OPENAI_API_KEY={secret} "
+        + "界🙂" * 100
+    )
+
+    repository.request_thread_creation(
+        discord_message_id="305",
+        content_hash="content",
+        attachment_manifest_hash="attachments",
+        first_request_text=raw_request,
+        has_image_attachment=False,
+        project_id=storage_context.project.id,
+        discord_guild_id=100,
+        discord_channel_id=200,
+        owner_user_id=400,
+        boot_id="boot",
+    )
+
+    ingress = repository.get_ingress_message("305")
+    outbox = repository.claim_outbox(worker_id="worker")
+    assert outbox is not None
+    payload = json.loads(outbox.payload_json)
+    summary, suffix = payload["name"].rsplit(" · ", 1)
+    assert suffix == ingress.id[:4]
+    assert 1 <= len(summary) <= 72
+    assert len(payload["name"]) <= 100
+    assert raw_request not in outbox.payload_json
+    assert str(storage_context.root) not in outbox.payload_json
+    assert secret not in outbox.payload_json
+    assert github_pat not in outbox.payload_json
+    assert "<redacted>" in payload["name"]
+    assert set(payload) == {
+        "expected_thread_id",
+        "kind",
+        "name",
+        "owner_user_id",
+        "project_id",
+        "starter_message_id",
+    }
+
+
+def test_thread_creation_title_redacts_security_detection_bypasses(
+    storage_context: StorageContext,
+) -> None:
+    line_secret = "line-split-secret"
+    tab_secret = "tab-split-secret"
+    slack_token = "xoxb-1234567890-" + "a" * 24
+    obfuscated_token = slack_token.replace("23", "2\u200d3").replace(
+        "67", "6\ufe0f7"
+    )
+    raw_root = str(storage_context.root)
+    digit_index = next(
+        index for index, character in enumerate(raw_root) if character.isdigit()
+    )
+    obfuscated_root = f"{raw_root[: digit_index + 1]}\ufe0f{raw_root[digit_index + 1:]}"
+    raw_request = (
+        f"API_\nKEY={line_secret} API_KEY+\t={tab_secret} "
+        f"{obfuscated_token} {obfuscated_root} /Us\ufe0fers/alice"
+    )
+
+    storage_context.repository.request_thread_creation(
+        discord_message_id="307",
+        content_hash="content",
+        attachment_manifest_hash="attachments",
+        first_request_text=raw_request,
+        has_image_attachment=False,
+        project_id=storage_context.project.id,
+        discord_guild_id=100,
+        discord_channel_id=200,
+        owner_user_id=400,
+        boot_id="boot",
+    )
+
+    outbox = storage_context.repository.claim_outbox(worker_id="worker")
+    assert outbox is not None
+    payload = json.loads(outbox.payload_json)
+    summary, _ = payload["name"].rsplit(" · ", 1)
+    assert summary == (
+        "API_KEY=<redacted> API_KEY+=<redacted> "
+        "<redacted> <project> <home>"
+    )
+    assert all(
+        value not in payload["name"]
+        for value in (
+            line_secret,
+            tab_secret,
+            "xoxb-",
+            raw_root,
+            obfuscated_root,
+            "/Users/alice",
+        )
+    )
+    assert raw_request not in outbox.payload_json
+
+
+def test_thread_creation_title_redacts_credentials_next_to_chinese_prose(
+    storage_context: StorageContext,
+) -> None:
+    token = "sk-aaaaaaaaaaaaaaaaaaaa"
+    auth = "abcdefghijklmnopqrstuvwxyz"
+    home = "/Users/alice"
+    raw_request = (
+        f"请轮换{token}密钥 "
+        f"请用Bearer {auth} "
+        f"检查{home}/private"
+    )
+
+    storage_context.repository.request_thread_creation(
+        discord_message_id="308",
+        content_hash="content",
+        attachment_manifest_hash="attachments",
+        first_request_text=raw_request,
+        has_image_attachment=False,
+        project_id=storage_context.project.id,
+        discord_guild_id=100,
+        discord_channel_id=200,
+        owner_user_id=400,
+        boot_id="boot",
+    )
+
+    outbox = storage_context.repository.claim_outbox(worker_id="worker")
+    assert outbox is not None
+    payload = json.loads(outbox.payload_json)
+    summary, _ = payload["name"].rsplit(" · ", 1)
+    assert summary == (
+        "请轮换<redacted>密钥 "
+        "请用Bearer <redacted> "
+        "检查<home>/private"
+    )
+    assert all(value not in outbox.payload_json for value in (token, auth, home))
+    assert raw_request not in outbox.payload_json
+
+
 def test_permanent_thread_creation_failure_rejects_ingress(
     storage_context: StorageContext,
 ) -> None:
@@ -1894,6 +2082,8 @@ def test_permanent_thread_creation_failure_rejects_ingress(
         discord_message_id="303",
         content_hash="content",
         attachment_manifest_hash="attachments",
+        first_request_text="permanent failure request",
+        has_image_attachment=False,
         project_id=storage_context.project.id,
         discord_guild_id=100,
         discord_channel_id=200,
