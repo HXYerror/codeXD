@@ -639,13 +639,28 @@ def _reported_media_type(value: str | None) -> str | None:
     return media_type
 
 
-def _claims_image(filename: str, reported_media_type: str | None) -> bool:
-    if isinstance(reported_media_type, str):
-        media_type = reported_media_type.partition(";")[0].strip().casefold()
-        if media_type.startswith("image/") or media_type == "application/svg+xml":
+def attachment_metadata_hints_image(
+    filename: str,
+    reported_media_type: str | None,
+) -> bool:
+    """Return a metadata-only image hint without classifying attachment bytes."""
+    bounded_media_type = _reported_media_type(reported_media_type)
+    if bounded_media_type is not None:
+        media_type = bounded_media_type.partition(";")[0].strip().casefold()
+        if media_type.startswith("image/"):
             return True
     safe_name = _sanitize_display_name(filename).casefold()
     return any(safe_name.endswith(extension) for extension in _IMAGE_EXTENSIONS)
+
+
+def _claims_image(filename: str, reported_media_type: str | None) -> bool:
+    if attachment_metadata_hints_image(filename, reported_media_type):
+        return True
+    bounded_media_type = _reported_media_type(reported_media_type)
+    if bounded_media_type is None:
+        return False
+    media_type = bounded_media_type.partition(";")[0].strip().casefold()
+    return media_type == "application/svg+xml"
 
 
 def _sanitize_display_name(value: str) -> str:

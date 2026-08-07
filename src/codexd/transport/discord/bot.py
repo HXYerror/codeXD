@@ -54,6 +54,7 @@ from codexd.transport.discord.attachments import (
     AttachmentError,
     DiscordAttachmentIngestor,
     DiscordAttachmentIngestResult,
+    attachment_metadata_hints_image,
 )
 from codexd.transport.discord.outbox import (
     DiscordOutboxTransport,
@@ -1078,6 +1079,13 @@ class CodexDBot(discord.Client):
                         "A prompt or attachment is required.",
                         code="empty_input",
                     )
+                has_image_attachment = any(
+                    attachment_metadata_hints_image(
+                        attachment.filename,
+                        attachment.content_type,
+                    )
+                    for attachment in attachments
+                )
                 await asyncio.to_thread(
                     self.repository.request_thread_creation,
                     discord_message_id=str(message.id),
@@ -1086,7 +1094,7 @@ class CodexDBot(discord.Client):
                         attachments
                     ),
                     first_request_text=content,
-                    has_image_attachment=bool(image_attachments),
+                    has_image_attachment=has_image_attachment,
                     project_id=project.id,
                     discord_guild_id=message.guild.id,
                     discord_channel_id=message.channel.id,

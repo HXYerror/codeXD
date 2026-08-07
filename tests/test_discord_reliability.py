@@ -1402,18 +1402,36 @@ async def test_message_ingress_acl_matrix_ignores_untrusted_sources(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("raw_content", "with_image", "expected_text"),
+    ("raw_content", "attachment_metadata", "expected_text", "expected_image_hint"),
     (
-        ("<@999> fix login", False, "fix login"),
-        ("<@999> fix screenshot", True, "fix screenshot"),
-        ("<@999>", True, ""),
+        ("<@999> fix login", (), "fix login", False),
+        (
+            "<@999> inspect files",
+            (("notes.txt", "text/plain"),),
+            "inspect files",
+            False,
+        ),
+        ("<@999>", (("capture.bin", "image/png"),), "", True),
+        ("<@999>", (("capture.PNG", "application/octet-stream"),), "", True),
+        ("<@999>", (("notes.txt", "application/octet-stream"),), "", False),
+        (
+            "<@999>",
+            (
+                ("notes.txt", "text/plain"),
+                ("capture.webp", "application/octet-stream"),
+                ("brief.pdf", "application/pdf"),
+            ),
+            "",
+            True,
+        ),
     ),
 )
 async def test_channel_mention_passes_title_inputs_to_repository(
     tmp_path: Path,
     raw_content: str,
-    with_image: bool,
+    attachment_metadata: tuple[tuple[str, str | None], ...],
     expected_text: str,
+    expected_image_hint: bool,
 ) -> None:
     repository = Mock()
     bot = _test_bot(tmp_path, repository=repository)
@@ -1433,24 +1451,21 @@ async def test_channel_mention_passes_title_inputs_to_repository(
     message.channel = channel
     message.content = raw_content
     message.mentions = [bot_user]
-    message.attachments = (
-        [
-            SimpleNamespace(
-                id=501,
-                filename="image.png",
-                size=42,
-                content_type="image/png",
-            )
-        ]
-        if with_image
-        else []
-    )
+    message.attachments = [
+        SimpleNamespace(
+            id=501 + index,
+            filename=filename,
+            size=42,
+            content_type=content_type,
+        )
+        for index, (filename, content_type) in enumerate(attachment_metadata)
+    ]
 
     await bot._handle_message(message)
 
     request = repository.request_thread_creation.call_args.kwargs
     assert request["first_request_text"] == expected_text
-    assert request["has_image_attachment"] is with_image
+    assert request["has_image_attachment"] is expected_image_hint
     assert request["content_hash"] == sha256_text(expected_text)
     channel.send.assert_not_awaited()
 
@@ -1741,6 +1756,10 @@ async def test_thread_creation_outbox_reconciles_existing_remote_thread(
     )
     record = storage_context.repository.claim_outbox(worker_id="worker")
     assert record is not None
+    ingress = storage_context.repository.get_ingress_message("302")
+    assert json.loads(record.payload_json)["name"] == (
+        f"reconcile existing thread · {ingress.id[:4]}"
+    )
     channel = Mock(spec=discord.TextChannel)
     channel.id = 200
     starter = Mock(spec=discord.Message)

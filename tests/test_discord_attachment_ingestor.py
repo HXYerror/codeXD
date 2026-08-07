@@ -23,6 +23,7 @@ from codexd.transport.discord.attachments import (
     DiscordAttachmentIngestor,
     DiscordAttachmentIngestResult,
     _ensure_private_directory,
+    attachment_metadata_hints_image,
 )
 
 
@@ -125,6 +126,27 @@ def _ingestor(
         message_max_bytes=message_max_bytes,
         retention_days=7,
         max_attachment_count=max_attachment_count,
+    )
+
+
+@pytest.mark.parametrize(
+    ("filename", "reported_media_type", "expected"),
+    (
+        ("capture.bin", "IMAGE/PNG; charset=binary", True),
+        ("capture.WeBp", "application/octet-stream", True),
+        ("vector.svg", None, True),
+        ("notes.txt", "application/octet-stream", False),
+        ("vector.bin", "application/svg+xml", False),
+        ("oversized.bin", "image/" + ("x" * 300), False),
+    ),
+)
+def test_attachment_metadata_image_hint_is_narrow_and_content_agnostic(
+    filename: str,
+    reported_media_type: str | None,
+    expected: bool,
+) -> None:
+    assert (
+        attachment_metadata_hints_image(filename, reported_media_type) is expected
     )
 
 

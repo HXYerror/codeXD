@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 from pathlib import Path
@@ -67,14 +68,19 @@ def _bot(
     return bot, bot_user
 
 
-def _attachment(ordinal: int, filename: str) -> discord.Attachment:
+def _attachment(
+    ordinal: int,
+    filename: str,
+    *,
+    content_type: str | None = "application/octet-stream",
+) -> discord.Attachment:
     return cast(
         discord.Attachment,
         SimpleNamespace(
             id=10_000 + ordinal,
             filename=filename,
             size=4 + ordinal,
-            content_type="application/octet-stream",
+            content_type=content_type,
             url=(f"https://cdn.discordapp.com/attachments/private/{ordinal}/{filename}"),
         ),
     )
@@ -362,7 +368,10 @@ async def test_existing_thread_uses_one_ingest_and_one_turn_for_file_inputs(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("scenario", ("file_only", "mixed"))
+@pytest.mark.parametrize(
+    "scenario",
+    ("text_only", "image_only", "file_only", "mixed", "misleading_image"),
+)
 async def test_channel_mention_refetches_then_ingests_attachments_once(
     storage_context: StorageContext,
     tmp_path: Path,
@@ -380,7 +389,34 @@ async def test_channel_mention_refetches_then_ingests_attachments_once(
     thread.locked = False
     data_root = storage_context.store.path.parent
     result: DiscordAttachmentIngestResult
-    if scenario == "file_only":
+    expected_title: str
+    expected_text: str | None
+    expected_kinds: list[tuple[int, str]]
+    if scenario == "text_only":
+        content = "<@999> inspect the project"
+        attachments = []
+        result = DiscordAttachmentIngestResult()
+        expected_title = "inspect the project"
+        expected_text = "inspect the project"
+        expected_kinds = []
+    elif scenario == "image_only":
+        content = "<@999>"
+        attachments = [
+            _attachment(0, "capture.bin", content_type="image/png")
+        ]
+        result = DiscordAttachmentIngestResult(
+            images=(
+                _turn_image(
+                    data_root,
+                    attachment_id="channel-image-only",
+                    ordinal=0,
+                ),
+            )
+        )
+        expected_title = "图片任务"
+        expected_text = None
+        expected_kinds = [(0, "image")]
+    elif scenario == "file_only":
         content = "<@999>"
         attachments = [_attachment(0, "channel.txt")]
         result = DiscordAttachmentIngestResult(
@@ -393,8 +429,11 @@ async def test_channel_mention_refetches_then_ingests_attachments_once(
                 ),
             )
         )
-    else:
-        content = "<@999> inspect the mixed input"
+        expected_title = "新任务"
+        expected_text = None
+        expected_kinds = [(0, "file")]
+    elif scenario == "mixed":
+        content = "<@999>"
         attachments = [
             _attachment(0, "channel.json"),
             _attachment(1, "channel.png"),
@@ -423,6 +462,26 @@ async def test_channel_mention_refetches_then_ingests_attachments_once(
                 ),
             ),
         )
+        expected_title = "图片任务"
+        expected_text = None
+        expected_kinds = [(0, "file"), (1, "image"), (2, "file")]
+    else:
+        content = "<@999>"
+        attachments = [
+            _attachment(0, "actually-an-image.txt", content_type="text/plain")
+        ]
+        result = DiscordAttachmentIngestResult(
+            images=(
+                _turn_image(
+                    data_root,
+                    attachment_id="channel-misleading-image",
+                    ordinal=0,
+                ),
+            )
+        )
+        expected_title = "新任务"
+        expected_text = None
+        expected_kinds = [(0, "image")]
     message = _message(
         message_id=911,
         channel=parent,
@@ -441,6 +500,29 @@ async def test_channel_mention_refetches_then_ingests_attachments_once(
 
     await bot._handle_message(message)
     ingestor.ingest.assert_not_awaited()
+    ingress = storage_context.repository.get_ingress_message("911")
+    outbox_row = storage_context.store.query_one(
+        """
+        SELECT o.payload_json
+        FROM ingress_messages AS i
+        JOIN discord_outbox AS o ON o.id = i.thread_creation_outbox_id
+        WHERE i.discord_message_id = '911'
+        """
+    )
+    assert outbox_row is not None
+    original_payload_json = str(outbox_row["payload_json"])
+    assert json.loads(original_payload_json)["name"] == (
+        f"{expected_title} · {ingress.id[:4]}"
+    )
+
+    await bot._handle_message(message)
+
+    duplicate_rows = storage_context.store.query_all(
+        "SELECT payload_json FROM discord_outbox WHERE dedupe_key = 'thread-create:911'"
+    )
+    assert [str(row["payload_json"]) for row in duplicate_rows] == [
+        original_payload_json
+    ]
     storage_context.repository.finalize_thread_creation(
         discord_message_id="911",
         discord_thread_id=911,
@@ -459,11 +541,11 @@ async def test_channel_mention_refetches_then_ingests_attachments_once(
     ingress = storage_context.repository.get_ingress_message("911")
     turn_input = storage_context.repository.load_turn_input(cast(str, ingress.turn_id))
     assert ingress.state == "ready"
-    assert turn_input.text == (None if scenario == "file_only" else "inspect the mixed input")
+    assert turn_input.text == expected_text
     assert sorted(
         [(image.ordinal, "image") for image in turn_input.images]
         + [(file.ordinal, "file") for file in turn_input.files]
-    ) == ([(0, "file")] if scenario == "file_only" else [(0, "file"), (1, "image"), (2, "file")])
+    ) == expected_kinds
     ingestor.ingest.assert_awaited_once_with(attachments)
     ingestor.cleanup.assert_not_called()
     bot.turns.enqueue.assert_awaited_once()
