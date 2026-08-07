@@ -16,18 +16,20 @@ _SECRET_NAME = re.compile(
 )
 _ASSIGNMENT_OPERATOR = r"(?::=|\+=|-=|\*=|/=|%=|\?=|\.=|=|:)"
 _AUTH_HEADER = re.compile(
-    r"(?i)\b(?P<header>authorization|proxy-authorization)\s*:\s*"
+    r"(?i)(?<![A-Za-z0-9_])"
+    r"(?P<header>authorization|proxy-authorization)\s*:\s*"
     r"(?P<scheme>[A-Za-z][A-Za-z0-9_-]*)\s+(?P<value>\S+)"
 )
 _COOKIE_HEADER = re.compile(
-    r"(?im)\b(?P<header>set-cookie|cookie)\s*:\s*(?P<value>[^\r\n]*)"
+    r"(?im)(?<![A-Za-z0-9_])"
+    r"(?P<header>set-cookie|cookie)\s*:\s*(?P<value>[^\r\n]*)"
 )
 _STANDALONE_BEARER = re.compile(
-    r"\b(?P<scheme>(?i:bearer))\s+"
+    r"(?<![A-Za-z0-9_])(?P<scheme>(?i:bearer))\s+"
     r"(?P<value>[A-Za-z0-9._~+/=-]+)"
 )
 _STANDALONE_BASIC = re.compile(
-    r"\b(?P<scheme>(?i:basic))\s+"
+    r"(?<![A-Za-z0-9_])(?P<scheme>(?i:basic))\s+"
     r"(?P<value>[A-Za-z0-9+/]{4,}={0,2})(?![A-Za-z0-9+/=])"
 )
 _SECRET_ASSIGNMENT = re.compile(
@@ -50,12 +52,16 @@ _SESSION_COOKIE_ASSIGNMENT = re.compile(
     r"(?P<value>\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;&]+)"
 )
 _TOKEN_PATTERNS = (
-    re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"),
     re.compile(
-        r"\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{6,}"
-        r"\.[A-Za-z0-9_-]{20,}\b"
+        r"(?<![A-Za-z0-9_])sk-[A-Za-z0-9_-]{16,}(?![A-Za-z0-9_])"
     ),
-    re.compile(r"\bmfa\.[A-Za-z0-9_-]{20,}\b"),
+    re.compile(
+        r"(?<![A-Za-z0-9_])[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{6,}"
+        r"\.[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_])"
+    ),
+    re.compile(
+        r"(?<![A-Za-z0-9_])mfa\.[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_])"
+    ),
     re.compile(
         r"(?<![A-Za-z0-9_])ghp_[A-Za-z0-9]{36,}(?![A-Za-z0-9_])"
     ),
@@ -78,9 +84,9 @@ _TOKEN_PATTERNS = (
 )
 _URL = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 _HOME_PATHS = (
-    re.compile(r"(?<![\w.-])/Users/[^/\s]+"),
-    re.compile(r"(?<![\w.-])/home/[^/\s]+"),
-    re.compile(r"(?i)\b[A-Z]:\\Users\\[^\\\s]+"),
+    re.compile(r"(?<![A-Za-z0-9_.-])/Users/[^/\s]+"),
+    re.compile(r"(?<![A-Za-z0-9_.-])/home/[^/\s]+"),
+    re.compile(r"(?i)(?<![A-Za-z0-9_])[A-Z]:\\Users\\[^\\\s]+"),
 )
 _CONTROL_CHARACTERS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 _DEFAULT_IGNORABLE_RANGES = (
@@ -97,7 +103,10 @@ _DEFAULT_IGNORABLE_RANGES = (
     (0xE0000, 0xE0FFF),
 )
 _DISCORD_ENTITY_MENTION = re.compile(r"<(?:@!?\d+|@&\d+|#\d+)>")
-_DISCORD_BROADCAST_MENTION = re.compile(r"@(?:everyone|here)\b", re.IGNORECASE)
+_DISCORD_BROADCAST_MENTION = re.compile(
+    r"@(?:everyone|here)(?![A-Za-z0-9_])",
+    re.IGNORECASE,
+)
 _NON_TEXT_SUMMARY = "[non-text input]"
 _THREAD_TITLE_SUMMARY_MAX_CHARS = 72
 _DIFF_PATH_HEADER = re.compile(

@@ -2036,6 +2036,44 @@ def test_thread_creation_title_redacts_security_detection_bypasses(
     assert raw_request not in outbox.payload_json
 
 
+def test_thread_creation_title_redacts_credentials_next_to_chinese_prose(
+    storage_context: StorageContext,
+) -> None:
+    token = "sk-aaaaaaaaaaaaaaaaaaaa"
+    auth = "abcdefghijklmnopqrstuvwxyz"
+    home = "/Users/alice"
+    raw_request = (
+        f"请轮换{token}密钥 "
+        f"请用Bearer {auth} "
+        f"检查{home}/private"
+    )
+
+    storage_context.repository.request_thread_creation(
+        discord_message_id="308",
+        content_hash="content",
+        attachment_manifest_hash="attachments",
+        first_request_text=raw_request,
+        has_image_attachment=False,
+        project_id=storage_context.project.id,
+        discord_guild_id=100,
+        discord_channel_id=200,
+        owner_user_id=400,
+        boot_id="boot",
+    )
+
+    outbox = storage_context.repository.claim_outbox(worker_id="worker")
+    assert outbox is not None
+    payload = json.loads(outbox.payload_json)
+    summary, _ = payload["name"].rsplit(" · ", 1)
+    assert summary == (
+        "请轮换<redacted>密钥 "
+        "请用Bearer <redacted> "
+        "检查<home>/private"
+    )
+    assert all(value not in outbox.payload_json for value in (token, auth, home))
+    assert raw_request not in outbox.payload_json
+
+
 def test_permanent_thread_creation_failure_rejects_ingress(
     storage_context: StorageContext,
 ) -> None:

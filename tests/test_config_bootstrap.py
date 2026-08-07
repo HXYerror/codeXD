@@ -444,6 +444,55 @@ def test_thread_title_summary_redacts_sensitive_values(
     assert 1 <= len(summary) <= 72
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    (
+        ("请轮换sk-aaaaaaaaaaaaaaaaaaaa密钥", "请轮换<redacted>密钥"),
+        (
+            "请用Bearer abcdefghijklmnopqrstuvwxyz",
+            "请用Bearer <redacted>",
+        ),
+        (
+            "请用Authorization: Token authorization-secret",
+            "请用Authorization: <redacted> <redacted>",
+        ),
+        ("请用Basic dXNlcjpwYXNz登录", "请用Basic <redacted>登录"),
+        (
+            "检查aaaaaaaaaaaaaaaaaaaa.bbbbbb.cccccccccccccccccccc密钥",
+            "检查<redacted>密钥",
+        ),
+        (
+            "检查mfa.abcdefghijklmnopqrstuvwxyz密钥",
+            "检查<redacted>密钥",
+        ),
+        (
+            "请用Set-Cookie: theme=private-value",
+            "请用Set-Cookie: <redacted>",
+        ),
+        ("检查/Users/alice/private", "检查<home>/private"),
+        ("检查/home/alice/private", "检查<home>/private"),
+        (r"检查C:\Users\alice\private", r"检查<home>\private"),
+        ("提醒@everyone修复", "提醒 修复"),
+        ("提醒@here修复", "提醒 修复"),
+    ),
+)
+def test_thread_title_summary_uses_ascii_security_boundaries(
+    value: str,
+    expected: str,
+) -> None:
+    assert safe_thread_title_summary(value) == expected
+
+
+def test_ascii_security_boundaries_preserve_identifiers_and_urls() -> None:
+    values = (
+        "notbearer abcdefghijklmnopqrstuvwxyz",
+        "databaseBasic dXNlcjpwYXNz",
+        "read https://example.invalid/Users/alice/guide",
+    )
+
+    assert tuple(safe_thread_title_summary(value) for value in values) == values
+
+
 def test_thread_title_summary_redacts_full_project_root(tmp_path: Path) -> None:
     project_root = tmp_path / "private-project"
 
