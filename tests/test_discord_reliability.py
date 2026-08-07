@@ -3,6 +3,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import queue
+import time
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -14,7 +18,7 @@ from conftest import StorageContext
 from discord import app_commands
 
 from codexd.application.session_coordinator import ResolvedProject, SessionCoordinator
-from codexd.config import SecurityConfig, load_config
+from codexd.config import AppConfig, DiscordConfig, SecurityConfig, load_config
 from codexd.domain.ids import canonical_json, sha256_text
 from codexd.domain.turns import TurnImage, TurnInput, TurnSource
 from codexd.errors import InvariantError
@@ -36,14 +40,246 @@ from codexd.transport.discord.attachments import (
     AttachmentError,
     DiscordImageIngestor,
 )
-from codexd.transport.discord.bot import CodexDBot, _remove_bot_mention
+from codexd.transport.discord.bot import (
+    CodexDBot,
+    _bounded_response,
+    _remove_bot_mention,
+)
 from codexd.transport.discord.outbox import (
     DeliveryError,
+    DeliveryResult,
     DiscordOutboxTransport,
     OutboxWorker,
+    _bounded_plain_text_fallback,
     _message_has_delivery_marker,
 )
 from codexd.transport.discord.presentation import TABLE_COPY_CUSTOM_ID, task_card_embed
+
+
+@pytest.mark.asyncio
+async def test_outbox_workers_deliver_independent_destinations_concurrently() -> None:
+    records: queue.Queue[OutboxRecord] = queue.Queue()
+    records.put(
+        OutboxRecord(
+            id="destination-a",
+            destination_key="thread:100",
+            operation="send",
+            payload_json='{"content":"a"}',
+            delivery_marker="a",
+            state="pending",
+            attempts=1,
+            lease_owner="worker",
+        )
+    )
+    records.put(
+        OutboxRecord(
+            id="destination-b",
+            destination_key="thread:200",
+            operation="send",
+            payload_json='{"content":"b"}',
+            delivery_marker="b",
+            state="pending",
+            attempts=1,
+            lease_owner="worker",
+        )
+    )
+    repository = Mock()
+
+    def claim_outbox(*, worker_id: str, lease_ms: int) -> OutboxRecord | None:
+        assert worker_id == "parallel-worker"
+        assert lease_ms == 30_000
+        try:
+            return records.get_nowait()
+        except queue.Empty:
+            return None
+
+    repository.claim_outbox.side_effect = claim_outbox
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    second_delivered = asyncio.Event()
+
+    async def deliver(record: OutboxRecord) -> DeliveryResult:
+        if record.id == "destination-a":
+            first_started.set()
+            await release_first.wait()
+        else:
+            second_delivered.set()
+        return DeliveryResult(discord_message_id=record.id)
+
+    worker = OutboxWorker(
+        repository=repository,
+        transport=SimpleNamespace(deliver=deliver),
+        worker_id="parallel-worker",
+        poll_seconds=0.01,
+        concurrency=2,
+    )
+    worker.start()
+    await asyncio.wait_for(first_started.wait(), timeout=1)
+    await asyncio.wait_for(second_delivered.wait(), timeout=1)
+    release_first.set()
+    await asyncio.sleep(0.05)
+    await worker.close()
+
+    acknowledged = {
+        call.args[0] for call in repository.ack_outbox.call_args_list
+    }
+    assert acknowledged == {"destination-a", "destination-b"}
+
+
+@pytest.mark.asyncio
+async def test_outbox_worker_renews_lease_during_slow_delivery(
+    storage_context: StorageContext,
+) -> None:
+    storage_context.repository.enqueue_outbox(
+        destination_key="thread:300",
+        operation="send",
+        payload={"content": "slow"},
+        dedupe_key="slow-delivery",
+        delivery_marker="slow-delivery",
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def deliver(_record: OutboxRecord) -> DeliveryResult:
+        entered.set()
+        await release.wait()
+        return DeliveryResult(discord_message_id="delivered")
+
+    worker = OutboxWorker(
+        repository=storage_context.repository,
+        transport=SimpleNamespace(deliver=deliver),
+        worker_id="slow-worker",
+        lease_ms=30,
+        lease_renew_seconds=0.01,
+    )
+    draining = asyncio.create_task(worker.drain_once())
+    await entered.wait()
+    await asyncio.sleep(0.05)
+
+    assert storage_context.repository.claim_outbox(
+        worker_id="competing-worker",
+        lease_ms=30,
+    ) is None
+    release.set()
+    assert await draining
+
+
+@pytest.mark.asyncio
+async def test_outbox_worker_cancels_delivery_after_lease_loss(
+    storage_context: StorageContext,
+) -> None:
+    storage_context.repository.enqueue_outbox(
+        destination_key="thread:300",
+        operation="send",
+        payload={"content": "slow"},
+        dedupe_key="lost-lease",
+        delivery_marker="lost-lease",
+    )
+    cancelled = asyncio.Event()
+
+    async def deliver(_record: OutboxRecord) -> DeliveryResult:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    storage_context.repository.renew_outbox_lease = (  # type: ignore[method-assign]
+        lambda *_args, **_kwargs: False
+    )
+    worker = OutboxWorker(
+        repository=storage_context.repository,
+        transport=SimpleNamespace(deliver=deliver),
+        worker_id="lost-lease-worker",
+        lease_ms=30,
+        lease_renew_seconds=0.01,
+    )
+
+    with pytest.raises(RuntimeError, match="lease was lost"):
+        await worker.drain_once()
+
+    assert cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_outbox_worker_cancels_delivery_when_another_worker_finishes_record() -> None:
+    record = OutboxRecord(
+        id="externally-finished",
+        destination_key="thread:300",
+        operation="send",
+        payload_json='{"content":"slow"}',
+        delivery_marker="externally-finished",
+        state="pending",
+        attempts=1,
+        lease_owner="first-worker",
+    )
+    repository = Mock()
+    repository.claim_outbox.return_value = record
+    repository.renew_outbox_lease.return_value = False
+    cancelled = asyncio.Event()
+
+    async def deliver(_record: OutboxRecord) -> DeliveryResult:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    worker = OutboxWorker(
+        repository=repository,
+        transport=SimpleNamespace(deliver=deliver),
+        worker_id="first-worker",
+        lease_ms=30,
+        lease_renew_seconds=0.01,
+    )
+
+    with pytest.raises(RuntimeError, match="lease was lost"):
+        await worker.drain_once()
+
+    assert cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_outbox_stops_lease_renewal_before_slow_post_ack_callback(
+    storage_context: StorageContext,
+) -> None:
+    storage_context.repository.enqueue_outbox(
+        destination_key="thread:300",
+        operation="send",
+        payload={"content": "created"},
+        dedupe_key="post-ack-callback",
+        delivery_marker="post-ack-callback",
+    )
+    callback_completed = asyncio.Event()
+
+    async def deliver(_record: OutboxRecord) -> DeliveryResult:
+        return DeliveryResult(
+            discord_message_id="300",
+            initial_ingress_message_id="starter-message",
+        )
+
+    async def callback(_message_id: str) -> None:
+        await asyncio.sleep(0.05)
+        callback_completed.set()
+
+    original_ack = storage_context.repository.ack_outbox
+
+    def slow_return_after_ack(*args: Any, **kwargs: Any) -> None:
+        original_ack(*args, **kwargs)
+        time.sleep(0.05)
+
+    storage_context.repository.ack_outbox = slow_return_after_ack  # type: ignore[method-assign]
+    worker = OutboxWorker(
+        repository=storage_context.repository,
+        transport=SimpleNamespace(deliver=deliver),
+        worker_id="post-ack-worker",
+        lease_ms=30,
+        lease_renew_seconds=0.01,
+        initial_ingress_ready=callback,
+    )
+
+    assert await worker.drain_once()
+    assert callback_completed.is_set()
 
 
 @pytest.mark.asyncio
@@ -173,6 +409,46 @@ async def test_thread_rename_outbox_edits_in_place() -> None:
         name="New name", reason="codexD session rename"
     )
     assert result.discord_message_id is None
+
+
+@pytest.mark.asyncio
+async def test_outbox_delivers_different_conversations_concurrently(
+    storage_context: StorageContext,
+) -> None:
+    for channel_id in (301, 302):
+        storage_context.repository.enqueue_outbox(
+            destination_key=f"thread:{channel_id}",
+            operation="send",
+            payload={"content": f"message-{channel_id}"},
+            dedupe_key=f"parallel-{channel_id}",
+            delivery_marker=f"parallel-{channel_id}",
+        )
+    started: set[str] = set()
+    both_started = asyncio.Event()
+    release = asyncio.Event()
+
+    class ParallelTransport:
+        async def deliver(self, record: OutboxRecord) -> DeliveryResult:
+            started.add(record.destination_key)
+            if len(started) == 2:
+                both_started.set()
+            await release.wait()
+            return DeliveryResult(record.id)
+
+    worker = OutboxWorker(
+        repository=storage_context.repository,
+        transport=ParallelTransport(),
+        worker_id="parallel-worker",
+        poll_seconds=0.01,
+        concurrency=2,
+    )
+    worker.start()
+    try:
+        await asyncio.wait_for(both_started.wait(), timeout=1)
+        assert started == {"thread:301", "thread:302"}
+    finally:
+        release.set()
+        await worker.close()
 
 
 @pytest.mark.asyncio
@@ -313,6 +589,7 @@ async def test_final_outbox_renders_table_embed_with_markdown_copy(
         retention_until=1,
     )
     thread = Mock(spec=discord.Thread)
+    thread.id = 300
     thread.archived = False
     thread.locked = False
     thread.send = AsyncMock(side_effect=[Mock(id=1), Mock(id=2)])
@@ -712,6 +989,7 @@ async def test_turn_progress_uses_one_editable_rich_embed() -> None:
     )
     existing = Mock(spec=discord.Message)
     existing.id = 601
+    existing.content = thread.send.await_args.args[0]
     existing.edit = AsyncMock()
     thread.fetch_message = AsyncMock(return_value=existing)
     repository.turn_progress_message.return_value = "601"
@@ -743,7 +1021,7 @@ async def test_turn_progress_uses_one_editable_rich_embed() -> None:
         existing.edit.await_args.kwargs["content"],
         "progress-edit",
     )
-    assert "Ordinary assistant text" not in existing.edit.await_args.kwargs["content"]
+    assert "Ordinary assistant text" in existing.edit.await_args.kwargs["content"]
 
 
 @pytest.mark.asyncio
@@ -763,14 +1041,17 @@ async def test_table_copy_component_returns_markdown_ephemerally(
     interaction.user = Mock(id=400)
     interaction.message = Mock(attachments=[attachment])
     interaction.response = Mock(
+        defer=AsyncMock(),
         send_message=AsyncMock(),
-        is_done=Mock(return_value=False),
+        is_done=Mock(return_value=True),
     )
+    interaction.followup = Mock(send=AsyncMock())
 
     await bot.on_interaction(interaction)
 
     attachment.read.assert_awaited_once()
-    sent = interaction.response.send_message.await_args
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+    sent = interaction.followup.send.await_args
     assert sent.args[0].startswith("```markdown\n| name | value |")
     assert sent.kwargs["ephemeral"] is True
     allowed_mentions = sent.kwargs["allowed_mentions"]
@@ -1003,6 +1284,56 @@ def test_discord_command_schema_exposes_codex_native_controls(
         "set",
         "default",
     }
+
+
+def test_archive_command_requires_archive_and_unarchive_capabilities(
+    tmp_path: Path,
+) -> None:
+    manifest = capability_manifest()
+    optional = dict(manifest.optional)
+    optional["thread.archive"] = True
+    optional["thread.unarchive"] = False
+    bot = CodexDBot(
+        config=AppConfig(
+            paths=AppPaths(tmp_path / "data", tmp_path / "logs"),
+            discord=DiscordConfig(
+                guild_id=100,
+                owner_user_id=400,
+                allowed_user_ids=frozenset({400}),
+            ),
+        ),
+        repository=Mock(),
+        sessions=Mock(),
+        session_lifecycle=Mock(),
+        turns=Mock(),
+        schedules=Mock(),
+        schedule_repository=Mock(),
+        runtimes=Mock(),
+        renderer=Mock(),
+        media_worker=Mock(),
+        signer=Mock(),
+        capability_manifest=replace(manifest, optional=optional),
+        boot_id="archive-gate",
+    )
+
+    bot._register_commands()
+
+    session = next(
+        command
+        for command in bot.tree.get_commands(guild=discord.Object(id=100))
+        if command.name == "session"
+    )
+    assert "archive" not in {command.name for command in session.commands}
+
+
+def test_long_error_response_preserves_unicode_graphemes() -> None:
+    family = "👩‍👩‍👧‍👦"
+
+    response = _bounded_response("error: " + ("界" * 1890) + family + ("x" * 100))
+
+    assert len(response) <= 1900
+    assert not response.endswith("\u200d")
+    assert response.endswith("…")
 
 
 @pytest.mark.asyncio
@@ -1420,7 +1751,7 @@ async def test_outbox_reconciliation_ignores_user_spoofed_marker() -> None:
 
 
 @pytest.mark.asyncio
-async def test_reconciliation_history_window_retries_with_incident(
+async def test_reconciliation_history_window_resends_with_incident(
     storage_context: StorageContext,
 ) -> None:
     outbox_id = storage_context.repository.enqueue_outbox(
@@ -1436,6 +1767,7 @@ async def test_reconciliation_history_window_retries_with_incident(
             (outbox_id,),
         )
     thread = Mock(spec=discord.Thread)
+    thread.id = 300
     thread.archived = False
     thread.locked = False
 
@@ -1471,21 +1803,18 @@ async def test_reconciliation_history_window_retries_with_incident(
         (outbox_id,),
     )
     assert row is not None
-    assert (row["state"], row["last_error_code"]) == (
-        "retry",
-        "discord_history_window_exhausted",
-    )
+    assert (row["state"], row["last_error_code"]) == ("sent", None)
     incident = storage_context.store.query_one(
         "SELECT severity, code, details_json FROM incidents WHERE code = ?",
-        ("discord_reconciliation_uncertain",),
+        ("delivery_duplicate_possible",),
     )
     assert incident is not None
     assert (incident["severity"], incident["code"]) == (
         "warning",
-        "discord_reconciliation_uncertain",
+        "delivery_duplicate_possible",
     )
-    assert json.loads(incident["details_json"])["outbox_id"] == outbox_id
-    thread.send.assert_not_awaited()
+    assert json.loads(incident["details_json"])["destination_channel_id"] == "300"
+    thread.send.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -1961,6 +2290,67 @@ async def test_shutdown_quiesces_initial_ingress_and_reconnect_callbacks(
 
 
 @pytest.mark.asyncio
+async def test_modal_preparation_timeout_responds_before_opening_modal(
+    tmp_path: Path,
+) -> None:
+    bot = _test_bot(tmp_path)
+    interaction = SimpleNamespace(
+        response=SimpleNamespace(
+            is_done=lambda: False,
+            send_message=AsyncMock(),
+            send_modal=AsyncMock(),
+        ),
+        followup=SimpleNamespace(send=AsyncMock()),
+    )
+
+    async def prepare() -> discord.ui.Modal:
+        raise TimeoutError
+
+    await bot._open_modal(cast(Any, interaction), prepare)
+
+    interaction.response.send_modal.assert_not_awaited()
+    sent = interaction.response.send_message.await_args.args[0]
+    assert "interaction_timeout" in sent
+    assert not bot._ingress_tasks
+
+
+@pytest.mark.asyncio
+async def test_modal_preparation_reserves_network_response_budget(
+    tmp_path: Path,
+) -> None:
+    bot = _test_bot(tmp_path)
+    prepare = AsyncMock(return_value=Mock(spec=discord.ui.Modal))
+    interaction = SimpleNamespace(
+        created_at=datetime.now(UTC) - timedelta(seconds=2.1),
+        response=SimpleNamespace(
+            is_done=lambda: False,
+            send_message=AsyncMock(),
+            send_modal=AsyncMock(),
+        ),
+        followup=SimpleNamespace(send=AsyncMock()),
+    )
+
+    await bot._open_modal(cast(Any, interaction), prepare)
+
+    prepare.assert_not_awaited()
+    interaction.response.send_modal.assert_not_awaited()
+    sent = interaction.response.send_message.await_args.args[0]
+    assert "interaction_timeout" in sent
+
+
+@pytest.mark.asyncio
+async def test_raw_thread_delete_cleans_uncached_conversation(
+    tmp_path: Path,
+) -> None:
+    repository = Mock()
+    bot = _test_bot(tmp_path, repository=repository)
+
+    await bot.on_raw_thread_delete(cast(Any, SimpleNamespace(thread_id=9876)))
+
+    repository.mark_conversation_deleted.assert_called_once_with(9876)
+
+
+@pytest.mark.asyncio
 async def test_shutdown_timeout_waits_for_active_ingress_before_returning(
     tmp_path: Path,
 ) -> None:
@@ -2265,6 +2655,71 @@ async def test_ready_preflight_publishes_sanitized_codex_auth_state(
 
 
 @pytest.mark.asyncio
+async def test_ready_preflight_retries_failed_startup_recovery(
+    tmp_path: Path,
+) -> None:
+    repository = Mock()
+    repository.list_enabled_projects.return_value = ()
+    bot = _test_bot(tmp_path, repository=repository)
+    bot._gateway_ready = True
+    bot._startup_recovery_retry_seconds = 0.01
+    bot.session_lifecycle.restore_provider_barriers = AsyncMock(
+        side_effect=[RuntimeError("temporary recovery failure"), None]
+    )
+    bot.turns.restore = AsyncMock()
+
+    complete = await bot._ready_preflight()
+    retry = bot._startup_recovery_task
+    assert not complete
+    assert retry is not None
+
+    await asyncio.wait_for(retry, timeout=1)
+
+    assert bot._startup_preflight_complete
+    assert not bot._ready_preflight_degraded
+    bot.turns.restore.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ready_preflight_keeps_runtime_degraded_until_runtime_retry(
+    tmp_path: Path,
+) -> None:
+    repository = Mock()
+    repository.list_enabled_projects.return_value = [
+        SimpleNamespace(id="project-1")
+    ]
+    bot = _test_bot(tmp_path, repository=repository)
+    bot._gateway_ready = True
+    bot._startup_recovery_retry_seconds = 0.01
+    runtime = Mock()
+    runtime.account_status = AsyncMock(
+        return_value=SimpleNamespace(auth_required=False)
+    )
+    bot.runtimes.ensure = AsyncMock(
+        side_effect=[
+            RuntimeError("temporary runtime failure"),
+            (runtime, SimpleNamespace()),
+        ]
+    )
+    bot.session_lifecycle.restore_provider_barriers = AsyncMock()
+    bot.turns.restore = AsyncMock()
+
+    complete = await bot._ready_preflight()
+    retry = bot._startup_recovery_task
+    assert not complete
+    assert retry is not None
+    assert bot._provider_recovery_complete
+    assert not bot._runtime_preflight_complete
+
+    await asyncio.wait_for(retry, timeout=1)
+
+    assert bot._startup_preflight_complete
+    assert not bot._ready_preflight_degraded
+    assert bot.runtimes.ensure.await_count == 2
+    bot.turns.restore.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_final_attachment_failure_falls_back_to_actual_content(
     tmp_path: Path,
 ) -> None:
@@ -2393,6 +2848,72 @@ async def test_final_attachment_failure_falls_back_to_actual_content(
 
 
 @pytest.mark.asyncio
+async def test_parent_source_link_does_not_overflow_full_final_chunk(
+    tmp_path: Path,
+) -> None:
+    source = "界" * 1900
+    plan = DurableDiscordRenderPlan((source,), ())
+    renderer = Mock(
+        artifact_root=tmp_path,
+        retention_days=30,
+        create_durable_plan=AsyncMock(return_value=plan),
+    )
+    renderer.load_durable_plan.return_value = plan
+    repository = Mock()
+    repository.render_plan.return_value = None
+    repository.persist_render_plan.return_value = RenderPlanRecord(
+        turn_id="turn-long-parent",
+        source_sha256=sha256_text(source),
+        plan_json=canonical_json(plan.to_payload(tmp_path)),
+        retention_until=1,
+    )
+    thread = Mock(spec=discord.Thread)
+    thread.id = 300
+    thread.archived = False
+    thread.locked = False
+    thread.send = AsyncMock(
+        side_effect=[Mock(id=1), Mock(id=2), Mock(id=3)]
+    )
+    client = Mock(spec=discord.Client)
+    client.user = Mock(id=999)
+    client.get_channel.return_value = thread
+    transport = DiscordOutboxTransport(
+        client=client,
+        repository=repository,
+        renderer=renderer,
+        signer=Mock(),
+    )
+    record = OutboxRecord(
+        id="long-parent",
+        destination_key="thread:300",
+        operation="send",
+        payload_json=canonical_json(
+            {
+                "kind": "turn_final",
+                "plain_text": source,
+                "turn_id": "turn-long-parent",
+                "state": "completed",
+                "input_message_id": "1234567890123456789",
+                "input_channel_id": "2234567890123456789",
+                "discord_guild_id": "3234567890123456789",
+            }
+        ),
+        delivery_marker="long-parent",
+        state="pending",
+        attempts=0,
+        lease_owner="test",
+    )
+
+    await transport.deliver(record)
+
+    assert len(thread.send.await_args_list) == 3
+    sent = [call.args[0] for call in thread.send.await_args_list]
+    assert all(len(content) <= 2000 for content in sent)
+    assert "Original request" in sent[0]
+    assert source in sent[1]
+
+
+@pytest.mark.asyncio
 async def test_corrupt_render_plan_uses_bounded_plain_text_fallback(
     tmp_path: Path,
 ) -> None:
@@ -2454,6 +2975,54 @@ async def test_corrupt_render_plan_uses_bounded_plain_text_fallback(
         summary="Discord rich rendering failed; bounded plain text was used",
         turn_id="turn-corrupt",
         details={"stable_code": "render_plan_invalid"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_render_fallback_attaches_short_output_split_into_five_chunks(
+    tmp_path: Path,
+) -> None:
+    source = "\n".join("x" * 600 for _ in range(10))
+    expected = DurableDiscordRenderPlan(("Complete source attached.",), ())
+    renderer = Mock(
+        artifact_root=tmp_path,
+        retention_days=30,
+        create_plain_text_fallback_plan=AsyncMock(return_value=expected),
+    )
+    repository = Mock()
+    transport = DiscordOutboxTransport(
+        client=Mock(spec=discord.Client),
+        repository=repository,
+        renderer=renderer,
+        signer=Mock(),
+    )
+
+    plan = await transport._render_fallback_plan(
+        turn_id="turn-five-chunks",
+        plain_text=source,
+        stable_code="render_plan_invalid",
+    )
+
+    assert plan is expected
+    renderer.create_plain_text_fallback_plan.assert_awaited_once_with(
+        turn_id="turn-five-chunks",
+        source=source,
+    )
+
+
+def test_plain_text_render_fallback_is_bounded_when_attachment_storage_fails() -> None:
+    source = ("持续输出 👩‍👩‍👧‍👦\n" * 2000).strip()
+
+    chunks = _bounded_plain_text_fallback(source)
+
+    assert len(chunks) == 4
+    assert all(len(chunk) <= 1900 for chunk in chunks)
+    assert "fallback truncated" in chunks[-1]
+
+
+def test_plain_text_render_fallback_handles_whitespace_only_output() -> None:
+    assert _bounded_plain_text_fallback("  \n\t") == (
+        "Codex completed, but rich rendering was unavailable.",
     )
 
 

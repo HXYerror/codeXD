@@ -11,7 +11,7 @@ from typing import Any, cast
 from codexd.domain.events import NormalizedEvent
 from codexd.domain.ids import canonical_json, new_id, sha256_text, utc_now_ms
 from codexd.domain.turns import InterruptOrigin, TurnState, assert_turn_transition
-from codexd.errors import NotFoundError, SecurityError, StorageError
+from codexd.errors import InvariantError, NotFoundError, SecurityError, StorageError
 from codexd.storage.progress import (
     insert_progress_update,
     insert_prompt_reaction_update,
@@ -158,12 +158,36 @@ class ProjectingEventSink:
         if event.provider_event_id:
             existing = connection.execute(
                 """
-                SELECT sequence FROM events
+                SELECT sequence, runtime_generation, kind, schema_version,
+                       payload_json, raw_type, raw_hash, raw_size
+                FROM events
                 WHERE turn_id = ? AND provider_event_id = ?
                 """,
                 (scope["id"], event.provider_event_id),
             ).fetchone()
             if existing:
+                expected = (
+                    int(scope["runtime_generation"]),
+                    event.kind,
+                    event.schema_version,
+                    canonical_json(dict(event.payload)),
+                    event.raw_type,
+                    event.raw_hash,
+                    event.raw_size,
+                )
+                actual = (
+                    int(existing["runtime_generation"]),
+                    existing["kind"],
+                    int(existing["schema_version"]),
+                    existing["payload_json"],
+                    existing["raw_type"],
+                    existing["raw_hash"],
+                    existing["raw_size"],
+                )
+                if actual != expected:
+                    raise InvariantError(
+                        "provider event ID was reused for different event content"
+                    )
                 return int(existing["sequence"]), False
         row = connection.execute(
             """
@@ -1404,7 +1428,8 @@ class ProjectingEventSink:
                 states=("pending",),
             )
         outbox_id = new_id()
-        connection.execute(
+        payload_json = canonical_json(payload)
+        inserted = connection.execute(
             """
             INSERT OR IGNORE INTO discord_outbox(
                 id, event_sequence, destination_key, operation,
@@ -1419,7 +1444,7 @@ class ProjectingEventSink:
                 destination_key,
                 operation,
                 depends_on_outbox_id,
-                canonical_json(payload),
+                payload_json,
                 dedupe_key,
                 coalesce_key,
                 marker,
@@ -1427,8 +1452,44 @@ class ProjectingEventSink:
                 now,
                 now,
             ),
+        ).rowcount
+        if inserted == 1:
+            return outbox_id
+        existing = connection.execute(
+            """
+            SELECT id, event_sequence, destination_key, operation,
+                   depends_on_outbox_id, payload_json, coalesce_key,
+                   delivery_marker
+            FROM discord_outbox
+            WHERE dedupe_key = ?
+            """,
+            (dedupe_key,),
+        ).fetchone()
+        if existing is None:
+            raise InvariantError("outbox dedupe conflict did not retain a row")
+        expected = (
+            event_sequence,
+            destination_key,
+            operation,
+            depends_on_outbox_id,
+            payload_json,
+            coalesce_key,
+            marker,
         )
-        return outbox_id
+        actual = (
+            int(existing["event_sequence"]),
+            existing["destination_key"],
+            existing["operation"],
+            existing["depends_on_outbox_id"],
+            existing["payload_json"],
+            existing["coalesce_key"],
+            existing["delivery_marker"],
+        )
+        if actual != expected:
+            raise InvariantError(
+                "outbox dedupe key was reused for a different projection"
+            )
+        return str(existing["id"])
 
     def _prepare_projection_identity(self) -> None:
         now = utc_now_ms()

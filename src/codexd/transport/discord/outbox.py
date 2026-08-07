@@ -22,6 +22,7 @@ from codexd.rendering.discord import (
     DurableRenderedAttachment,
     RenderedAttachment,
     split_discord_code,
+    split_discord_text,
 )
 from codexd.security.signing import ComponentSigner
 from codexd.storage.records import OutboxRecord
@@ -81,12 +82,28 @@ class OutboxWorker:
         transport: OutboxTransport,
         worker_id: str,
         poll_seconds: float = 0.5,
+        concurrency: int = 4,
+        lease_ms: int = 30_000,
+        lease_renew_seconds: float = 10.0,
         initial_ingress_ready: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
+        if poll_seconds <= 0:
+            raise ValueError("outbox poll interval must be positive")
+        if concurrency < 1 or concurrency > 32:
+            raise ValueError("outbox concurrency must be between 1 and 32")
+        if (
+            lease_ms < 1
+            or lease_renew_seconds <= 0
+            or lease_renew_seconds * 1000 >= lease_ms
+        ):
+            raise ValueError("outbox lease renewal must occur before lease expiry")
         self._repository = repository
         self._transport = transport
         self._worker_id = worker_id
         self._poll_seconds = poll_seconds
+        self._concurrency = concurrency
+        self._lease_ms = lease_ms
+        self._lease_renew_seconds = lease_renew_seconds
         self._initial_ingress_ready = initial_ingress_ready
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
@@ -104,10 +121,43 @@ class OutboxWorker:
 
     async def drain_once(self) -> bool:
         record = await asyncio.to_thread(
-            self._repository.claim_outbox, worker_id=self._worker_id
+            self._repository.claim_outbox,
+            worker_id=self._worker_id,
+            lease_ms=self._lease_ms,
         )
         if record is None:
             return False
+        lease_released = asyncio.Event()
+        delivery = asyncio.create_task(
+            self._deliver_claimed(record, lease_released),
+            name=f"codexd-outbox-delivery-{record.id}",
+        )
+        renewal = asyncio.create_task(
+            self._renew_lease(record, lease_released),
+            name=f"codexd-outbox-lease-{record.id}",
+        )
+        try:
+            done, _pending = await asyncio.wait(
+                {delivery, renewal},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if delivery in done:
+                return delivery.result()
+            error = renewal.exception()
+            if error is not None:
+                raise error
+            return await delivery
+        finally:
+            lease_released.set()
+            if not delivery.done():
+                delivery.cancel()
+            await asyncio.gather(delivery, renewal, return_exceptions=True)
+
+    async def _deliver_claimed(
+        self,
+        record: OutboxRecord,
+        lease_released: asyncio.Event,
+    ) -> bool:
         try:
             result = await self._transport.deliver(record)
         except asyncio.CancelledError:
@@ -118,6 +168,7 @@ class OutboxWorker:
                 if exc.retry_after is not None
                 else _retry_delay(record.attempts)
             )
+            lease_released.set()
             if exc.permanent and record.operation == "create_thread":
                 await asyncio.to_thread(
                     self._repository.fail_thread_creation_outbox,
@@ -161,6 +212,7 @@ class OutboxWorker:
                     ),
                 )
             return True
+
         except Exception as exc:
             logger.exception("Unexpected outbox delivery failure")
             await self._record_worker_incident(
@@ -168,6 +220,7 @@ class OutboxWorker:
                 summary="Discord outbox delivery failed unexpectedly",
                 details={"outbox_id": record.id, "exception": type(exc).__name__},
             )
+            lease_released.set()
             await asyncio.to_thread(
                 self._repository.retry_outbox,
                 record.id,
@@ -178,6 +231,7 @@ class OutboxWorker:
                 permanent=False,
             )
             return True
+        lease_released.set()
         await asyncio.to_thread(
             self._repository.ack_outbox,
             record.id,
@@ -213,7 +267,42 @@ class OutboxWorker:
                 )
         return True
 
+    async def _renew_lease(
+        self,
+        record: OutboxRecord,
+        stop: asyncio.Event,
+    ) -> None:
+        while not stop.is_set():
+            with suppress(TimeoutError):
+                await asyncio.wait_for(
+                    stop.wait(),
+                    timeout=self._lease_renew_seconds,
+                )
+            if stop.is_set():
+                return
+            renewed = await asyncio.to_thread(
+                self._repository.renew_outbox_lease,
+                record.id,
+                lease_owner=record.lease_owner,
+                lease_attempt=record.attempts,
+                lease_ms=self._lease_ms,
+            )
+            if not renewed:
+                if stop.is_set():
+                    return
+                raise RuntimeError(
+                    f"outbox delivery lease was lost for {record.id}"
+                )
+
     async def _run(self) -> None:
+        async with asyncio.TaskGroup() as workers:
+            for index in range(self._concurrency):
+                workers.create_task(
+                    self._worker_loop(),
+                    name=f"codexd-discord-outbox-{index}",
+                )
+
+    async def _worker_loop(self) -> None:
         while not self._stop.is_set():
             try:
                 processed = await self.drain_once()
@@ -501,9 +590,23 @@ class DiscordOutboxTransport:
         messages = list(rendered.messages)
         attachments = list(rendered.attachments)
         if not messages and not attachments:
-            messages = ["Codex completed without a final response."]
+            state = str(payload.get("state", "completed"))
+            messages = [
+                {
+                    "completed": "Codex completed without a final response.",
+                    "failed": "Codex failed before producing a final response.",
+                    "cancelled": "Codex was cancelled before producing a final response.",
+                    "interrupted": "Codex was interrupted before producing a final response.",
+                }.get(state, f"Codex ended in state `{state}` without a final response.")
+            ]
         reference = _final_message_reference(channel, payload)
         source_url = _final_source_url(channel, payload)
+        if source_url is not None:
+            prefix = f"-# Original request: <{source_url}>\n\n"
+            if messages and len(prefix) + len(messages[0]) + 25 <= 2000:
+                messages[0] = prefix + messages[0]
+            else:
+                messages.insert(0, prefix.rstrip())
         first: discord.Message | None = None
         for index, content in enumerate(messages):
             part_marker = marker if index == 0 else f"{marker}-{index}"
@@ -512,8 +615,6 @@ class DiscordOutboxTransport:
                 if existing is not None:
                     first = first or existing
                     continue
-            if index == 0 and source_url is not None:
-                content = f"-# Original request: <{source_url}>\n\n{content}"
             if index == 0 and reference is not None:
                 message = await channel.send(
                     _with_marker_strict(content, part_marker),
@@ -602,6 +703,16 @@ class DiscordOutboxTransport:
             turn_id=turn_id,
             details={"stable_code": stable_code},
         )
+        if len(_plain_text_fallback_chunks(plain_text)) > 4:
+            try:
+                return await self._renderer.create_plain_text_fallback_plan(
+                    turn_id=turn_id,
+                    source=plain_text,
+                )
+            except (CodexDError, OSError, ValueError):
+                logger.exception(
+                    "Could not persist complete rich-rendering fallback attachment"
+                )
         return DurableDiscordRenderPlan(
             messages=_bounded_plain_text_fallback(plain_text),
             attachments=(),
@@ -865,10 +976,9 @@ class DiscordOutboxTransport:
         content = payload.get("content")
         if not turn_id or not isinstance(content, str) or not content:
             raise DeliveryError("turn_progress_payload_invalid", permanent=True)
-        plain_text = payload.get("plain_text", "")
-        if not isinstance(plain_text, str):
+        plain_text = payload.get("plain_text")
+        if plain_text is not None and not isinstance(plain_text, str):
             raise DeliveryError("turn_progress_payload_invalid", permanent=True)
-        rendered = _with_marker(plain_text, marker)
         embed = progress_embed(content)
         if operation == "edit":
             message_id = await asyncio.to_thread(
@@ -881,8 +991,17 @@ class DiscordOutboxTransport:
                 except discord.NotFound:
                     pass
                 else:
+                    visible_text = (
+                        plain_text
+                        if isinstance(plain_text, str)
+                        else _without_hidden_marker(
+                            message.content
+                            if isinstance(message.content, str)
+                            else ""
+                        )
+                    )
                     await message.edit(
-                        content=rendered,
+                        content=_with_marker(visible_text, marker),
                         embed=embed,
                         allowed_mentions=discord.AllowedMentions.none(),
                         suppress=False,
@@ -891,6 +1010,7 @@ class DiscordOutboxTransport:
                         str(message.id),
                         turn_progress_id=turn_id,
                     )
+        rendered = _with_marker(plain_text or "", marker)
         if record_state != "pending":
             existing = await self._find_marker(channel, marker)
             if existing is not None:
@@ -950,11 +1070,24 @@ class DiscordOutboxTransport:
             error.incident_code = "discord_reconciliation_uncertain"
             raise error from exc
         if count >= 500:
-            raise DeliveryError(
-                "discord_history_window_exhausted",
-                permanent=False,
-                incident_code="discord_reconciliation_uncertain",
-            )
+            try:
+                await asyncio.to_thread(
+                    self._repository.record_incident,
+                    severity="warning",
+                    code="delivery_duplicate_possible",
+                    summary=(
+                        "Discord reconciliation history was exhausted; "
+                        "at-least-once delivery may create a duplicate"
+                    ),
+                    details={
+                        "destination_channel_id": str(channel.id),
+                        "marker_hash": sha256_text(marker)[:16],
+                    },
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to persist possible duplicate-delivery incident"
+                )
         return None
 
 
@@ -1144,7 +1277,12 @@ def _discord_file(
 def _with_marker(content: str, marker: str) -> str:
     marker_text = _hidden_delivery_marker(marker)
     maximum = 2000 - len(marker_text)
-    return content[:maximum] + marker_text
+    if len(content) > maximum:
+        try:
+            content = split_discord_text(content, limit=maximum)[0]
+        except ValueError:
+            content = content[:maximum]
+    return content + marker_text
 
 
 def _with_marker_strict(content: str, marker: str) -> str:
@@ -1166,30 +1304,41 @@ def _message_has_delivery_marker(content: str, marker: str) -> bool:
     )
 
 
-def _bounded_plain_text_fallback(source: str) -> tuple[str, ...]:
-    maximum_messages = 4
-    chunk_size = 1700
+def _without_hidden_marker(content: str) -> str:
+    if len(content) < 25:
+        return content
+    marker_start = len(content) - 25
+    if content[marker_start] != "\u200b":
+        return content
+    suffix = content[marker_start + 1 :]
+    if len(suffix) == 24 and all("\ufe00" <= value <= "\ufe0f" for value in suffix):
+        return content[:marker_start]
+    return content
+
+
+def _plain_text_fallback_chunks(source: str) -> tuple[str, ...]:
     text = discord.utils.escape_mentions(source)
-    limit = maximum_messages * chunk_size
-    truncated = len(text) > limit
-    text = text[:limit]
-    chunks: list[str] = []
-    while text and len(chunks) < maximum_messages:
-        end = min(len(text), chunk_size)
-        if end < len(text):
-            newline = text.rfind("\n", 0, end)
-            if newline >= chunk_size // 2:
-                end = newline + 1
-        chunks.append(text[:end].rstrip())
-        text = text[end:]
+    if not text.strip():
+        return ()
+    try:
+        return split_discord_text(text, limit=1700)
+    except ValueError:
+        return split_discord_code(text, limit=1700)
+
+
+def _bounded_plain_text_fallback(source: str) -> tuple[str, ...]:
+    chunks = _plain_text_fallback_chunks(source)
     if not chunks:
-        chunks.append("Codex completed, but rich rendering was unavailable.")
-    if truncated:
-        suffix = "\n\n[Output truncated after rich-rendering failure.]"
-        chunks[-1] = chunks[-1][: chunk_size - len(suffix)] + suffix
+        return ("Codex completed, but rich rendering was unavailable.",)
     prefix = "Rich rendering was unavailable; showing plain text.\n\n"
-    chunks[0] = prefix + chunks[0]
-    return tuple(filter(None, chunks[:maximum_messages]))
+    if len(chunks) <= 4:
+        return (prefix + chunks[0], *chunks[1:])
+    suffix = "\n\n[Complete output could not be attached; fallback truncated.]"
+    return (
+        prefix + chunks[0],
+        *chunks[1:3],
+        chunks[3] + suffix,
+    )
 
 
 def _discord_http_error(

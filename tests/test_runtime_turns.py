@@ -909,7 +909,7 @@ async def test_runtime_status_does_not_wait_for_watchdog_cleanup(
 
 
 @pytest.mark.asyncio
-async def test_runtime_crashes_aggregate_into_ten_minute_cooldown(
+async def test_runtime_crashes_report_without_exceeding_backoff_cap(
     storage_context: StorageContext,
 ) -> None:
     async def factory(_slot: object, generation: int) -> FakeCodexRuntime:
@@ -917,7 +917,7 @@ async def test_runtime_crashes_aggregate_into_ten_minute_cooldown(
 
     supervisor = _runtime_supervisor(storage_context, factory)
     slot = await supervisor._slot(storage_context.project.id)
-    for attempt in range(5):
+    for attempt in range(6):
         _runtime, lease = await supervisor.ensure(storage_context.project)
         await supervisor.report_failure(
             storage_context.project,
@@ -925,10 +925,11 @@ async def test_runtime_crashes_aggregate_into_ten_minute_cooldown(
             expected_generation=lease.generation,
             failure_code=f"runtime_test_crash_{attempt}",
         )
-        if attempt < 4:
+        if attempt < 5:
             slot.retry_at = 0
 
-    assert slot.retry_at - time.monotonic() > 590
+    remaining = slot.retry_at - time.monotonic()
+    assert 50 < remaining <= 60
     incident = storage_context.store.query_one(
         """
         SELECT code, details_json
@@ -938,10 +939,53 @@ async def test_runtime_crashes_aggregate_into_ten_minute_cooldown(
         (storage_context.project.id,),
     )
     assert incident is not None
-    assert json.loads(str(incident["details_json"]))["failure_count"] == 5
+    assert json.loads(str(incident["details_json"]))["failure_count"] == 6
     with pytest.raises(RuntimeUnavailable) as error:
         await supervisor.ensure(storage_context.project)
     assert error.value.failure.code == "runtime_restart_backoff"
+    await supervisor.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_startup_timeout_is_retryable_and_durable(
+    storage_context: StorageContext,
+) -> None:
+    async def factory(_slot: object, _generation: int) -> FakeCodexRuntime:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    supervisor = RuntimeSupervisor(
+        repository=storage_context.repository,
+        factory=factory,
+        topology="project_scoped",
+        environment={},
+        environment_hash="environment",
+        codex_home=None,
+        neutral_cwd=storage_context.root / ".runtime",
+        allowed_roots=(storage_context.root.parent,),
+        startup_timeout_seconds=0.01,
+    )
+
+    with pytest.raises(RuntimeUnavailable) as raised:
+        await supervisor.ensure(storage_context.project)
+
+    assert raised.value.failure.code == "runtime_start_timeout"
+    assert raised.value.failure.retryable
+    lease = storage_context.store.query_one(
+        """
+        SELECT state, failure_code
+        FROM runtime_leases
+        WHERE project_id = ?
+        ORDER BY generation DESC
+        LIMIT 1
+        """,
+        (storage_context.project.id,),
+    )
+    assert lease is not None
+    assert (lease["state"], lease["failure_code"]) == (
+        "failed",
+        "runtime_start_timeout",
+    )
     await supervisor.close()
 
 
@@ -963,7 +1007,7 @@ async def test_shared_runtime_crash_loop_is_globally_attributed(
         allowed_roots=(storage_context.root.parent,),
     )
     slot = await supervisor._slot("shared")
-    for attempt in range(5):
+    for attempt in range(6):
         _runtime, lease = await supervisor.ensure(storage_context.project)
         await supervisor.report_failure(
             storage_context.project,
@@ -971,7 +1015,7 @@ async def test_shared_runtime_crash_loop_is_globally_attributed(
             expected_generation=lease.generation,
             failure_code=f"shared_runtime_test_crash_{attempt}",
         )
-        if attempt < 4:
+        if attempt < 5:
             slot.retry_at = 0
 
     incident = storage_context.store.query_one(

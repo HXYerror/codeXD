@@ -25,6 +25,7 @@ from codexd.config import AppConfig, DiscordConfig, RuntimeConfig
 from codexd.errors import ConfigurationError
 from codexd.paths import AppPaths
 from codexd.service.containment import _WindowsJobContainment
+from codexd.service.locking import InstanceLock
 from codexd.service.manager import (
     _validate_registered_windows_task,
     _wait_for_fresh_heartbeat,
@@ -77,6 +78,53 @@ async def test_initial_discord_connection_retries_without_stopping_daemon(
     assert attempts == 2
     reset.assert_awaited_once_with(bot)
     health.observe_discord.assert_called_once_with("connecting")
+
+
+@pytest.mark.asyncio
+async def test_initial_discord_login_timeout_is_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stop = asyncio.Event()
+    attempts = 0
+
+    async def login(_token: str) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            await asyncio.Event().wait()
+
+    async def connect(*, reconnect: bool) -> None:
+        assert reconnect is True
+        stop.set()
+
+    bot = SimpleNamespace(
+        login=login,
+        connect=connect,
+        transport_initialized=False,
+    )
+    reset = AsyncMock()
+    monkeypatch.setattr(
+        daemon_module,
+        "_DISCORD_INITIAL_LOGIN_TIMEOUT_SECONDS",
+        0.01,
+    )
+    monkeypatch.setattr(
+        daemon_module,
+        "_DISCORD_INITIAL_RETRY_DELAYS_SECONDS",
+        (0.0,),
+    )
+    monkeypatch.setattr(daemon_module, "_reset_discord_client", reset)
+
+    await _start_discord_with_initial_retries(
+        bot=bot,
+        token="test-token",
+        stop=stop,
+        health=SimpleNamespace(observe_discord=Mock()),
+        logger=Mock(),
+    )
+
+    assert attempts == 2
+    reset.assert_awaited_once_with(bot)
 
 
 @pytest.mark.asyncio
@@ -232,6 +280,16 @@ def test_process_identity_detects_pid_reuse() -> None:
 
     assert process_matches(identity.pid, identity.start_token)
     assert not process_matches(identity.pid, "0.000000")
+
+
+def test_instance_lock_rejects_symlink(tmp_path: Path) -> None:
+    target = tmp_path / "target.lock"
+    target.write_bytes(b"")
+    linked = tmp_path / "linked.lock"
+    linked.symlink_to(target)
+
+    with pytest.raises(Exception, match="opened safely"):
+        InstanceLock(linked).acquire()
 
 
 @pytest.mark.parametrize(

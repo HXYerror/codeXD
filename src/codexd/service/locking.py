@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import os
+import stat
 from pathlib import Path
 from typing import BinaryIO
 
-from codexd.errors import ConflictError
+from codexd.errors import ConflictError, SecurityError
 
 
 class InstanceLock:
@@ -23,9 +24,19 @@ class InstanceLock:
         if self._file is not None:
             return
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        file = self.path.open("a+b")
-        if os.name != "nt":
-            self.path.chmod(0o600)
+        flags = os.O_APPEND | os.O_CREAT | os.O_RDWR
+        if hasattr(os, "O_BINARY"):
+            flags |= os.O_BINARY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(self.path, flags, 0o600)
+        except OSError as exc:
+            raise SecurityError("instance lock path could not be opened safely") from exc
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            os.close(descriptor)
+            raise SecurityError("instance lock path is not a regular file")
+        file = os.fdopen(descriptor, "a+b")
         try:
             _lock(file)
         except OSError as exc:

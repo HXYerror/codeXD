@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -63,6 +64,17 @@ def test_config_defaults_to_full_access_and_compatible_sdk(tmp_path: Path) -> No
     assert config.discord.owner_user_id == 456
 
 
+def test_schedule_poll_rejects_unrepresentable_integer(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        f"[schedule]\npoll_seconds = {10**400}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(Exception, match="finite and positive"):
+        load_config(config_file, environment={"HOME": str(tmp_path)})
+
+
 def test_runtime_accepts_an_explicit_codex_executable(tmp_path: Path) -> None:
     executable = tmp_path / "codex"
     executable.write_text("#!/bin/sh\n", encoding="utf-8")
@@ -78,6 +90,23 @@ def test_runtime_accepts_an_explicit_codex_executable(tmp_path: Path) -> None:
     assert config.runtime.codex_bin == executable.resolve()
 
 
+def test_config_rejects_nonfinite_poll_and_oversized_snowflake(
+    tmp_path: Path,
+) -> None:
+    nonfinite = tmp_path / "nonfinite.toml"
+    nonfinite.write_text("[schedule]\npoll_seconds = nan\n", encoding="utf-8")
+    with pytest.raises(Exception, match="finite and positive"):
+        load_config(nonfinite, environment={"HOME": str(tmp_path)})
+
+    oversized = tmp_path / "oversized.toml"
+    oversized.write_text(
+        f"[discord]\nguild_id = {1 << 64}\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(Exception, match="64-bit snowflake"):
+        load_config(oversized, environment={"HOME": str(tmp_path)})
+
+
 def test_runtime_rejects_a_non_executable_codex_file(tmp_path: Path) -> None:
     executable = tmp_path / "codex"
     executable.write_text("not executable", encoding="utf-8")
@@ -90,6 +119,22 @@ def test_runtime_rejects_a_non_executable_codex_file(tmp_path: Path) -> None:
 
     with pytest.raises(Exception, match="must be executable"):
         load_config(config_file, environment={"HOME": str(tmp_path)})
+
+
+def test_config_and_data_paths_reject_symlinks(tmp_path: Path) -> None:
+    real_config = tmp_path / "real.toml"
+    real_config.write_text("", encoding="utf-8")
+    linked_config = tmp_path / "linked.toml"
+    linked_config.symlink_to(real_config)
+    with pytest.raises(Exception, match="must not be a symlink"):
+        load_config(linked_config, environment={"HOME": str(tmp_path)})
+
+    target = tmp_path / "target"
+    target.mkdir()
+    data_link = tmp_path / "data"
+    data_link.symlink_to(target, target_is_directory=True)
+    with pytest.raises(SecurityError, match="must not be a symlink"):
+        AppPaths(data_link, tmp_path / "logs").ensure()
 
 
 def test_discord_owner_must_be_explicit_and_allowed(tmp_path: Path) -> None:
@@ -125,6 +170,12 @@ def test_project_path_must_be_inside_an_allowed_root(tmp_path: Path) -> None:
         resolve_project_path(str(outside), (allowed.resolve(),))
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX protected-directory assertion")
+def test_project_path_rejects_protected_system_directory() -> None:
+    with pytest.raises(SecurityError, match="protected system"):
+        resolve_project_path("/", (Path("/"),))
+
+
 def test_bootstrap_removes_secrets_before_sdk_import() -> None:
     source = {
         "HOME": "/tmp/home",
@@ -147,6 +198,12 @@ def test_bootstrap_removes_secrets_before_sdk_import() -> None:
     assert_environment_scrubbed(
         prepared.child_environment, environment=process_environment
     )
+    process_environment["SAFE_FLAG"] = "changed"
+    with pytest.raises(SecurityError, match="values changed"):
+        assert_environment_scrubbed(
+            prepared.child_environment,
+            environment=process_environment,
+        )
 
 
 def test_bootstrap_rejects_secret_named_allowlist_entries() -> None:
@@ -228,6 +285,38 @@ def test_redaction_covers_headers_environment_flags_urls_and_mfa() -> None:
     assert redact_value({"OPENAI_API_KEY": "opaque-secret"}) == {
         "OPENAI_API_KEY": "<redacted>"
     }
+
+
+def test_redaction_preserves_ordinary_basic_and_bearer_prose() -> None:
+    prose = (
+        "Use basic authentication, and note that the bearer, "
+        "who represents the caller."
+    )
+
+    assert redact_text(prose) == prose
+    assert (
+        redact_text("Supports Basic ClassName behavior.")
+        == "Supports Basic ClassName behavior."
+    )
+    assert redact_text("Run basic sha256sum now.") == "Run basic sha256sum now."
+    assert redact_text("Basic dXNlcjpwYXNz") == "Basic <redacted>"
+    assert redact_text("Basic YTph") == "Basic <redacted>"
+    assert (
+        redact_text("Bearer abcdefghijklmnopqrstuvwxyz")
+        == "Bearer <redacted>"
+    )
+    assert (
+        redact_text("Send bearer abcdefghijklmnopqrstuvwxyz")
+        == "Send bearer <redacted>"
+    )
+    assert (
+        redact_text("the bearer alphabeticonlytoken")
+        == "the bearer <redacted>"
+    )
+    assert (
+        redact_text("Send bearer eyJhbGciOiJIUzI1NiJ9.payload.signature")
+        == "Send bearer <redacted>"
+    )
 
 
 def test_json_formatter_redacts_messages_extras_and_exceptions() -> None:

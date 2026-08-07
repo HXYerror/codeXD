@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from codexd.config import resolve_project_path
+from codexd.domain.capabilities import CapabilityManifest
 from codexd.domain.ids import utc_now_ms
 from codexd.domain.models import AccountStatus, ModelCatalogSnapshot
 from codexd.errors import InvariantError, SecurityError
@@ -22,12 +23,12 @@ from codexd.storage.repository import Repository
 
 RuntimeFactory = Callable[[RuntimeSlotConfig, int], Awaitable[CodexRuntime]]
 _BACKOFF_SECONDS = (1, 2, 5, 10, 30, 60)
-_RUNTIME_CLOSE_TIMEOUT_SECONDS = 10.0
+_RUNTIME_STARTUP_TIMEOUT_SECONDS = 30.0
+_RUNTIME_CLOSE_TIMEOUT_SECONDS = 30.0
 _RUNTIME_WATCHDOG_INTERVAL_SECONDS = 30.0
 _RUNTIME_WATCHDOG_TIMEOUT_SECONDS = 5.0
 _CRASH_WINDOW_MS = 10 * 60 * 1000
-_CRASH_LOOP_THRESHOLD = 5
-_CRASH_LOOP_BACKOFF_SECONDS = 10 * 60
+_CRASH_LOOP_THRESHOLD = 6
 
 
 @dataclass
@@ -56,13 +57,18 @@ class RuntimeSupervisor:
         neutral_cwd: Path,
         allowed_roots: tuple[Path, ...],
         codex_bin: Path | None = None,
+        startup_timeout_seconds: float = _RUNTIME_STARTUP_TIMEOUT_SECONDS,
         watchdog_interval_seconds: float = _RUNTIME_WATCHDOG_INTERVAL_SECONDS,
         watchdog_timeout_seconds: float = _RUNTIME_WATCHDOG_TIMEOUT_SECONDS,
     ) -> None:
         if topology not in {"project_scoped", "shared"}:
             raise ValueError("runtime topology must be project_scoped or shared")
-        if watchdog_interval_seconds <= 0 or watchdog_timeout_seconds <= 0:
-            raise ValueError("runtime watchdog intervals must be positive")
+        if (
+            startup_timeout_seconds <= 0
+            or watchdog_interval_seconds <= 0
+            or watchdog_timeout_seconds <= 0
+        ):
+            raise ValueError("runtime timeouts and watchdog intervals must be positive")
         self._repository = repository
         self._factory = factory
         self._topology = topology
@@ -72,6 +78,7 @@ class RuntimeSupervisor:
         self._neutral_cwd = neutral_cwd
         self._allowed_roots = allowed_roots
         self._codex_bin = codex_bin
+        self._startup_timeout_seconds = startup_timeout_seconds
         self._watchdog_interval_seconds = watchdog_interval_seconds
         self._watchdog_timeout_seconds = watchdog_timeout_seconds
         self._slots: dict[str, RuntimeSlot] = {}
@@ -131,6 +138,7 @@ class RuntimeSupervisor:
             slot.startup_task = startup_task
             lease: RuntimeLeaseRecord | None = None
             runtime: CodexRuntime | None = None
+            manifest: CapabilityManifest | None = None
             try:
                 lease = await asyncio.to_thread(
                     self._repository.create_runtime_lease,
@@ -144,33 +152,54 @@ class RuntimeSupervisor:
                     environment_hash=self._environment_hash,
                 )
                 slot.lease = lease
-                runtime = await self._factory(slot_config, lease.generation)
-                if runtime.generation != lease.generation:
-                    raise AdapterInvariantError(
-                        AdapterFailure(
-                            code="runtime_generation_mismatch",
-                            provider_exception="RuntimeFactory",
-                            message="Runtime factory returned the wrong generation",
+
+                async def initialize_runtime() -> None:
+                    nonlocal manifest, runtime
+                    runtime = await self._factory(slot_config, lease.generation)
+                    if runtime.generation != lease.generation:
+                        raise AdapterInvariantError(
+                            AdapterFailure(
+                                code="runtime_generation_mismatch",
+                                provider_exception="RuntimeFactory",
+                                message="Runtime factory returned the wrong generation",
+                                retryable=False,
+                                runtime_generation=lease.generation,
+                            )
+                        )
+                    manifest = await runtime.capabilities()
+                    manifest.assert_required()
+                    account = await runtime.account_status()
+                    if account.auth_required:
+                        failure = AdapterFailure(
+                            code="codex_auth_required",
+                            provider_exception="AccountStatus",
+                            message="Codex authentication is required",
                             retryable=False,
                             runtime_generation=lease.generation,
                         )
+                        raise AdapterError(failure)
+                    catalog = await runtime.list_models()
+                    _assert_image_capability(catalog)
+                    if self._closing:
+                        raise InvariantError("runtime supervisor closed during startup")
+
+                try:
+                    await asyncio.wait_for(
+                        initialize_runtime(),
+                        timeout=self._startup_timeout_seconds,
                     )
-                manifest = await runtime.capabilities()
-                manifest.assert_required()
-                account = await runtime.account_status()
-                if account.auth_required:
-                    failure = AdapterFailure(
-                        code="codex_auth_required",
-                        provider_exception="AccountStatus",
-                        message="Codex authentication is required",
-                        retryable=False,
-                        runtime_generation=lease.generation,
-                    )
-                    raise AdapterError(failure)
-                catalog = await runtime.list_models()
-                _assert_image_capability(catalog)
-                if self._closing:
-                    raise InvariantError("runtime supervisor closed during startup")
+                except TimeoutError as exc:
+                    raise RuntimeUnavailable(
+                        AdapterFailure(
+                            code="runtime_start_timeout",
+                            provider_exception=type(exc).__name__,
+                            message="Codex runtime startup exceeded its deadline",
+                            retryable=True,
+                            runtime_generation=lease.generation,
+                        )
+                    ) from exc
+                if runtime is None or manifest is None:
+                    raise InvariantError("runtime startup did not produce a ready runtime")
                 await asyncio.to_thread(
                     self._repository.mark_runtime_ready,
                     lease.id,
@@ -262,6 +291,8 @@ class RuntimeSupervisor:
             finally:
                 if slot.startup_task is startup_task:
                     slot.startup_task = None
+            if runtime is None:
+                raise InvariantError("runtime startup completed without a runtime")
             slot.runtime = runtime
             slot.lease = RuntimeLeaseRecord(
                 id=lease.id,
@@ -678,7 +709,6 @@ class RuntimeSupervisor:
             min(slot.failures - 1, len(_BACKOFF_SECONDS) - 1)
         ]
         if failure_count >= _CRASH_LOOP_THRESHOLD:
-            delay = max(delay, _CRASH_LOOP_BACKOFF_SECONDS)
             await asyncio.to_thread(
                 self._repository.record_incident,
                 severity="error",

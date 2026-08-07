@@ -94,11 +94,13 @@ SDK_DECLARED_RANGE = ">=0.144.4,<0.145"
 _MAX_DELTA = 16 * 1024
 _THREAD_COMPACT_START_TIMEOUT_SECONDS = 30.0
 _SUBAGENT_DETAIL_TIMEOUT_SECONDS = 2.0
+_CANCELLED_STARTUP_CLEANUP_TIMEOUT_SECONDS = 30.0
 _NEW_THREAD_PERSISTENCE_NAME = "codexD session"
 _ARCHIVE_DIRECT_HANDLE_CONTRACT_VERIFIED = False
 _MIN_SDK_VERSION = (0, 144, 4)
 _MAX_SDK_VERSION = (0, 145, 0)
 logger = logging.getLogger(__name__)
+_PENDING_STARTUP_CLEANUPS: set[asyncio.Task[None]] = set()
 _COMPAT_UNKNOWN_NOTIFICATION_METHODS = frozenset(
     {
         "hook/completed",
@@ -118,6 +120,72 @@ _COMPAT_UNKNOWN_NOTIFICATION_METHODS = frozenset(
         "turn/moderationMetadata",
     }
 )
+
+
+def _schedule_cancelled_startup_cleanup(
+    client: AsyncCodex,
+    enter_task: asyncio.Task[Any],
+) -> None:
+    cleanup = asyncio.create_task(
+        _finish_cancelled_startup(client, enter_task),
+        name="codexd-sdk-cancelled-startup-cleanup",
+    )
+    _PENDING_STARTUP_CLEANUPS.add(cleanup)
+    cleanup.add_done_callback(_PENDING_STARTUP_CLEANUPS.discard)
+
+
+async def _wait_for_cancelled_startup_cleanups() -> None:
+    while pending := tuple(_PENDING_STARTUP_CLEANUPS):
+        await asyncio.wait(pending)
+
+
+async def _finish_cancelled_startup(
+    client: AsyncCodex,
+    enter_task: asyncio.Task[Any],
+) -> None:
+    try:
+        async with asyncio.timeout(_CANCELLED_STARTUP_CLEANUP_TIMEOUT_SECONDS):
+            await client.close()
+            await asyncio.shield(enter_task)
+            await client.close()
+    except asyncio.CancelledError:
+        _force_terminate_cancelled_startup_process(client)
+        await _cancel_startup_entry(enter_task)
+        raise
+    except TimeoutError:
+        logger.error("Cancelled Codex runtime startup cleanup exceeded its deadline")
+        _force_terminate_cancelled_startup_process(client)
+        await _cancel_startup_entry(enter_task)
+    except Exception:
+        logger.exception("Cancelled Codex runtime startup cleanup failed")
+        _force_terminate_cancelled_startup_process(client)
+        await _cancel_startup_entry(enter_task)
+
+
+async def _cancel_startup_entry(enter_task: asyncio.Task[Any]) -> None:
+    enter_task.cancel()
+    try:
+        await enter_task
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logger.exception("Cancelled Codex runtime startup task failed during cleanup")
+
+
+def _force_terminate_cancelled_startup_process(client: AsyncCodex) -> None:
+    async_client = getattr(client, "_client", None)
+    sync_client = getattr(async_client, "_sync", None)
+    process = getattr(sync_client, "_proc", None)
+    if process is None:
+        return
+    try:
+        process.kill()
+    except ProcessLookupError:
+        pass
+    except OSError:
+        logger.exception("Could not force-terminate cancelled Codex startup process")
+
+
 _UNKNOWN_OUTCOME_MUTATIONS = frozenset(
     {
         "thread.start",
@@ -159,17 +227,25 @@ class CodexSDKRuntime:
         slot: RuntimeSlotConfig,
         generation: int,
     ) -> CodexSDKRuntime:
+        await _wait_for_cancelled_startup_cleanups()
         _verify_public_contract()
         config = _sdk_config(slot, generation=generation)
         client = AsyncCodex(config)
+        enter_task = asyncio.create_task(
+            client.__aenter__(),
+            name=f"codexd-sdk-enter-{generation}",
+        )
         entered = False
         try:
-            await client.__aenter__()
+            await asyncio.shield(enter_task)
             entered = True
             manifest = capability_manifest(
                 runtime_version=_initialized_runtime_version(client)
             )
             manifest.assert_required()
+        except asyncio.CancelledError:
+            _schedule_cancelled_startup_cleanup(client, enter_task)
+            raise
         except CodexError as exc:
             if entered:
                 await _close_after_failed_create(client, exc)
@@ -322,7 +398,11 @@ class CodexSDKRuntime:
                 service_tier=config.service_tier,
             )
             self._threads[thread.id] = thread
-            return await self._identity(thread, requested_thread_id=thread_id)
+            return await self._identity_after_mutation(
+                thread,
+                requested_thread_id=thread_id,
+                operation="thread.resume",
+            )
         except CodexError as exc:
             raise _adapter_error(
                 exc,
@@ -1477,7 +1557,7 @@ def _normalize_notification_unredacted(
             "assistant.text.delta",
             {
                 "item_id": payload.item_id,
-                "text": _bounded(redact_text(payload.delta, project_root=cwd)),
+                "text": redact_text(payload.delta, project_root=cwd),
             },
             raw_type=method,
         )
@@ -1486,7 +1566,7 @@ def _normalize_notification_unredacted(
             "plan.delta",
             {
                 "item_id": payload.item_id,
-                "text": _bounded(redact_text(payload.delta, project_root=cwd)),
+                "text": redact_text(payload.delta, project_root=cwd),
             },
             raw_type=method,
         )
@@ -1527,7 +1607,7 @@ def _normalize_notification_unredacted(
         )
     if method == "turn/diff/updated":
         return NormalizedEvent(
-            "diff.updated", {"diff": _bounded(payload.diff, 256 * 1024)}, raw_type=method
+            "diff.updated", {"diff": payload.diff}, raw_type=method
         )
     if method == "turn/plan/updated":
         return NormalizedEvent(
@@ -1578,7 +1658,7 @@ def _normalize_item(method: str, item_wrapper: Any, *, cwd: Path) -> NormalizedE
             f"assistant.text.{suffix}",
             {
                 "item_id": item_id,
-                "text": _bounded(item.text) if completed else "",
+                "text": item.text if completed else "",
                 "phase": _enum_value(item.phase) if item.phase is not None else None,
             },
             provider_event_id=f"item:{item_id}:{suffix}",
@@ -1587,7 +1667,7 @@ def _normalize_item(method: str, item_wrapper: Any, *, cwd: Path) -> NormalizedE
     if item_type == "plan":
         return NormalizedEvent(
             f"plan.{suffix}",
-            {"item_id": item_id, "text": _bounded(item.text) if completed else ""},
+            {"item_id": item_id, "text": item.text if completed else ""},
             provider_event_id=f"item:{item_id}:{suffix}",
             raw_type=method,
         )

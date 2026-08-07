@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from openai_codex import (
@@ -72,6 +73,68 @@ def test_official_sdk_public_contract_and_required_manifest() -> None:
     manifest.assert_required()
     assert manifest.adapter == "openai_codex"
     assert "local_path" in manifest.image_input_modes
+
+
+@pytest.mark.asyncio
+async def test_cancelled_runtime_startup_retains_cleanup_ownership() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    closed = asyncio.Event()
+    client = Mock()
+
+    async def close() -> None:
+        closed.set()
+        release.set()
+
+    client.close = AsyncMock(side_effect=close)
+
+    async def enter() -> None:
+        started.set()
+        await release.wait()
+
+    enter_task = asyncio.create_task(enter())
+    await started.wait()
+    codex_sdk._schedule_cancelled_startup_cleanup(client, enter_task)
+    cleanup = next(iter(codex_sdk._PENDING_STARTUP_CLEANUPS))
+
+    await asyncio.wait_for(cleanup, timeout=1)
+
+    assert closed.is_set()
+    assert client.close.await_count == 2
+    assert not codex_sdk._PENDING_STARTUP_CLEANUPS
+
+
+@pytest.mark.asyncio
+async def test_cancelled_runtime_startup_cleanup_has_hard_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    process = Mock()
+    client = SimpleNamespace(
+        close=AsyncMock(),
+        _client=SimpleNamespace(_sync=SimpleNamespace(_proc=process)),
+    )
+
+    async def enter() -> None:
+        started.set()
+        await release.wait()
+
+    monkeypatch.setattr(
+        codex_sdk,
+        "_CANCELLED_STARTUP_CLEANUP_TIMEOUT_SECONDS",
+        0.01,
+    )
+    enter_task = asyncio.create_task(enter())
+    await started.wait()
+    codex_sdk._schedule_cancelled_startup_cleanup(client, enter_task)
+    cleanup = next(iter(codex_sdk._PENDING_STARTUP_CLEANUPS))
+
+    await asyncio.wait_for(cleanup, timeout=1)
+
+    assert enter_task.cancelled()
+    process.kill.assert_called_once_with()
+    assert not codex_sdk._PENDING_STARTUP_CLEANUPS
 
 
 def test_runtime_version_comes_from_initialized_server_metadata() -> None:
@@ -749,6 +812,39 @@ def test_normalized_provider_content_is_redacted_at_adapter_boundary(
         event = _normalize_notification(cast(Any, notification), cwd=tmp_path)
         assert secret not in str(event.payload)
         assert "<redacted>" in str(event.payload)
+
+
+def test_completed_assistant_message_is_not_silently_truncated(tmp_path: Path) -> None:
+    text = "长答案😀" * 10_000
+    notification = SimpleNamespace(
+        method="item/completed",
+        payload=SimpleNamespace(
+            item=SimpleNamespace(
+                root=SimpleNamespace(
+                    type="agentMessage",
+                    id="assistant-long",
+                    text=text,
+                    phase="final_answer",
+                )
+            )
+        ),
+    )
+
+    event = _normalize_notification(cast(Any, notification), cwd=tmp_path)
+
+    assert event.payload["text"] == text
+
+
+def test_assistant_stream_delta_is_not_silently_truncated(tmp_path: Path) -> None:
+    text = "流式内容😀" * 10_000
+    notification = SimpleNamespace(
+        method="item/agentMessage/delta",
+        payload=SimpleNamespace(item_id="assistant-long", delta=text),
+    )
+
+    event = _normalize_notification(cast(Any, notification), cwd=tmp_path)
+
+    assert event.payload["text"] == text
 
 
 def test_usage_token_counts_are_not_mistaken_for_credentials(tmp_path: Path) -> None:

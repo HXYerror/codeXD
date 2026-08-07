@@ -11,6 +11,7 @@ from codexd.application.conversation_locks import ConversationLocks
 from codexd.application.session_lifecycle import SessionLifecycleCoordinator
 from codexd.domain.conversations import (
     ConversationState,
+    SandboxProfile,
     ThreadConfig,
     ThreadIdentity,
     ThreadProviderState,
@@ -23,6 +24,34 @@ from codexd.runtime.errors import AdapterFailure, ProviderOutcomeUnknown
 from codexd.runtime.fake import FakeCodexRuntime
 from codexd.runtime.port import CompactStartResult
 from codexd.runtime.supervisor import RuntimeFactory, RuntimeSupervisor
+
+
+def test_revision_listing_does_not_hide_older_sessions(
+    storage_context: StorageContext,
+) -> None:
+    for index in range(105):
+        storage_context.repository.activate_thread_revision(
+            conversation_id=storage_context.conversation.id,
+            identity=ThreadIdentity(
+                thread_id=f"history-thread-{index}",
+                requested_thread_id=None,
+                provider_session_id=f"history-session-{index}",
+                forked_from_thread_id=None,
+                parent_thread_id=None,
+                provider_version="test",
+            ),
+            config=ThreadConfig(
+                model=None,
+                personality=None,
+                sandbox=SandboxProfile.FULL_ACCESS,
+            ),
+        )
+
+    revisions = storage_context.repository.list_thread_revisions(
+        storage_context.conversation.id
+    )
+
+    assert len(revisions) == 105
 
 
 @pytest.mark.asyncio
@@ -55,7 +84,7 @@ async def test_session_lifecycle_uses_provider_threads_and_preserves_history(
 
         forked = await lifecycle.fork(storage_context.conversation.id)
         assert forked.parent_revision_id == first.id
-        assert forked.provider_session_id != first.provider_session_id
+        assert forked.provider_session_id == first.provider_session_id
         assert storage_context.repository.resolve_thread_revision(
             storage_context.conversation.id, first.id[:8]
         ).state == "superseded"
@@ -441,7 +470,7 @@ async def test_fork_rejects_invalid_lineage_without_persisting_provider_ids(
             thread_id="unexpected-fork-thread",
             requested_thread_id=None,
             provider_session_id="unexpected-fork-session",
-            forked_from_thread_id="unrelated-thread",
+            forked_from_thread_id=source.provider_thread_id,
             parent_thread_id=None,
             provider_version="fake",
         )

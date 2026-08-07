@@ -93,16 +93,18 @@ def export_diagnostics(
             f".{destination.name}.{secrets.token_hex(6)}.tmp"
         )
         try:
-            with zipfile.ZipFile(
-                temporary_zip,
-                mode="x",
+            flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(temporary_zip, flags, 0o600)
+            with os.fdopen(descriptor, "w+b") as output_file, zipfile.ZipFile(
+                output_file,
+                mode="w",
                 compression=zipfile.ZIP_DEFLATED,
                 compresslevel=6,
             ) as archive:
                 for path in sorted(root.iterdir()):
                     archive.write(path, arcname=path.name)
-            if os.name != "nt":
-                temporary_zip.chmod(0o600)
             os.replace(temporary_zip, destination)
         finally:
             temporary_zip.unlink(missing_ok=True)
@@ -152,39 +154,40 @@ def _database_details(
         repository = Repository(store)
         incidents = list(repository.unresolved_incidents(limit=50))
         if include_content:
+            content = {
+                "messages": [
+                    {
+                        "turn_id": str(row["turn_id"]),
+                        "plain_text": str(row["plain_text"]),
+                    }
+                    for row in store.query_all(
+                        """
+                        SELECT turn_id, plain_text
+                        FROM message_projections
+                        ORDER BY rowid DESC
+                        LIMIT 100
+                        """
+                    )
+                ],
+                "events": [
+                    {
+                        "sequence": int(row["sequence"]),
+                        "kind": str(row["kind"]),
+                        "payload": json.loads(str(row["payload_json"])),
+                    }
+                    for row in store.query_all(
+                        """
+                        SELECT sequence, kind, payload_json
+                        FROM events
+                        ORDER BY sequence DESC
+                        LIMIT 100
+                        """
+                    )
+                ],
+            }
             _write_json(
                 root / "content.json",
-                {
-                    "messages": [
-                        {
-                            "turn_id": str(row["turn_id"]),
-                            "plain_text": str(row["plain_text"]),
-                        }
-                        for row in store.query_all(
-                            """
-                            SELECT turn_id, plain_text
-                            FROM message_projections
-                            ORDER BY rowid DESC
-                            LIMIT 100
-                            """
-                        )
-                    ],
-                    "events": [
-                        {
-                            "sequence": int(row["sequence"]),
-                            "kind": str(row["kind"]),
-                            "payload": json.loads(str(row["payload_json"])),
-                        }
-                        for row in store.query_all(
-                            """
-                            SELECT sequence, kind, payload_json
-                            FROM events
-                            ORDER BY sequence DESC
-                            LIMIT 100
-                            """
-                        )
-                    ],
-                },
+                redact_value(content),
             )
     return {"incidents": incidents}
 

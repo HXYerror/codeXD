@@ -117,6 +117,15 @@ def assert_environment_scrubbed(
     unexpected = sorted(set(actual) - set(allowed))
     if unexpected:
         raise SecurityError(f"process environment was not scrubbed: {unexpected}")
+    changed = sorted(
+        name
+        for name, value in actual.items()
+        if name in allowed and allowed[name] != value
+    )
+    if changed:
+        raise SecurityError(
+            f"process environment values changed after bootstrap: {changed}"
+        )
     if actual.get("CODEXD_DISCORD_TOKEN"):
         raise SecurityError("Discord token remained in process environment")
 

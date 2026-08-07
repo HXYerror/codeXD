@@ -98,6 +98,97 @@ def test_migration_integrity(storage_context: StorageContext) -> None:
     assert storage_context.store.foreign_key_check() == ()
 
 
+def test_outbox_dedupe_rejects_divergent_operation(
+    storage_context: StorageContext,
+) -> None:
+    repository = storage_context.repository
+    first = repository.enqueue_outbox(
+        destination_key="thread:300",
+        operation="send",
+        payload={"content": "first"},
+        dedupe_key="same-key",
+        delivery_marker="same-marker",
+    )
+
+    assert repository.enqueue_outbox(
+        destination_key="thread:300",
+        operation="send",
+        payload={"content": "first"},
+        dedupe_key="same-key",
+        delivery_marker="same-marker",
+    ) == first
+    with pytest.raises(InvariantError, match="dedupe key"):
+        repository.enqueue_outbox(
+            destination_key="thread:300",
+            operation="send",
+            payload={"content": "different"},
+            dedupe_key="same-key",
+            delivery_marker="same-marker",
+        )
+
+
+def test_provider_event_id_rejects_divergent_content(
+    storage_context: StorageContext,
+) -> None:
+    turn, lease = _running_turn(storage_context, "event-id-collision")
+    sink = ProjectingEventSink(
+        storage_context.store,
+        correlation_key=b"e" * 32,
+    )
+    event = NormalizedEvent(
+        "command.started",
+        {"item_id": "command", "command": "first", "status": "inProgress"},
+        provider_event_id="provider-event",
+    )
+
+    sink.record(
+        turn_id=turn.id,
+        runtime_generation=lease.generation,
+        event=event,
+    )
+    sink.record(
+        turn_id=turn.id,
+        runtime_generation=lease.generation,
+        event=event,
+    )
+    with pytest.raises(InvariantError, match="provider event ID"):
+        sink.record(
+            turn_id=turn.id,
+            runtime_generation=lease.generation,
+            event=NormalizedEvent(
+                "command.completed",
+                {"item_id": "command", "command": "different", "status": "completed"},
+                provider_event_id="provider-event",
+            ),
+        )
+
+
+def test_turn_revision_must_belong_to_active_conversation(
+    storage_context: StorageContext,
+) -> None:
+    _activate_schedule_target(storage_context, "revision-scope")
+    active = storage_context.repository.get_active_revision(
+        storage_context.conversation.id
+    )
+    assert active is not None
+    other = storage_context.repository.create_conversation(
+        project_id=storage_context.project.id,
+        discord_thread_id=301,
+        discord_guild_id=100,
+        discord_parent_channel_id=200,
+        owner_user_id=400,
+    )
+    turn = storage_context.repository.enqueue_turn(
+        conversation_id=other.id,
+        source=TurnSource.DISCORD,
+        turn_input=TurnInput(text="wrong revision"),
+        input_message_id="wrong-revision",
+    )
+
+    with pytest.raises(ConflictError, match="active revision"):
+        storage_context.repository.attach_turn_revision(turn.id, active.id)
+
+
 def test_tool_progress_updates_are_durably_throttled_and_terminal_is_immediate(
     storage_context: StorageContext,
     monkeypatch: pytest.MonkeyPatch,
@@ -1875,7 +1966,7 @@ def test_local_terminal_projection_is_complete_and_unblocked_by_dead_progress(
     assert claimed_final.id == final["id"]
 
 
-def test_terminal_progress_supersedes_reconciling_running_revision(
+def test_terminal_progress_reconciles_running_send_before_terminal_revision(
     storage_context: StorageContext,
 ) -> None:
     repository = storage_context.repository
@@ -1890,16 +1981,26 @@ def test_terminal_progress_supersedes_reconciling_running_revision(
     repository.request_cancel(turn.id, origin=InterruptOrigin.USER)
 
     repository.recover_startup(current_boot_id="new-boot")
-    terminal = repository.claim_outbox(worker_id="new-worker")
+    recovered = repository.claim_outbox(worker_id="new-worker")
 
+    assert recovered is not None
+    assert recovered.id == running.id
+    assert recovered.state == "reconciling"
+    repository.ack_outbox(
+        recovered.id,
+        lease_owner=recovered.lease_owner,
+        lease_attempt=recovered.attempts,
+        discord_message_id="reconciled-progress",
+    )
+    terminal = repository.claim_outbox(worker_id="new-worker")
     assert terminal is not None
     assert json.loads(terminal.payload_json)["state"] == "terminal"
-    stale = storage_context.store.query_one(
+    sent = storage_context.store.query_one(
         "SELECT state FROM discord_outbox WHERE id = ?",
         (running.id,),
     )
-    assert stale is not None
-    assert stale["state"] == "superseded"
+    assert sent is not None
+    assert sent["state"] == "sent"
 
 
 def test_permanent_discord_failure_blocks_conversation_and_records_incident(

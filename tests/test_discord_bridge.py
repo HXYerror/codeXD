@@ -32,7 +32,7 @@ from codexd.domain.models import (
     ServiceTierDescriptor,
 )
 from codexd.domain.schedules import MisfirePolicy, ScheduleKind
-from codexd.domain.turns import TurnInput, TurnSource
+from codexd.domain.turns import TurnInput, TurnSource, TurnState
 from codexd.errors import ConflictError, SecurityError
 from codexd.paths import AppPaths
 from codexd.runtime.codex_sdk import capability_manifest
@@ -208,6 +208,9 @@ async def test_every_registered_discord_command_executes_through_bridge(
         runtime_generation=lease.generation,
     )
     running_turn = repository.mark_turn_running(turn.id, "provider-turn")
+    repository.turn_recorded_diff = (  # type: ignore[method-assign]
+        lambda turn_id: "+bridge change\n" if turn_id == turn.id else None
+    )
     conversation = repository.get_conversation(storage_context.conversation.id)
     schedule_repository = ScheduleRepository(storage_context.store)
     schedule = schedule_repository.create(
@@ -536,6 +539,29 @@ async def test_command_acks_before_slow_intent_storage(
 
 
 @pytest.mark.asyncio
+async def test_steer_does_not_open_modal_until_turn_is_running(
+    storage_context: StorageContext,
+    tmp_path: Path,
+) -> None:
+    bot = _storage_bot(storage_context, tmp_path)
+    thread, text_channel = _thread_channels()
+    interaction = _interaction(
+        20_040,
+        thread=thread,
+        text_channel=text_channel,
+        in_thread=True,
+    )
+    storage_context.repository.active_turn_for_conversation = (  # type: ignore[method-assign]
+        lambda _conversation_id: SimpleNamespace(state=TurnState.STARTING)
+    )
+
+    with pytest.raises(ConflictError, match="wait until the Turn is running"):
+        await bot._steer(interaction)
+
+    interaction.response.send_modal.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("oversized", [False, True])
 async def test_diff_attaches_only_when_oversized(
     storage_context: StorageContext,
@@ -793,7 +819,8 @@ async def test_duplicate_command_replays_specific_persisted_result(
     duplicate_action.assert_not_awaited()
     response = duplicate.followup.send.await_args.args[0]
     assert "`ok`" in response
-    assert "specific command result" in response
+    assert "`/duplicate test` completed." in response
+    assert "specific command result" not in response
 
 
 @pytest.mark.asyncio
