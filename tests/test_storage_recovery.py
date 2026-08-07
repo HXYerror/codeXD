@@ -2669,13 +2669,25 @@ def test_permanent_progress_cleanup_failure_preserves_terminal_result(
     ) == 1
 
 
-def test_tampered_progress_cleanup_kind_isolated_from_terminal_delivery(
+@pytest.mark.parametrize(
+    "tamper",
+    (
+        "dependency",
+        "destination",
+        "payload",
+        "operation_signal_only",
+        "dedupe_signal_only",
+        "payload_signal_only",
+    ),
+)
+def test_tampered_progress_cleanup_isolated_from_terminal_delivery(
     storage_context: StorageContext,
+    tamper: str,
 ) -> None:
     repository = storage_context.repository
     turn, final, schedule_id = _terminal_schedule_final_with_remote_progress(
         storage_context,
-        "cleanup-tampered-kind",
+        f"cleanup-tampered-{tamper}",
     )
     repository.ack_outbox(
         final.id,
@@ -2690,13 +2702,59 @@ def test_tampered_progress_cleanup_kind_isolated_from_terminal_delivery(
     )
     assert final_before is not None
     with storage_context.store.transaction() as connection:
-        connection.execute(
-            "UPDATE discord_outbox SET payload_json = ? WHERE id = ?",
-            (
-                canonical_json({"kind": "turn_final", "turn_id": turn.id}),
-                cleanup.id,
-            ),
-        )
+        if tamper == "dependency":
+            connection.execute(
+                "UPDATE discord_outbox SET depends_on_outbox_id = NULL WHERE id = ?",
+                (cleanup.id,),
+            )
+        elif tamper == "destination":
+            connection.execute(
+                "UPDATE discord_outbox SET destination_key = 'thread:999' WHERE id = ?",
+                (cleanup.id,),
+            )
+        elif tamper == "payload":
+            connection.execute(
+                "UPDATE discord_outbox SET payload_json = ? WHERE id = ?",
+                (
+                    canonical_json({"kind": "turn_final", "turn_id": turn.id}),
+                    cleanup.id,
+                ),
+            )
+        elif tamper == "operation_signal_only":
+            connection.execute(
+                """
+                UPDATE discord_outbox
+                SET dedupe_key = ?, payload_json = ?
+                WHERE id = ?
+                """,
+                (
+                    f"tampered:{cleanup.id}",
+                    canonical_json({"kind": "turn_final", "turn_id": turn.id}),
+                    cleanup.id,
+                ),
+            )
+        elif tamper == "dedupe_signal_only":
+            connection.execute(
+                """
+                UPDATE discord_outbox
+                SET operation = 'edit', payload_json = ?
+                WHERE id = ?
+                """,
+                (
+                    canonical_json({"kind": "turn_final", "turn_id": turn.id}),
+                    cleanup.id,
+                ),
+            )
+        else:
+            assert tamper == "payload_signal_only"
+            connection.execute(
+                """
+                UPDATE discord_outbox
+                SET operation = 'edit', dedupe_key = ?
+                WHERE id = ?
+                """,
+                (f"tampered:{cleanup.id}", cleanup.id),
+            )
 
     repository.fail_outbox_permanently(
         cleanup.id,
@@ -2721,18 +2779,26 @@ def test_tampered_progress_cleanup_kind_isolated_from_terminal_delivery(
         (turn.id,),
     )
     assert failed_view is not None
-    assert failed_view["cleanup_state"] == "delete_failed"
+    assert failed_view["cleanup_state"] == "delete_pending"
     assert failed_view["discord_message_id"] is not None
     incidents = storage_context.store.query_all(
-        "SELECT code, turn_id FROM incidents WHERE conversation_id = ?",
-        (turn.conversation_id,),
+        """
+        SELECT code, project_id, conversation_id, turn_id, details_json
+        FROM incidents
+        WHERE code = 'discord_progress_delete_permanent'
+        """,
     )
-    assert [dict(incident) for incident in incidents] == [
-        {
-            "code": "discord_progress_delete_permanent",
-            "turn_id": turn.id,
-        }
-    ]
+    assert len(incidents) == 1
+    incident = incidents[0]
+    assert incident["code"] == "discord_progress_delete_permanent"
+    assert incident["project_id"] is None
+    assert incident["conversation_id"] is None
+    assert incident["turn_id"] is None
+    assert json.loads(incident["details_json"]) == {
+        "error_code": "turn_progress_delete_target_invalid",
+        "identity_valid": False,
+        "outbox_id": cleanup.id,
+    }
     assert storage_context.store.query_one(
         "SELECT 1 FROM audit_log WHERE conversation_id = ? "
         "AND action = 'conversation.blocked'",

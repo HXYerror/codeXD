@@ -4505,18 +4505,32 @@ class Repository:
             if changed != 1:
                 raise ConflictError("outbox delivery lease was lost")
 
-            progress_cleanup_turn_id = _terminal_progress_cleanup_turn_id(
-                connection,
-                outbox=outbox,
-            )
             try:
                 payload = json.loads(str(outbox["payload_json"]))
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, TypeError, ValueError):
                 payload = {}
+            cleanup_like = _terminal_progress_cleanup_like(
+                outbox=outbox,
+                payload=payload,
+            )
+            progress_cleanup_identity = None
+            if cleanup_like:
+                try:
+                    progress_cleanup_identity = _validate_terminal_progress_delete(
+                        connection,
+                        outbox_id=outbox_id,
+                        expected_state="dead_letter",
+                    )
+                except InvariantError:
+                    progress_cleanup_identity = None
             payload_turn_id = (
                 payload.get("turn_id") if isinstance(payload, dict) else None
             )
-            turn_id = progress_cleanup_turn_id or payload_turn_id
+            turn_id = (
+                progress_cleanup_identity.turn_id
+                if progress_cleanup_identity is not None
+                else payload_turn_id if not cleanup_like else None
+            )
             scope = None
             if isinstance(turn_id, str):
                 scope = connection.execute(
@@ -4533,7 +4547,7 @@ class Repository:
                 ).fetchone()
             if (
                 scope is None
-                and progress_cleanup_turn_id is None
+                and not cleanup_like
                 and str(outbox["destination_key"]).startswith("thread:")
             ):
                 thread_id = str(outbox["destination_key"]).partition(":")[2]
@@ -4562,21 +4576,22 @@ class Repository:
                 if scope is not None and scope["schedule_id"] is not None
                 else None
             )
-            if progress_cleanup_turn_id is not None:
-                connection.execute(
-                    """
-                    UPDATE turn_progress_views
-                    SET cleanup_state = 'delete_failed', updated_at = ?
-                    WHERE turn_id = ?
-                      AND destination_key = ?
-                      AND cleanup_state = 'delete_pending'
-                    """,
-                    (
-                        now,
-                        progress_cleanup_turn_id,
-                        outbox["destination_key"],
-                    ),
-                )
+            if cleanup_like:
+                if progress_cleanup_identity is not None:
+                    connection.execute(
+                        """
+                        UPDATE turn_progress_views
+                        SET cleanup_state = 'delete_failed', updated_at = ?
+                        WHERE turn_id = ?
+                          AND destination_key = ?
+                          AND cleanup_state = 'delete_pending'
+                        """,
+                        (
+                            now,
+                            progress_cleanup_identity.turn_id,
+                            progress_cleanup_identity.destination_key,
+                        ),
+                    )
                 _upsert_incident(
                     connection,
                     severity="error",
@@ -4588,7 +4603,11 @@ class Repository:
                     project_id=project_id,
                     conversation_id=conversation_id,
                     turn_id=scoped_turn_id,
-                    details={"error_code": error_code, "outbox_id": outbox_id},
+                    details={
+                        "error_code": error_code,
+                        "outbox_id": outbox_id,
+                        "identity_valid": progress_cleanup_identity is not None,
+                    },
                     now=now,
                 )
                 return
@@ -5991,37 +6010,23 @@ def _apply_progress_cleanup_after_ack(
         )
 
 
-def _terminal_progress_cleanup_turn_id(
-    connection: sqlite3.Connection,
+def _terminal_progress_cleanup_like(
     *,
     outbox: sqlite3.Row,
-) -> str | None:
-    if outbox["operation"] != "delete":
-        return None
-    match = re.fullmatch(
-        r"turn:([^:]+):progress:delete",
-        str(outbox["dedupe_key"]),
+    payload: object,
+) -> bool:
+    return (
+        outbox["operation"] == "delete"
+        or re.fullmatch(
+            r"turn:[^:]+:progress:delete",
+            str(outbox["dedupe_key"]),
+        )
+        is not None
+        or (
+            isinstance(payload, dict)
+            and payload.get("kind") == "turn_progress_delete"
+        )
     )
-    if match is None or outbox["depends_on_outbox_id"] is None:
-        return None
-    turn_id = match.group(1)
-    dependency = connection.execute(
-        """
-        SELECT operation, state, destination_key, dedupe_key
-        FROM discord_outbox
-        WHERE id = ?
-        """,
-        (outbox["depends_on_outbox_id"],),
-    ).fetchone()
-    if (
-        dependency is None
-        or dependency["operation"] != "send"
-        or dependency["state"] != "sent"
-        or dependency["destination_key"] != outbox["destination_key"]
-        or dependency["dedupe_key"] != f"turn:{turn_id}:final"
-    ):
-        return None
-    return turn_id
 
 
 def _enqueue_terminal_progress_cleanup(
