@@ -26,6 +26,9 @@ class DiscordConfig:
     owner_user_id: int | None = None
     allowed_user_ids: frozenset[int] = field(default_factory=frozenset)
     command_scope: str = "guild"
+    max_attachment_count: int = 10
+    file_max_bytes: int = 25 * 1024 * 1024
+    message_max_bytes: int = 50 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -176,7 +179,15 @@ def _resolve_existing_project_path(candidate: Path) -> Path:
 def _discord_config(raw: dict[str, Any], env: Mapping[str, str]) -> DiscordConfig:
     _reject_unknown(
         raw,
-        {"guild_id", "owner_user_id", "allowed_user_ids", "command_scope"},
+        {
+            "guild_id",
+            "owner_user_id",
+            "allowed_user_ids",
+            "command_scope",
+            "max_attachment_count",
+            "file_max_bytes",
+            "message_max_bytes",
+        },
         "discord",
     )
     guild_raw = env.get("CODEXD_DISCORD_GUILD_ID", raw.get("guild_id"))
@@ -211,11 +222,32 @@ def _discord_config(raw: dict[str, Any], env: Mapping[str, str]) -> DiscordConfi
     scope = _string(raw.get("command_scope", "guild"), "discord.command_scope")
     if scope != "guild":
         raise ConfigurationError("discord.command_scope must be 'guild'")
+    max_attachment_count = _positive_int(
+        raw.get("max_attachment_count", 10),
+        "discord.max_attachment_count",
+    )
+    if max_attachment_count > 10:
+        raise ConfigurationError("discord.max_attachment_count may not exceed 10")
+    file_max_bytes = _positive_int(
+        raw.get("file_max_bytes", 25 * 1024 * 1024),
+        "discord.file_max_bytes",
+    )
+    message_max_bytes = _positive_int(
+        raw.get("message_max_bytes", 50 * 1024 * 1024),
+        "discord.message_max_bytes",
+    )
+    if file_max_bytes > message_max_bytes:
+        raise ConfigurationError(
+            "discord.file_max_bytes may not exceed discord.message_max_bytes"
+        )
     return DiscordConfig(
         guild_id=guild_id,
         owner_user_id=owner_user_id,
         allowed_user_ids=users,
         command_scope=scope,
+        max_attachment_count=max_attachment_count,
+        file_max_bytes=file_max_bytes,
+        message_max_bytes=message_max_bytes,
     )
 
 

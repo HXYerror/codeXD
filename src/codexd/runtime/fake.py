@@ -28,13 +28,21 @@ from codexd.domain.models import (
 )
 from codexd.domain.turns import TurnIdentity, TurnInput
 from codexd.errors import NotFoundError
+from codexd.runtime.errors import file_input_unsupported
 from codexd.runtime.port import CompactStartResult, StartedTurn, TurnStream
 
 
 class FakeCodexRuntime:
-    def __init__(self, *, generation: int = 1, event_delay: float = 0) -> None:
+    def __init__(
+        self,
+        *,
+        generation: int = 1,
+        event_delay: float = 0,
+        mention_input_supported: bool = True,
+    ) -> None:
         self.generation = generation
         self.event_delay = event_delay
+        self.mention_input_supported = mention_input_supported
         self.closed = False
         self._thread_counter = 0
         self._turn_counter = 0
@@ -44,6 +52,7 @@ class FakeCodexRuntime:
         self._turn_events: dict[str, tuple[NormalizedEvent, ...]] = {}
         self._interrupts: set[str] = set()
         self.steers: dict[str, list[str]] = defaultdict(list)
+        self.started_inputs: list[TurnInput] = []
 
     def script(self, events: Iterable[NormalizedEvent]) -> None:
         self._scripts.append(tuple(events))
@@ -82,6 +91,7 @@ class FakeCodexRuntime:
                 "turn.reasoning_summary": True,
                 "turn.service_tier": True,
                 "web_search.config": True,
+                "mention.input": self.mention_input_supported,
                 "collab.item": EventCapability.SUPPORTED_NOT_OBSERVED,
             },
         )
@@ -192,9 +202,16 @@ class FakeCodexRuntime:
         input: TurnInput,
         config: TurnConfig,
     ) -> StartedTurn:
-        del input, config
+        if input.files and not self.mention_input_supported:
+            raise file_input_unsupported(
+                generation=self.generation,
+                thread_id=thread.thread_id,
+                turn_id=local_turn_id,
+            )
+        del config
         if thread.thread_id not in self._threads:
             raise NotFoundError(f"fake thread not found: {thread.thread_id}")
+        self.started_inputs.append(input)
         self._turn_counter += 1
         provider_turn_id = f"fake-turn-{self._turn_counter}"
         identity = TurnIdentity(local_turn_id, provider_turn_id, self.generation)

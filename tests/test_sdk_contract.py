@@ -3,13 +3,17 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import importlib.metadata
+import os
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, Mock
 
+import openai_codex
 import pytest
+from conftest import StorageContext
 from openai_codex import (
     CodexConfig,
     CodexError,
@@ -17,10 +21,14 @@ from openai_codex import (
     InvalidParamsError,
     InvalidRequestError,
     JsonRpcError,
+    LocalImageInput,
+    MentionInput,
     MethodNotFoundError,
     ParseError,
     RetryLimitExceededError,
     ServerBusyError,
+    SkillInput,
+    TextInput,
     TransportClosedError,
 )
 from openai_codex.generated.v2_all import (
@@ -31,6 +39,7 @@ from openai_codex.generated.v2_all import (
 from openai_codex.models import Notification, UnknownNotification
 from openai_codex.types import TurnStatus
 
+from codexd.config import RetentionConfig
 from codexd.domain.capabilities import CapabilityManifest
 from codexd.domain.conversations import (
     ApprovalPolicy,
@@ -39,8 +48,16 @@ from codexd.domain.conversations import (
     ThreadIdentity,
     TurnConfig,
 )
-from codexd.domain.turns import TurnInput
-from codexd.errors import InvariantError
+from codexd.domain.turns import (
+    TurnFile,
+    TurnImage,
+    TurnInput,
+    TurnSkill,
+    TurnSource,
+    TurnState,
+)
+from codexd.errors import AttachmentIntegrityError, InvariantError
+from codexd.paths import AppPaths
 from codexd.runtime import codex_sdk
 from codexd.runtime.codex_sdk import (
     CodexSDKRuntime,
@@ -56,6 +73,7 @@ from codexd.runtime.codex_sdk import (
 from codexd.runtime.errors import (
     AdapterError,
     AdapterInvariantError,
+    FileInputUnsupported,
     InterruptFailed,
     ProviderOutcomeUnknown,
     ProviderRateLimited,
@@ -64,6 +82,8 @@ from codexd.runtime.errors import (
     UnsupportedCapability,
 )
 from codexd.runtime.port import RuntimeSlotConfig
+from codexd.security import private_files
+from codexd.storage.retention import run_retention
 
 
 def test_official_sdk_public_contract_and_required_manifest() -> None:
@@ -73,6 +93,603 @@ def test_official_sdk_public_contract_and_required_manifest() -> None:
     manifest.assert_required()
     assert manifest.adapter == "openai_codex"
     assert "local_path" in manifest.image_input_modes
+    assert manifest.optional["mention.input"] is (
+        manifest.sdk_version == "0.144.4"
+        and codex_sdk._file_input_leasing_supported()
+    )
+
+
+@pytest.mark.asyncio
+async def test_sdk_0144_4_public_mention_constructor_and_exact_wire_contract() -> None:
+    assert openai_codex.MentionInput is MentionInput
+    assert codex_sdk._mention_input_contract_supported("0.144.4")
+    assert not codex_sdk._mention_input_contract_supported("0.144.5")
+
+    class CaptureWireClient:
+        def __init__(self) -> None:
+            self.input: list[dict[str, object]] | None = None
+
+        async def turn_start(
+            self,
+            thread_id: str,
+            input: list[dict[str, object]],
+            *,
+            params: object,
+        ) -> SimpleNamespace:
+            del params
+            assert thread_id == "thread"
+            self.input = input
+            return SimpleNamespace(turn=SimpleNamespace(id="turn"))
+
+    class CaptureCodex:
+        def __init__(self) -> None:
+            self._client = CaptureWireClient()
+
+        async def _ensure_initialized(self) -> None:
+            return None
+
+    client = CaptureCodex()
+    mention = MentionInput("资料.md", "/validated/opaque.bin")
+    handle = await openai_codex.AsyncThread(cast(Any, client), "thread").turn(mention)
+
+    assert (mention.name, mention.path) == ("资料.md", "/validated/opaque.bin")
+    assert handle.id == "turn"
+    assert client._client.input == [
+        {
+            "type": "mention",
+            "name": "资料.md",
+            "path": "/validated/opaque.bin",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "posix", reason="secure file leasing requires POSIX")
+async def test_runtime_maps_mixed_attachments_by_ordinal_without_prompt_downgrade(
+    tmp_path: Path,
+) -> None:
+    capture = _InputCaptureThread()
+    runtime = _runtime_for_input_capture(tmp_path, capture)
+    skill = TurnSkill("review", tmp_path / "SKILL.md", "skill-hash")
+    images = (
+        _turn_image(tmp_path / "late.png", ordinal=3, attachment_id="late-image"),
+        _turn_image(tmp_path / "middle.png", ordinal=1, attachment_id="middle-image"),
+    )
+    files = (
+        _turn_file(tmp_path / "late.bin", ordinal=2, display_name="late.pdf"),
+        _turn_file(tmp_path / "first.bin", ordinal=0, display_name="资料.txt"),
+    )
+
+    started = await runtime.start_turn(
+        local_turn_id="local",
+        thread=ThreadIdentity("thread", None, "session", None, None, "test"),
+        input=TurnInput(
+            text="inspect attachments",
+            images=images,
+            files=files,
+            skill_inputs=(skill,),
+        ),
+        config=_turn_config(tmp_path),
+    )
+
+    assert capture.inputs == [
+        [
+            TextInput("inspect attachments"),
+            SkillInput("review", str(tmp_path / "SKILL.md")),
+            MentionInput("资料.txt", str(files[1].canonical_path)),
+            LocalImageInput(str(tmp_path / "middle.png")),
+            MentionInput("late.pdf", str(files[0].canonical_path)),
+            LocalImageInput(str(tmp_path / "late.png")),
+        ]
+    ]
+    with pytest.raises(RuntimeUnavailable):
+        async for _event in started.stream:
+            pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "posix", reason="secure file leasing requires POSIX")
+async def test_runtime_starts_file_only_turn_with_one_mention(tmp_path: Path) -> None:
+    capture = _InputCaptureThread()
+    runtime = _runtime_for_input_capture(tmp_path, capture)
+    file = _turn_file(tmp_path / "only.bin", ordinal=0, display_name="only.zip")
+
+    started = await runtime.start_turn(
+        local_turn_id="local",
+        thread=ThreadIdentity("thread", None, "session", None, None, "test"),
+        input=TurnInput(files=(file,)),
+        config=_turn_config(tmp_path),
+    )
+
+    assert capture.inputs == [[MentionInput("only.zip", str(file.canonical_path))]]
+    with pytest.raises(RuntimeUnavailable):
+        async for _event in started.stream:
+            pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "posix", reason="secure file leasing requires POSIX")
+async def test_runtime_final_file_lease_rejects_named_path_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = _InputCaptureThread()
+    runtime = _runtime_for_input_capture(tmp_path, capture)
+    file = _turn_file(tmp_path / "leased.bin", ordinal=0, display_name="leased.txt")
+    original_read = os.read
+    replaced = False
+
+    def replace_during_hash(descriptor: int, size: int) -> bytes:
+        nonlocal replaced
+        chunk = original_read(descriptor, size)
+        if chunk and not replaced:
+            replaced = True
+            replacement = file.canonical_path.with_name("replacement.bin")
+            replacement.write_bytes(file.canonical_path.read_bytes())
+            replacement.chmod(0o600)
+            os.replace(replacement, file.canonical_path)
+        return chunk
+
+    monkeypatch.setattr(codex_sdk.os, "read", replace_during_hash)
+
+    with pytest.raises(AttachmentIntegrityError) as failure:
+        await runtime.start_turn(
+            local_turn_id="local",
+            thread=ThreadIdentity("thread", None, "session", None, None, "test"),
+            input=TurnInput(files=(file,)),
+            config=_turn_config(tmp_path),
+        )
+
+    assert failure.value.code == "attachment_integrity_failed"
+    assert file.attachment_id in str(failure.value)
+    assert str(file.canonical_path) not in str(failure.value)
+    assert capture.inputs == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "posix", reason="secure file leasing requires POSIX")
+async def test_runtime_file_lease_rejects_symlinked_private_parent(
+    tmp_path: Path,
+) -> None:
+    capture = _InputCaptureThread()
+    runtime = _runtime_for_input_capture(tmp_path, capture)
+    file = _turn_file(tmp_path / "leased.bin", ordinal=0, display_name="leased.txt")
+    input_root = file.canonical_path.parent
+    moved_root = input_root.with_name("moved-input")
+    input_root.rename(moved_root)
+    input_root.symlink_to(moved_root, target_is_directory=True)
+
+    with pytest.raises(AttachmentIntegrityError):
+        await runtime.start_turn(
+            local_turn_id="local",
+            thread=ThreadIdentity("thread", None, "session", None, None, "test"),
+            input=TurnInput(files=(file,)),
+            config=_turn_config(tmp_path),
+        )
+
+    assert capture.inputs == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "posix", reason="secure file leasing requires POSIX")
+async def test_abnormal_stream_retains_file_lease_until_confirmed_runtime_close(
+    storage_context: StorageContext,
+) -> None:
+    capture = _InputCaptureThread()
+    runtime = _runtime_for_input_capture(storage_context.root, capture)
+    file = replace(
+        _turn_file(
+            storage_context.store.path.parent / "leased.bin",
+            ordinal=0,
+            display_name="leased.txt",
+        ),
+        retention_until=1,
+    )
+    turn = storage_context.repository.enqueue_turn(
+        conversation_id=storage_context.conversation.id,
+        source=TurnSource.DISCORD,
+        turn_input=TurnInput(files=(file,)),
+        input_message_id="abnormal-file-stream",
+    )
+    process = SimpleNamespace(exited=False)
+    process.poll = lambda: 0 if process.exited else None
+
+    async def close() -> None:
+        process.exited = True
+
+    runtime._client = cast(
+        Any,
+        SimpleNamespace(
+            close=close,
+            _client=SimpleNamespace(_sync=SimpleNamespace(_proc=process)),
+        ),
+    )
+
+    started = await runtime.start_turn(
+        local_turn_id="local",
+        thread=ThreadIdentity("thread", None, "session", None, None, "test"),
+        input=TurnInput(files=(file,)),
+        config=_turn_config(storage_context.root),
+    )
+    descriptor = runtime._file_input_leases["turn"].descriptors[0]
+
+    with pytest.raises(RuntimeUnavailable, match="terminal event"):
+        async for _event in started.stream:
+            pass
+
+    terminal = storage_context.repository.terminal_turn(
+        turn.id,
+        target=TurnState.INTERRUPTED,
+        terminal_code="stream_ended_without_terminal",
+    )
+    assert terminal.state is TurnState.INTERRUPTED
+    assert runtime._file_input_leases["turn"].descriptors == (descriptor,)
+    assert "turn" in runtime._turn_handles
+    os.fstat(descriptor)
+    _assert_exclusive_lock(file.canonical_path, available=False)
+
+    paths = AppPaths(
+        storage_context.store.path.parent,
+        storage_context.store.path.parent / "logs",
+    )
+    retained = run_retention(
+        storage_context.store,
+        paths,
+        RetentionConfig(),
+        now_ms=1_000_000_000,
+    )
+    assert retained.input_attachments == 0
+    assert file.canonical_path.exists()
+
+    await runtime.close()
+
+    assert runtime._file_input_leases == {}
+    assert runtime._turn_handles == {}
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
+    _assert_exclusive_lock(file.canonical_path, available=True)
+    removed = run_retention(
+        storage_context.store,
+        paths,
+        RetentionConfig(),
+        now_ms=1_000_000_000,
+    )
+    assert removed.input_attachments == 1
+    assert not file.canonical_path.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "posix", reason="secure file leasing requires POSIX")
+async def test_runtime_releases_file_lease_before_yielding_terminal_event(
+    tmp_path: Path,
+) -> None:
+    notification = Notification(
+        "turn/completed",
+        TurnCompletedNotification(
+            thread_id="thread",
+            turn=Turn(id="turn", items=[], status=TurnStatus.completed),
+        ),
+    )
+    runtime = _runtime_for_notifications(tmp_path, (notification,))
+    file = _turn_file(tmp_path / "leased.bin", ordinal=0, display_name="leased.txt")
+    started = await runtime.start_turn(
+        local_turn_id="local",
+        thread=ThreadIdentity("thread", None, "session", None, None, "test"),
+        input=TurnInput(files=(file,)),
+        config=_turn_config(tmp_path),
+    )
+    descriptor = runtime._file_input_leases["turn"].descriptors[0]
+    stream = started.stream.__aiter__()
+
+    event = await anext(stream)
+
+    assert event.kind == "turn.completed"
+    assert runtime._file_input_leases == {}
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
+    close = getattr(stream, "aclose", None)
+    if callable(close):
+        await close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "posix", reason="secure file leasing requires POSIX")
+async def test_runtime_releases_file_lease_on_start_failure_and_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file = _turn_file(tmp_path / "leased.bin", ordinal=0, display_name="leased.txt")
+    acquired: list[int] = []
+    original_acquire = codex_sdk._acquire_file_input_lease
+
+    def record_acquire(value: TurnFile) -> int:
+        descriptor = original_acquire(value)
+        acquired.append(descriptor)
+        return descriptor
+
+    class FailingThread:
+        async def turn(self, *_args: object, **_kwargs: object) -> object:
+            raise CodexError("start failed")
+
+    monkeypatch.setattr(codex_sdk, "_acquire_file_input_lease", record_acquire)
+    failing = _runtime_for_input_capture(tmp_path, cast(Any, FailingThread()))
+    with pytest.raises(AdapterError):
+        await failing.start_turn(
+            local_turn_id="failed",
+            thread=ThreadIdentity("thread", None, "session", None, None, "test"),
+            input=TurnInput(files=(file,)),
+            config=_turn_config(tmp_path),
+        )
+    assert acquired
+    with pytest.raises(OSError):
+        os.fstat(acquired.pop())
+    _assert_exclusive_lock(file.canonical_path, available=True)
+
+    capture = _InputCaptureThread()
+    runtime = _runtime_for_input_capture(tmp_path, capture)
+    runtime._client = cast(Any, SimpleNamespace(close=AsyncMock()))
+    await runtime.start_turn(
+        local_turn_id="closing",
+        thread=ThreadIdentity("thread", None, "session", None, None, "test"),
+        input=TurnInput(files=(file,)),
+        config=_turn_config(tmp_path),
+    )
+    descriptor = runtime._file_input_leases["turn"].descriptors[0]
+
+    await runtime.close()
+
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
+    _assert_exclusive_lock(file.canonical_path, available=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "posix", reason="secure file leasing requires POSIX")
+@pytest.mark.parametrize("cancelled", (False, True))
+async def test_uncertain_file_start_force_terminates_before_descriptor_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cancelled: bool,
+) -> None:
+    file = _turn_file(tmp_path / "leased.bin", ordinal=0, display_name="leased.txt")
+    acquired: list[int] = []
+    events: list[str] = []
+    original_acquire = codex_sdk._acquire_file_input_lease
+    original_close = codex_sdk.os.close
+
+    def record_acquire(value: TurnFile) -> int:
+        descriptor = original_acquire(value)
+        acquired.append(descriptor)
+        return descriptor
+
+    def record_close(descriptor: int) -> None:
+        if acquired and descriptor == acquired[0]:
+            events.append("fd-close")
+        original_close(descriptor)
+
+    def kill() -> None:
+        assert acquired
+        os.fstat(acquired[0])
+        events.append("kill")
+
+    def wait(*, timeout: float) -> int:
+        assert timeout == codex_sdk._APP_SERVER_FORCE_WAIT_TIMEOUT_SECONDS
+        os.fstat(acquired[0])
+        events.append("wait")
+        return 0
+
+    class FailingThread:
+        async def turn(self, *_args: object, **_kwargs: object) -> object:
+            if cancelled:
+                raise asyncio.CancelledError
+            raise CodexError("start failed")
+
+    process = SimpleNamespace(kill=kill, wait=wait)
+    sync_client = SimpleNamespace(_proc=process)
+
+    async def close() -> None:
+        events.append("client-close")
+        # Match the SDK: it drops this reference before process shutdown.
+        sync_client._proc = None
+        raise OSError("close failed")
+
+    monkeypatch.setattr(codex_sdk, "_acquire_file_input_lease", record_acquire)
+    monkeypatch.setattr(codex_sdk.os, "close", record_close)
+    runtime = _runtime_for_input_capture(tmp_path, cast(Any, FailingThread()))
+    runtime._client = cast(
+        Any,
+        SimpleNamespace(
+            close=close,
+            _client=SimpleNamespace(_sync=sync_client),
+        ),
+    )
+
+    expected = asyncio.CancelledError if cancelled else RuntimeUnavailable
+    with pytest.raises(expected):
+        await runtime.start_turn(
+            local_turn_id="failed",
+            thread=ThreadIdentity("thread", None, "session", None, None, "test"),
+            input=TurnInput(files=(file,)),
+            config=_turn_config(tmp_path),
+        )
+
+    assert events == ["client-close", "kill", "wait", "fd-close"]
+    assert runtime._closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "posix", reason="secure file leasing requires POSIX")
+@pytest.mark.parametrize("cancelled", (False, True))
+async def test_runtime_close_force_terminates_before_descriptor_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cancelled: bool,
+) -> None:
+    capture = _InputCaptureThread()
+    runtime = _runtime_for_input_capture(tmp_path, capture)
+    file = _turn_file(tmp_path / "leased.bin", ordinal=0, display_name="leased.txt")
+    await runtime.start_turn(
+        local_turn_id="closing",
+        thread=ThreadIdentity("thread", None, "session", None, None, "test"),
+        input=TurnInput(files=(file,)),
+        config=_turn_config(tmp_path),
+    )
+    descriptor = runtime._file_input_leases["turn"].descriptors[0]
+    events: list[str] = []
+    original_close = codex_sdk.os.close
+
+    def record_close(value: int) -> None:
+        if value == descriptor:
+            events.append("fd-close")
+        original_close(value)
+
+    def kill() -> None:
+        os.fstat(descriptor)
+        events.append("kill")
+
+    def wait(*, timeout: float) -> int:
+        assert timeout == codex_sdk._APP_SERVER_FORCE_WAIT_TIMEOUT_SECONDS
+        os.fstat(descriptor)
+        events.append("wait")
+        return 0
+
+    process = SimpleNamespace(kill=kill, wait=wait)
+    sync_client = SimpleNamespace(_proc=process)
+
+    async def close() -> None:
+        events.append("client-close")
+        sync_client._proc = None
+        if cancelled:
+            raise asyncio.CancelledError
+        raise OSError("close failed")
+
+    runtime._client = cast(
+        Any,
+        SimpleNamespace(
+            close=close,
+            _client=SimpleNamespace(_sync=sync_client),
+        ),
+    )
+    monkeypatch.setattr(codex_sdk.os, "close", record_close)
+
+    expected = asyncio.CancelledError if cancelled else OSError
+    with pytest.raises(expected):
+        await runtime.close()
+
+    assert events == ["client-close", "kill", "wait", "fd-close"]
+    assert runtime._file_input_leases == {}
+    assert runtime._turn_handles == {}
+    assert runtime._threads == {}
+    assert runtime._closed
+    with pytest.raises(InvariantError, match="closed"):
+        await runtime.start_turn(
+            local_turn_id="after-close",
+            thread=ThreadIdentity("thread", None, "session", None, None, "test"),
+            input=TurnInput(text="must not start"),
+            config=_turn_config(tmp_path),
+        )
+    assert len(capture.inputs) == 1
+
+
+@pytest.mark.asyncio
+async def test_runtime_force_wait_failure_retains_file_leases(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime_for_input_capture(tmp_path, _InputCaptureThread())
+    path = tmp_path / "held.bin"
+    path.write_bytes(b"held")
+    descriptor = os.open(path, os.O_RDONLY)
+    runtime._file_input_leases["turn"] = codex_sdk._FileInputLeases((descriptor,))
+    events: list[str] = []
+    wait_attempts = 0
+
+    def kill() -> None:
+        events.append("kill")
+
+    def wait(*, timeout: float) -> int:
+        nonlocal wait_attempts
+        assert timeout == codex_sdk._APP_SERVER_FORCE_WAIT_TIMEOUT_SECONDS
+        wait_attempts += 1
+        events.append(f"wait-{wait_attempts}")
+        if wait_attempts == 1:
+            raise TimeoutError("process did not exit")
+        return 0
+
+    async def close() -> None:
+        raise OSError("close failed")
+
+    process = SimpleNamespace(kill=kill, wait=wait)
+    runtime._client = cast(
+        Any,
+        SimpleNamespace(
+            close=close,
+            _client=SimpleNamespace(
+                _sync=SimpleNamespace(_proc=process)
+            ),
+        ),
+    )
+
+    with pytest.raises(OSError, match="close failed"):
+        await runtime.close()
+
+    assert events == ["kill", "wait-1"]
+    assert not runtime._closed
+    assert runtime._file_lease_release_blocked
+    assert runtime._file_lease_process is process
+    assert runtime._file_input_leases["turn"].descriptors == (descriptor,)
+    os.fstat(descriptor)
+    with pytest.raises(InvariantError, match="termination is unconfirmed"):
+        await runtime.start_turn(
+            local_turn_id="blocked",
+            thread=ThreadIdentity("thread", None, "session", None, None, "test"),
+            input=TurnInput(text="must not start"),
+            config=_turn_config(tmp_path),
+        )
+
+    runtime._client = cast(Any, SimpleNamespace(close=AsyncMock()))
+    await runtime.close()
+    assert events == ["kill", "wait-1", "wait-2"]
+    assert runtime._file_lease_process is None
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
+
+
+@pytest.mark.asyncio
+async def test_runtime_rejects_files_before_provider_when_mention_capability_is_missing(
+    tmp_path: Path,
+) -> None:
+    capture = _InputCaptureThread()
+    manifest = _capability_manifest()
+    unsupported = replace(
+        manifest,
+        optional={**manifest.optional, "mention.input": False},
+    )
+    runtime = CodexSDKRuntime(
+        client=cast(Any, object()),
+        slot=_runtime_slot(tmp_path),
+        generation=7,
+        manifest=unsupported,
+    )
+    runtime._threads["thread"] = cast(Any, capture)
+    file = _turn_file(
+        tmp_path / "private-location.bin",
+        ordinal=0,
+        display_name="safe.txt",
+    )
+
+    with pytest.raises(FileInputUnsupported) as error:
+        await runtime.start_turn(
+            local_turn_id="local",
+            thread=ThreadIdentity("thread", None, "session", None, None, "test"),
+            input=TurnInput(files=(file,)),
+            config=_turn_config(tmp_path),
+        )
+
+    assert error.value.code == "file_input_unsupported"
+    assert error.value.failure.code == "file_input_unsupported"
+    assert not error.value.failure.retryable
+    assert str(file.canonical_path) not in error.value.failure.message
+    assert capture.inputs == []
 
 
 @pytest.mark.asyncio
@@ -966,6 +1583,74 @@ def test_in_range_patch_uses_verified_public_contract(
     assert manifest.optional["thread.compact"] is True
     assert manifest.optional["thread.archive"] is False
     assert manifest.optional["thread.unarchive"] is False
+    assert manifest.optional["mention.input"] is False
+
+
+def test_mention_capability_rejects_an_incompatible_public_constructor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class IncompatibleMentionInput:
+        def __init__(self, resource: str) -> None:
+            self.resource = resource
+
+    monkeypatch.setattr(openai_codex, "MentionInput", IncompatibleMentionInput)
+
+    assert not codex_sdk._mention_input_contract_supported("0.144.4")
+    assert codex_sdk.capability_manifest().optional["mention.input"] is False
+
+
+def test_windows_file_lease_facade_disables_mention_capability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(private_files, "_platform_name", lambda: "nt")
+
+    manifest = codex_sdk.capability_manifest()
+
+    assert manifest.optional["mention.input"] is False
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows semantics")
+def test_windows_runtime_reports_file_input_unsupported_without_handle_contract() -> None:
+    assert codex_sdk.capability_manifest().optional["mention.input"] is False
+
+
+@pytest.mark.asyncio
+async def test_missing_optional_mention_export_keeps_text_and_image_turns_working(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delattr(openai_codex, "MentionInput")
+    manifest = codex_sdk.capability_manifest()
+    assert manifest.optional["mention.input"] is False
+
+    capture = _InputCaptureThread()
+    runtime = CodexSDKRuntime(
+        client=cast(Any, object()),
+        slot=_runtime_slot(tmp_path),
+        generation=1,
+        manifest=manifest,
+    )
+    runtime._threads["thread"] = cast(Any, capture)
+    image = _turn_image(tmp_path / "image.png", ordinal=0, attachment_id="image")
+    await runtime.start_turn(
+        local_turn_id="text-image",
+        thread=ThreadIdentity("thread", None, "session", None, None, "test"),
+        input=TurnInput(text="inspect", images=(image,)),
+        config=_turn_config(tmp_path),
+    )
+    assert capture.inputs == [
+        [TextInput("inspect"), LocalImageInput(str(image.canonical_path))]
+    ]
+
+    file = _turn_file(tmp_path / "file.bin", ordinal=0, display_name="file.txt")
+    with pytest.raises(FileInputUnsupported):
+        await runtime.start_turn(
+            local_turn_id="file",
+            thread=ThreadIdentity("thread", None, "session", None, None, "test"),
+            input=TurnInput(files=(file,)),
+            config=_turn_config(tmp_path),
+        )
+    assert len(capture.inputs) == 1
 
 
 def test_codex_home_is_propagated_and_conflicts_fail(tmp_path: Path) -> None:
@@ -1305,7 +1990,9 @@ def test_interrupt_error_is_operation_specific() -> None:
 
 
 @pytest.mark.asyncio
-async def test_runtime_close_can_retry_after_client_close_failure(tmp_path: Path) -> None:
+async def test_runtime_close_finalizes_after_client_close_failure_without_process(
+    tmp_path: Path,
+) -> None:
     class RetryCloseClient:
         def __init__(self) -> None:
             self.attempts = 0
@@ -1325,11 +2012,11 @@ async def test_runtime_close_can_retry_after_client_close_failure(tmp_path: Path
 
     with pytest.raises(OSError, match="close failed"):
         await runtime.close()
-    assert not runtime._closed
+    assert runtime._closed
 
     await runtime.close()
 
-    assert client.attempts == 2
+    assert client.attempts == 1
     assert runtime._closed
 
 
@@ -1366,6 +2053,19 @@ class _NotificationThread:
 
     async def turn(self, *_args: object, **_kwargs: object) -> _NotificationHandle:
         return self._handle
+
+
+class _InputCaptureThread:
+    def __init__(self) -> None:
+        self.inputs: list[list[object]] = []
+
+    async def turn(
+        self,
+        input: list[object],
+        **_kwargs: object,
+    ) -> _NotificationHandle:
+        self.inputs.append(input)
+        return _NotificationHandle(())
 
 
 class _MutationThread:
@@ -1457,6 +2157,20 @@ def _runtime_for_notifications(
     return runtime
 
 
+def _runtime_for_input_capture(
+    root: Path,
+    capture: _InputCaptureThread,
+) -> CodexSDKRuntime:
+    runtime = CodexSDKRuntime(
+        client=cast(Any, object()),
+        slot=_runtime_slot(root),
+        generation=1,
+        manifest=_capability_manifest(),
+    )
+    runtime._threads["thread"] = cast(Any, capture)
+    return runtime
+
+
 def _runtime_for_mutations(
     root: Path,
     client: _MutationClient,
@@ -1475,3 +2189,75 @@ def _thread_config() -> ThreadConfig:
         personality=None,
         sandbox=SandboxProfile.READ_ONLY,
     )
+
+
+def _turn_config(root: Path) -> TurnConfig:
+    return TurnConfig(
+        cwd=root,
+        sandbox=SandboxProfile.READ_ONLY,
+        approval_mode=ApprovalPolicy.AUTO_REVIEW,
+    )
+
+
+def _turn_file(
+    path: Path,
+    *,
+    ordinal: int,
+    display_name: str,
+) -> TurnFile:
+    content = f"opaque:{display_name}".encode()
+    data_root = path.parent
+    attachment_root = data_root / "attachments"
+    input_root = attachment_root / "input"
+    input_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    data_root.chmod(0o700)
+    attachment_root.chmod(0o700)
+    input_root.chmod(0o700)
+    path = input_root / path.name
+    path.write_bytes(content)
+    path.chmod(0o600)
+    return TurnFile(
+        attachment_id=f"file-{ordinal}",
+        ordinal=ordinal,
+        canonical_path=path.resolve(strict=True),
+        display_name=display_name,
+        reported_media_type="application/octet-stream",
+        sha256=hashlib.sha256(content).hexdigest(),
+        size_bytes=len(content),
+        retention_until=9_999_999_999_999,
+    )
+
+
+def _turn_image(path: Path, *, ordinal: int, attachment_id: str) -> TurnImage:
+    path.write_bytes(b"normalized-image")
+    return TurnImage(
+        attachment_id=attachment_id,
+        ordinal=ordinal,
+        canonical_path=path.resolve(strict=True),
+        media_type="image/png",
+        source_sha256="source-image-hash",
+        sha256="normalized-image-hash",
+        size_bytes=16,
+        width=1,
+        height=1,
+        source_name_sanitized=path.name,
+        retention_until=9_999_999_999_999,
+    )
+
+
+def _assert_exclusive_lock(path: Path, *, available: bool) -> None:
+    if os.name != "posix":
+        pytest.skip("POSIX advisory locks are required for this assertion")
+    fcntl = importlib.import_module("fcntl")
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        if available:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        else:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)

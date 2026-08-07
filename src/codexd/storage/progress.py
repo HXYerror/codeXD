@@ -176,7 +176,7 @@ def insert_progress_update(
         "SELECT * FROM turn_progress_views WHERE turn_id = ?",
         (turn_id,),
     ).fetchone()
-    if view is None:
+    if view is None or str(view["cleanup_state"]) != "active":
         return None
     revision = int(view["content_revision"]) + 1
     connection.execute(
@@ -244,6 +244,7 @@ def insert_progress_update(
         connection,
         coalesce_key=coalesce_key,
         now=now,
+        states=("pending",),
     )
     outbox_id = new_id()
     connection.execute(

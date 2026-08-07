@@ -30,8 +30,9 @@ class EventPump:
     async def run(self, *, local_turn_id: str, started: StartedTurn) -> PumpResult:
         terminal: tuple[TurnState, str] | None = None
         stale_generation = False
+        stream = started.stream.__aiter__()
         try:
-            async for event in started.stream:
+            async for event in stream:
                 terminal, sequence = await self._record_event(
                     local_turn_id=local_turn_id,
                     started=started,
@@ -70,6 +71,10 @@ class EventPump:
                 if recorded
                 else PumpResult(TurnState.INTERRUPTED, "stale_generation_ignored")
             )
+        finally:
+            close = getattr(stream, "aclose", None)
+            if callable(close):
+                await close()
         if terminal is None:
             recorded = await self._record_stream_failure(
                 local_turn_id, started, "stream_ended_without_terminal"

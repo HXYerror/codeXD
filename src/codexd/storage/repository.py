@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import hashlib
 import hmac
 import json
 import os
 import re
 import sqlite3
+import stat
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
@@ -26,6 +29,7 @@ from codexd.domain.ids import (
 )
 from codexd.domain.turns import (
     InterruptOrigin,
+    TurnFile,
     TurnImage,
     TurnInput,
     TurnSkill,
@@ -34,13 +38,20 @@ from codexd.domain.turns import (
     assert_turn_transition,
 )
 from codexd.errors import (
+    AttachmentIntegrityError,
     ConflictError,
     InvariantError,
     NotFoundError,
     SecurityError,
     StorageError,
 )
-from codexd.security.redaction import redacted_summary
+from codexd.security.private_files import (
+    validate_private_directory_metadata as _validate_owner_only_directory,
+)
+from codexd.security.private_files import (
+    validate_private_file_metadata as _validate_owner_only_file,
+)
+from codexd.security.redaction import redacted_summary, safe_thread_title_summary
 from codexd.storage.progress import (
     insert_initial_progress,
     insert_progress_update,
@@ -57,6 +68,7 @@ from codexd.storage.records import (
     RenderPlanRecord,
     RuntimeLeaseRecord,
     ThreadRevisionRecord,
+    TurnProgressDeleteTarget,
     TurnRecord,
 )
 from codexd.storage.sqlite import SQLiteStore
@@ -915,6 +927,8 @@ class Repository:
         discord_message_id: str,
         content_hash: str,
         attachment_manifest_hash: str,
+        first_request_text: str,
+        has_image_attachment: bool,
         project_id: str,
         discord_guild_id: int,
         discord_channel_id: int,
@@ -953,13 +967,21 @@ class Repository:
                 return False, str(outbox_id)
             ingress_id = new_id()
             outbox_id = new_id()
+            title_summary = safe_thread_title_summary(
+                first_request_text,
+                project_root=Path(str(project["root_path"])),
+                has_image_attachment=has_image_attachment,
+            )
+            thread_name = f"{title_summary} · {ingress_id[:4]}"
+            if not 1 <= len(thread_name) <= 100:
+                raise InvariantError("generated Discord thread name is out of bounds")
             payload = {
                 "kind": "create_thread",
                 "starter_message_id": discord_message_id,
                 "expected_thread_id": discord_message_id,
                 "project_id": project_id,
                 "owner_user_id": owner_user_id,
-                "name": f"codex-{ingress_id[:8]}",
+                "name": thread_name,
             }
             connection.execute(
                 """
@@ -2642,7 +2664,10 @@ class Repository:
                 f"SELECT * FROM turns WHERE {id_column} = ?", (id_value,)
             ).fetchone()
             if existing is not None:
-                if existing["input_hash"] != turn_input.input_hash:
+                if not _turn_input_hash_matches(
+                    turn_input,
+                    str(existing["input_hash"]),
+                ):
                     raise ConflictError("duplicate Turn source has different input")
                 return _turn(existing)
 
@@ -2734,15 +2759,21 @@ class Repository:
                 sandbox_profile=str(conversation["sandbox_profile"]),
                 now=now,
             )
-            data_root = self.store.path.parent.resolve()
+            data_root = self.store.path.parent
             for image in turn_input.images:
                 try:
-                    relative_path = image.canonical_path.resolve(strict=True).relative_to(
-                        data_root
+                    _path, relative_path = _validate_input_artifact(
+                        data_root=data_root,
+                        candidate=image.canonical_path,
+                        expected_sha256=image.sha256,
+                        expected_size=image.size_bytes,
+                        require_input_directory=False,
+                        require_private_permissions=False,
                     )
-                except (OSError, ValueError) as exc:
-                    raise InvariantError(
-                        "input image must be stored inside the codexD data directory"
+                except _InvalidInputArtifact as exc:
+                    raise AttachmentIntegrityError(
+                        "input image must be stored safely inside the codexD data "
+                        f"directory and match its snapshot: {exc}"
                     ) from exc
                 connection.execute(
                     """
@@ -2765,6 +2796,45 @@ class Repository:
                         image.height,
                         image.source_name_sanitized,
                         image.retention_until,
+                        now,
+                    ),
+                )
+            for file in turn_input.files:
+                try:
+                    path, relative_path = _validate_input_artifact(
+                        data_root=data_root,
+                        candidate=file.canonical_path,
+                        expected_sha256=file.sha256,
+                        expected_size=file.size_bytes,
+                        require_input_directory=True,
+                        require_private_permissions=True,
+                    )
+                except _InvalidInputArtifact as exc:
+                    raise AttachmentIntegrityError(
+                        "input file must be stored safely inside the codexD input "
+                        f"attachment directory and match its snapshot: {exc}"
+                    ) from exc
+                if path != file.canonical_path:
+                    raise InvariantError("input file path must be canonical")
+                connection.execute(
+                    """
+                    INSERT INTO attachments(
+                        id, turn_id, kind, ordinal, relative_path,
+                        source_sha256, normalized_sha256, size_bytes, mime_type,
+                        width, height, source_name_sanitized, retention_until, created_at
+                    ) VALUES (?, ?, 'input_file', ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)
+                    """,
+                    (
+                        file.attachment_id,
+                        turn_id,
+                        file.ordinal,
+                        str(relative_path),
+                        file.sha256,
+                        file.sha256,
+                        file.size_bytes,
+                        file.reported_media_type,
+                        file.display_name,
+                        file.retention_until,
                         now,
                     ),
                 )
@@ -2869,25 +2939,20 @@ class Repository:
             """,
             (turn_id,),
         ):
-            relative = Path(str(row["relative_path"]))
-            if relative.is_absolute() or any(
-                part in {"", ".", ".."} for part in relative.parts
-            ):
-                raise ConflictError(f"queued image path is invalid: {row['id']}")
-            data_root = self.store.path.parent.resolve()
-            unresolved = data_root.joinpath(*relative.parts)
-            current = unresolved
-            while current != data_root:
-                if current.is_symlink():
-                    raise ConflictError(
-                        f"queued image path contains a symlink: {row['id']}"
-                    )
-                current = current.parent
-            path = unresolved.resolve(strict=True)
-            if not path.is_relative_to(data_root) or not path.is_file():
-                raise ConflictError(f"queued image path changed: {row['id']}")
-            if sha256_file(path) != row["normalized_sha256"]:
-                raise ConflictError(f"queued image attachment changed: {row['id']}")
+            data_root = self.store.path.parent
+            try:
+                path, _relative_path = _validate_stored_input_artifact(
+                    data_root=data_root,
+                    relative_path=str(row["relative_path"]),
+                    expected_sha256=str(row["normalized_sha256"]),
+                    expected_size=int(row["size_bytes"]),
+                    require_input_directory=False,
+                    require_private_permissions=False,
+                )
+            except _InvalidInputArtifact as exc:
+                raise AttachmentIntegrityError(
+                    f"queued image attachment is invalid ({exc}): {row['id']}"
+                ) from exc
             images.append(
                 TurnImage(
                     attachment_id=str(row["id"]),
@@ -2903,12 +2968,55 @@ class Repository:
                     retention_until=int(row["retention_until"]),
                 )
             )
+        files: list[TurnFile] = []
+        for row in self.store.query_all(
+            """
+            SELECT * FROM attachments
+            WHERE turn_id = ? AND kind = 'input_file'
+            ORDER BY ordinal, id
+            """,
+            (turn_id,),
+        ):
+            data_root = self.store.path.parent
+            try:
+                path, _relative_path = _validate_stored_input_artifact(
+                    data_root=data_root,
+                    relative_path=str(row["relative_path"]),
+                    expected_sha256=str(row["normalized_sha256"]),
+                    expected_size=int(row["size_bytes"]),
+                    require_input_directory=True,
+                    require_private_permissions=True,
+                )
+            except _InvalidInputArtifact as exc:
+                raise AttachmentIntegrityError(
+                    f"queued file attachment is invalid ({exc}): {row['id']}"
+                ) from exc
+            media_type_raw = row["mime_type"]
+            files.append(
+                TurnFile(
+                    attachment_id=str(row["id"]),
+                    ordinal=int(row["ordinal"]),
+                    canonical_path=path,
+                    display_name=str(row["source_name_sanitized"]),
+                    reported_media_type=(
+                        str(media_type_raw) if media_type_raw is not None else None
+                    ),
+                    sha256=str(row["normalized_sha256"]),
+                    size_bytes=int(row["size_bytes"]),
+                    retention_until=int(row["retention_until"]),
+                )
+            )
         turn_input = TurnInput(
             text=turn.queued_input_text,
             images=tuple(images),
+            files=tuple(files),
             skill_inputs=tuple(skills),
         )
-        if turn_input.input_hash != turn.input_hash:
+        if not _turn_input_hash_matches(turn_input, turn.input_hash):
+            if images or files:
+                raise AttachmentIntegrityError(
+                    "queued attachment input snapshot hash changed"
+                )
             raise ConflictError("queued Turn input snapshot hash changed")
         return turn_input
 
@@ -4275,6 +4383,7 @@ class Repository:
                   AND stale.coalesce_key IS NOT NULL
                   AND stale.operation <> 'send'
                   AND stale.coalesce_key NOT LIKE 'task-card:%'
+                  AND stale.coalesce_key NOT LIKE 'turn:%:progress'
                   AND EXISTS (
                       SELECT 1
                       FROM discord_outbox newer
@@ -4383,6 +4492,11 @@ class Repository:
             ).rowcount
             if changed != 1:
                 raise ConflictError("outbox delivery lease was lost")
+            outbox = connection.execute(
+                "SELECT * FROM discord_outbox WHERE id = ?",
+                (outbox_id,),
+            ).fetchone()
+            assert outbox is not None
             if task_card_view_id is not None and discord_message_id is not None:
                 view_changed = connection.execute(
                     """
@@ -4402,6 +4516,7 @@ class Repository:
                     UPDATE turn_progress_views
                     SET discord_message_id = ?, updated_at = ?
                     WHERE turn_id = ?
+                      AND cleanup_state IN ('active', 'legacy_ineligible')
                     """,
                     (discord_message_id, now, turn_progress_id),
                 ).rowcount
@@ -4409,6 +4524,11 @@ class Repository:
                     raise NotFoundError(
                         f"Turn progress view not found: {turn_progress_id}"
                     )
+            _apply_progress_cleanup_after_ack(
+                connection,
+                outbox=outbox,
+                now=now,
+            )
 
     def retry_outbox(
         self,
@@ -4493,9 +4613,30 @@ class Repository:
 
             try:
                 payload = json.loads(str(outbox["payload_json"]))
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, TypeError, ValueError):
                 payload = {}
-            turn_id = payload.get("turn_id") if isinstance(payload, dict) else None
+            cleanup_like = _terminal_progress_cleanup_like(
+                outbox=outbox,
+                payload=payload,
+            )
+            progress_cleanup_identity = None
+            if cleanup_like:
+                try:
+                    progress_cleanup_identity = _validate_terminal_progress_delete(
+                        connection,
+                        outbox_id=outbox_id,
+                        expected_state="dead_letter",
+                    )
+                except InvariantError:
+                    progress_cleanup_identity = None
+            payload_turn_id = (
+                payload.get("turn_id") if isinstance(payload, dict) else None
+            )
+            turn_id = (
+                progress_cleanup_identity.turn_id
+                if progress_cleanup_identity is not None
+                else payload_turn_id if not cleanup_like else None
+            )
             scope = None
             if isinstance(turn_id, str):
                 scope = connection.execute(
@@ -4510,7 +4651,11 @@ class Repository:
                     """,
                     (turn_id,),
                 ).fetchone()
-            if scope is None and str(outbox["destination_key"]).startswith("thread:"):
+            if (
+                scope is None
+                and not cleanup_like
+                and str(outbox["destination_key"]).startswith("thread:")
+            ):
                 thread_id = str(outbox["destination_key"]).partition(":")[2]
                 scope = connection.execute(
                     """
@@ -4537,6 +4682,41 @@ class Repository:
                 if scope is not None and scope["schedule_id"] is not None
                 else None
             )
+            if cleanup_like:
+                if progress_cleanup_identity is not None:
+                    connection.execute(
+                        """
+                        UPDATE turn_progress_views
+                        SET cleanup_state = 'delete_failed', updated_at = ?
+                        WHERE turn_id = ?
+                          AND destination_key = ?
+                          AND cleanup_state = 'delete_pending'
+                        """,
+                        (
+                            now,
+                            progress_cleanup_identity.turn_id,
+                            progress_cleanup_identity.destination_key,
+                        ),
+                    )
+                _upsert_incident(
+                    connection,
+                    severity="error",
+                    code="discord_progress_delete_permanent",
+                    summary=(
+                        "Discord progress cleanup failed permanently; "
+                        "the terminal result remains delivered"
+                    ),
+                    project_id=project_id,
+                    conversation_id=conversation_id,
+                    turn_id=scoped_turn_id,
+                    details={
+                        "error_code": error_code,
+                        "outbox_id": outbox_id,
+                        "identity_valid": progress_cleanup_identity is not None,
+                    },
+                    now=now,
+                )
+                return
             if conversation_id is not None:
                 connection.execute(
                     """
@@ -4744,15 +4924,32 @@ class Repository:
         value = row["discord_message_id"]
         return str(value) if value is not None else None
 
+    def turn_progress_delete_target(
+        self,
+        outbox_id: str,
+    ) -> TurnProgressDeleteTarget:
+        with self.store.transaction() as connection:
+            identity = _validate_terminal_progress_delete(
+                connection,
+                outbox_id=outbox_id,
+                expected_state="sending",
+            )
+            return TurnProgressDeleteTarget(
+                destination_key=identity.destination_key,
+                discord_message_id=identity.discord_message_id,
+            )
+
     def set_turn_progress_message(self, turn_id: str, message_id: str) -> None:
         with self.store.transaction() as connection:
+            now = utc_now_ms()
             changed = connection.execute(
                 """
                 UPDATE turn_progress_views
                 SET discord_message_id = ?, updated_at = ?
                 WHERE turn_id = ?
+                  AND cleanup_state IN ('active', 'legacy_ineligible')
                 """,
-                (message_id, utc_now_ms(), turn_id),
+                (message_id, now, turn_id),
             ).rowcount
             if changed != 1:
                 raise NotFoundError(f"Turn progress view not found: {turn_id}")
@@ -5652,6 +5849,237 @@ def mark_command_effect_in_transaction(
     return _command_intent(updated), True
 
 
+class _InvalidInputArtifact(ValueError):
+    pass
+
+
+def _turn_input_hash_matches(turn_input: TurnInput, expected: str) -> bool:
+    if hmac.compare_digest(turn_input.input_hash, expected):
+        return True
+    if turn_input.files:
+        return False
+    legacy_snapshot = turn_input.snapshot()
+    legacy_snapshot.pop("files")
+    legacy_hash = sha256_text(canonical_json(legacy_snapshot))
+    return hmac.compare_digest(legacy_hash, expected)
+
+
+def _validate_stored_input_artifact(
+    *,
+    data_root: Path,
+    relative_path: str,
+    expected_sha256: str,
+    expected_size: int,
+    require_input_directory: bool,
+    require_private_permissions: bool,
+) -> tuple[Path, Path]:
+    relative = Path(relative_path)
+    if (
+        relative.is_absolute()
+        or not relative.parts
+        or any(part in {"", ".", ".."} or "\\" in part for part in relative.parts)
+    ):
+        raise _InvalidInputArtifact("relative path is invalid")
+    root = _resolve_data_root(data_root)
+    return _validate_input_artifact(
+        data_root=root,
+        candidate=root.joinpath(*relative.parts),
+        expected_sha256=expected_sha256,
+        expected_size=expected_size,
+        require_input_directory=require_input_directory,
+        require_private_permissions=require_private_permissions,
+    )
+
+
+def _validate_input_artifact(
+    *,
+    data_root: Path,
+    candidate: Path,
+    expected_sha256: str,
+    expected_size: int,
+    require_input_directory: bool,
+    require_private_permissions: bool,
+) -> tuple[Path, Path]:
+    root = _resolve_data_root(data_root)
+    if not candidate.is_absolute() or ".." in candidate.parts:
+        raise _InvalidInputArtifact("path is not canonical and absolute")
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError as exc:
+        raise _InvalidInputArtifact("path escapes the data directory") from exc
+    if not relative.parts:
+        raise _InvalidInputArtifact("path does not identify a file")
+    if require_input_directory and (
+        len(relative.parts) != 3 or relative.parts[:2] != ("attachments", "input")
+    ):
+        raise _InvalidInputArtifact("path is outside the input attachment directory")
+
+    _inspect_input_artifact_path(
+        root=root,
+        relative=relative,
+        require_private_permissions=require_private_permissions,
+    )
+    descriptor = _open_input_artifact(root, relative)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise _InvalidInputArtifact("target is not a regular file")
+        if require_private_permissions:
+            _validate_private_file_metadata(before)
+        digest = hashlib.sha256()
+        observed_size = 0
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            observed_size += len(chunk)
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+    except OSError as exc:
+        raise _InvalidInputArtifact("file cannot be read safely") from exc
+    finally:
+        os.close(descriptor)
+    if (
+        before.st_dev != after.st_dev
+        or before.st_ino != after.st_ino
+        or before.st_size != after.st_size
+        or observed_size != after.st_size
+    ):
+        raise _InvalidInputArtifact("file changed while it was read")
+    if observed_size != expected_size:
+        raise _InvalidInputArtifact("file size changed")
+    if not hmac.compare_digest(digest.hexdigest(), expected_sha256):
+        raise _InvalidInputArtifact("file SHA-256 changed")
+
+    # Recheck the named path after reading so replacement of the directory entry
+    # cannot make the validated descriptor stand in for another artifact.
+    _inspect_input_artifact_path(
+        root=root,
+        relative=relative,
+        require_private_permissions=require_private_permissions,
+        expected_file=after,
+    )
+    try:
+        canonical = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise _InvalidInputArtifact("file disappeared after validation") from exc
+    if not canonical.is_relative_to(root):
+        raise _InvalidInputArtifact("resolved path escapes the data directory")
+    return canonical, relative
+
+
+def _resolve_data_root(data_root: Path) -> Path:
+    raw_root = data_root.absolute()
+    try:
+        metadata = raw_root.lstat()
+    except OSError as exc:
+        raise _InvalidInputArtifact("data directory is unavailable") from exc
+    if stat.S_ISLNK(metadata.st_mode):
+        raise _InvalidInputArtifact("data directory is a symlink")
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise _InvalidInputArtifact("data directory is not a directory")
+    try:
+        return raw_root.resolve(strict=True)
+    except OSError as exc:
+        raise _InvalidInputArtifact("data directory cannot be resolved") from exc
+
+
+def _inspect_input_artifact_path(
+    *,
+    root: Path,
+    relative: Path,
+    require_private_permissions: bool,
+    expected_file: os.stat_result | None = None,
+) -> None:
+    directories = (
+        root,
+        *(
+            root.joinpath(*relative.parts[:index])
+            for index in range(1, len(relative.parts))
+        ),
+    )
+    try:
+        for directory in directories:
+            metadata = directory.lstat()
+            if stat.S_ISLNK(metadata.st_mode):
+                raise _InvalidInputArtifact("path contains a symlink")
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise _InvalidInputArtifact("path parent is not a directory")
+            if require_private_permissions:
+                _validate_private_directory_metadata(metadata)
+        file_metadata = root.joinpath(*relative.parts).lstat()
+    except _InvalidInputArtifact:
+        raise
+    except OSError as exc:
+        raise _InvalidInputArtifact("path is missing or inaccessible") from exc
+    if stat.S_ISLNK(file_metadata.st_mode):
+        raise _InvalidInputArtifact("path contains a symlink")
+    if not stat.S_ISREG(file_metadata.st_mode):
+        raise _InvalidInputArtifact("target is not a regular file")
+    if require_private_permissions:
+        _validate_private_file_metadata(file_metadata)
+    if expected_file is not None and (
+        file_metadata.st_dev != expected_file.st_dev
+        or file_metadata.st_ino != expected_file.st_ino
+    ):
+        raise _InvalidInputArtifact("file was replaced during validation")
+
+
+def _open_input_artifact(root: Path, relative: Path) -> int:
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    if os.open in os.supports_dir_fd and nofollow:
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow | cloexec
+        try:
+            directory_descriptor = os.open(root, directory_flags)
+        except OSError as exc:
+            raise _InvalidInputArtifact("data directory cannot be opened safely") from exc
+        try:
+            for part in relative.parts[:-1]:
+                try:
+                    child_descriptor = os.open(
+                        part,
+                        directory_flags,
+                        dir_fd=directory_descriptor,
+                    )
+                except OSError as exc:
+                    raise _InvalidInputArtifact("path parent cannot be opened safely") from exc
+                os.close(directory_descriptor)
+                directory_descriptor = child_descriptor
+            try:
+                return os.open(
+                    relative.parts[-1],
+                    os.O_RDONLY | nofollow | cloexec,
+                    dir_fd=directory_descriptor,
+                )
+            except OSError as exc:
+                raise _InvalidInputArtifact(
+                    "file cannot be opened without following links"
+                ) from exc
+        finally:
+            os.close(directory_descriptor)
+    try:
+        return os.open(root.joinpath(*relative.parts), os.O_RDONLY | nofollow | cloexec)
+    except OSError as exc:
+        raise _InvalidInputArtifact("file cannot be opened without following links") from exc
+
+
+def _validate_private_directory_metadata(metadata: os.stat_result) -> None:
+    try:
+        _validate_owner_only_directory(metadata)
+    except OSError:
+        raise _InvalidInputArtifact(
+            "input directory ownership or mode is unsafe"
+        ) from None
+
+
+def _validate_private_file_metadata(metadata: os.stat_result) -> None:
+    try:
+        _validate_owner_only_file(metadata)
+    except OSError:
+        raise _InvalidInputArtifact("input file ownership or mode is unsafe") from None
+
+
 def _assert_conversation_mutable(
     connection: sqlite3.Connection,
     conversation_id: str,
@@ -5879,6 +6307,258 @@ def _turn(row: sqlite3.Row) -> TurnRecord:
         error_code=row["error_code"],
         error_message_redacted=row["error_message_redacted"],
         usage_scope=row["usage_scope"],
+    )
+
+
+def _apply_progress_cleanup_after_ack(
+    connection: sqlite3.Connection,
+    *,
+    outbox: sqlite3.Row,
+    now: int,
+) -> None:
+    if (
+        outbox["operation"] == "delete"
+        or str(outbox["dedupe_key"]).endswith(":progress:delete")
+    ):
+        _mark_terminal_progress_deleted(
+            connection,
+            outbox=outbox,
+            now=now,
+        )
+        return
+    try:
+        payload = json.loads(str(outbox["payload_json"]))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return
+    if not isinstance(payload, dict):
+        return
+    if payload.get("kind") == "turn_progress_delete":
+        _mark_terminal_progress_deleted(
+            connection,
+            outbox=outbox,
+            now=now,
+        )
+    elif payload.get("kind") == "turn_final":
+        _enqueue_terminal_progress_cleanup(
+            connection,
+            outbox=outbox,
+            payload=payload,
+            now=now,
+        )
+
+
+def _terminal_progress_cleanup_like(
+    *,
+    outbox: sqlite3.Row,
+    payload: object,
+) -> bool:
+    return (
+        outbox["operation"] == "delete"
+        or re.fullmatch(
+            r"turn:[^:]+:progress:delete",
+            str(outbox["dedupe_key"]),
+        )
+        is not None
+        or (
+            isinstance(payload, dict)
+            and payload.get("kind") == "turn_progress_delete"
+        )
+    )
+
+
+def _enqueue_terminal_progress_cleanup(
+    connection: sqlite3.Connection,
+    *,
+    outbox: sqlite3.Row,
+    payload: dict[str, Any],
+    now: int,
+) -> None:
+    turn_id = payload.get("turn_id")
+    if not isinstance(turn_id, str) or not turn_id:
+        raise InvariantError("turn final outbox is missing its Turn identity")
+    expected_final_key = f"turn:{turn_id}:final"
+    if outbox["operation"] != "send" or outbox["dedupe_key"] != expected_final_key:
+        raise InvariantError("turn final outbox identity is invalid")
+    view = connection.execute(
+        """
+        SELECT v.*, t.state AS turn_state
+        FROM turn_progress_views v
+        JOIN turns t ON t.id = v.turn_id
+        WHERE v.turn_id = ?
+        """,
+        (turn_id,),
+    ).fetchone()
+    if view is None:
+        raise NotFoundError(f"Turn progress view not found: {turn_id}")
+    if not TurnState(str(view["turn_state"])).terminal or view["state"] != "terminal":
+        raise InvariantError("turn final was acknowledged before terminal progress")
+    if view["cleanup_state"] != "active":
+        return
+    if view["discord_message_id"] is None:
+        connection.execute(
+            """
+            UPDATE turn_progress_views
+            SET cleanup_state = 'deleted', deleted_at = ?, updated_at = ?
+            WHERE turn_id = ? AND cleanup_state = 'active'
+            """,
+            (now, now, turn_id),
+        )
+        return
+
+    cleanup_payload = canonical_json(
+        {"kind": "turn_progress_delete", "turn_id": turn_id}
+    )
+    cleanup_key = f"turn:{turn_id}:progress:delete"
+    cleanup_marker = f"turn-{turn_id[:8]}-progress-delete"
+    connection.execute(
+        """
+        INSERT INTO discord_outbox(
+            id, event_sequence, destination_key, operation,
+            depends_on_outbox_id, payload_json, dedupe_key,
+            delivery_marker, state, attempts, next_attempt_at,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, 'delete', ?, ?, ?, ?, 'pending', 0, ?, ?, ?)
+        """,
+        (
+            new_id(),
+            None,
+            view["destination_key"],
+            outbox["id"],
+            cleanup_payload,
+            cleanup_key,
+            cleanup_marker,
+            now,
+            now,
+            now,
+        ),
+    )
+    connection.execute(
+        """
+        UPDATE turn_progress_views
+        SET cleanup_state = 'delete_pending', updated_at = ?
+        WHERE turn_id = ? AND cleanup_state = 'active'
+        """,
+        (now, turn_id),
+    )
+
+
+def _mark_terminal_progress_deleted(
+    connection: sqlite3.Connection,
+    *,
+    outbox: sqlite3.Row,
+    now: int,
+) -> None:
+    identity = _validate_terminal_progress_delete(
+        connection,
+        outbox_id=str(outbox["id"]),
+        expected_state="sent",
+    )
+    changed = connection.execute(
+        """
+        UPDATE turn_progress_views
+        SET discord_message_id = NULL, cleanup_state = 'deleted',
+            deleted_at = COALESCE(deleted_at, ?), updated_at = ?
+        WHERE turn_id = ? AND cleanup_state <> 'active'
+        """,
+        (now, now, identity.turn_id),
+    ).rowcount
+    if changed != 1:
+        raise NotFoundError(
+            f"Turn progress view not found: {identity.turn_id}"
+        )
+
+
+@dataclass(frozen=True)
+class _TerminalProgressDeleteIdentity:
+    turn_id: str
+    destination_key: str
+    discord_message_id: str | None
+
+
+def _validate_terminal_progress_delete(
+    connection: sqlite3.Connection,
+    *,
+    outbox_id: str,
+    expected_state: str,
+) -> _TerminalProgressDeleteIdentity:
+    row = connection.execute(
+        """
+        SELECT cleanup.operation AS cleanup_operation,
+               cleanup.state AS cleanup_outbox_state,
+               cleanup.destination_key AS cleanup_destination_key,
+               cleanup.payload_json AS cleanup_payload_json,
+               cleanup.dedupe_key AS cleanup_dedupe_key,
+               cleanup.depends_on_outbox_id AS cleanup_dependency_id,
+               view.turn_id AS view_turn_id,
+               view.destination_key AS view_destination_key,
+               view.discord_message_id AS view_message_id,
+               view.cleanup_state AS view_cleanup_state,
+               dependency.id AS dependency_id,
+               dependency.operation AS dependency_operation,
+               dependency.state AS dependency_state,
+               dependency.destination_key AS dependency_destination_key,
+               dependency.payload_json AS dependency_payload_json,
+               dependency.dedupe_key AS dependency_dedupe_key
+        FROM discord_outbox cleanup
+        LEFT JOIN turn_progress_views view
+          ON view.turn_id = json_extract(cleanup.payload_json, '$.turn_id')
+        LEFT JOIN discord_outbox dependency
+          ON dependency.id = cleanup.depends_on_outbox_id
+        WHERE cleanup.id = ?
+        """,
+        (outbox_id,),
+    ).fetchone()
+    if row is None:
+        raise NotFoundError(f"Discord outbox item not found: {outbox_id}")
+    try:
+        payload = json.loads(str(row["cleanup_payload_json"]))
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise InvariantError(
+            "turn progress cleanup outbox identity is invalid"
+        ) from exc
+    turn_id = payload.get("turn_id") if isinstance(payload, dict) else None
+    expected_payload = {
+        "kind": "turn_progress_delete",
+        "turn_id": turn_id,
+    }
+    expected_cleanup_payload = canonical_json(expected_payload)
+    expected_cleanup_key = f"turn:{turn_id}:progress:delete"
+    expected_final_key = f"turn:{turn_id}:final"
+    try:
+        dependency_payload = json.loads(str(row["dependency_payload_json"]))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        dependency_payload = None
+    if (
+        not isinstance(turn_id, str)
+        or not turn_id
+        or payload != expected_payload
+        or row["cleanup_payload_json"] != expected_cleanup_payload
+        or row["cleanup_dedupe_key"] != expected_cleanup_key
+        or row["cleanup_operation"] != "delete"
+        or row["cleanup_outbox_state"] != expected_state
+        or row["view_turn_id"] != turn_id
+        or row["view_cleanup_state"] != "delete_pending"
+        or row["cleanup_destination_key"] != row["view_destination_key"]
+        or row["cleanup_dependency_id"] is None
+        or row["dependency_id"] != row["cleanup_dependency_id"]
+        or row["dependency_operation"] != "send"
+        or row["dependency_state"] != "sent"
+        or row["dependency_dedupe_key"] != expected_final_key
+        or row["dependency_destination_key"] != row["view_destination_key"]
+        or not isinstance(dependency_payload, dict)
+        or dependency_payload.get("kind") != "turn_final"
+        or dependency_payload.get("turn_id") != turn_id
+    ):
+        raise InvariantError(
+            "turn progress cleanup outbox identity is invalid"
+        )
+    message_id = row["view_message_id"]
+    return _TerminalProgressDeleteIdentity(
+        turn_id=turn_id,
+        destination_key=str(row["view_destination_key"]),
+        discord_message_id=(
+            str(message_id) if message_id is not None else None
+        ),
     )
 
 
