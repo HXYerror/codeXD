@@ -35,7 +35,11 @@ from codexd.rendering.markdown import MarkdownContentParser
 from codexd.runtime.codex_sdk import _normalize_notification
 from codexd.storage.progress import insert_progress_update
 from codexd.storage.projectors import ProjectingEventSink
-from codexd.storage.records import OutboxRecord, TurnRecord
+from codexd.storage.records import (
+    OutboxRecord,
+    TurnProgressDeleteTarget,
+    TurnRecord,
+)
 from codexd.storage.repository import Repository
 from codexd.storage.schedules import ScheduleRepository
 from codexd.storage.sqlite import SQLiteStore
@@ -1043,8 +1047,7 @@ def test_terminal_progress_cleanup_migration_preserves_rollout_boundary(
         assert store.migrate() == 15
         active_row = store.query_one(
             """
-            SELECT discord_message_id, remote_message_seen_at,
-                   cleanup_state, deleted_at
+            SELECT discord_message_id, cleanup_state, deleted_at
             FROM turn_progress_views
             WHERE turn_id = ?
             """,
@@ -1053,14 +1056,12 @@ def test_terminal_progress_cleanup_migration_preserves_rollout_boundary(
         assert active_row is not None
         assert dict(active_row) == {
             "discord_message_id": "active-legacy-remote-progress",
-            "remote_message_seen_at": 42,
             "cleanup_state": "active",
             "deleted_at": None,
         }
         terminal_row = store.query_one(
             """
-            SELECT discord_message_id, remote_message_seen_at,
-                   cleanup_state, deleted_at
+            SELECT discord_message_id, cleanup_state, deleted_at
             FROM turn_progress_views
             WHERE turn_id = ?
             """,
@@ -1069,7 +1070,6 @@ def test_terminal_progress_cleanup_migration_preserves_rollout_boundary(
         assert terminal_row is not None
         assert dict(terminal_row) == {
             "discord_message_id": None,
-            "remote_message_seen_at": None,
             "cleanup_state": "legacy_ineligible",
             "deleted_at": None,
         }
@@ -1086,7 +1086,7 @@ def test_terminal_progress_cleanup_migration_preserves_rollout_boundary(
         )
         delivered_terminal_row = store.query_one(
             """
-            SELECT discord_message_id, remote_message_seen_at, cleanup_state
+            SELECT discord_message_id, cleanup_state
             FROM turn_progress_views
             WHERE turn_id = ?
             """,
@@ -1096,7 +1096,6 @@ def test_terminal_progress_cleanup_migration_preserves_rollout_boundary(
         assert delivered_terminal_row["discord_message_id"] == (
             "terminal-legacy-remote-progress"
         )
-        assert delivered_terminal_row["remote_message_seen_at"] is not None
         assert delivered_terminal_row["cleanup_state"] == "legacy_ineligible"
 
         legacy_final = repository.claim_outbox(worker_id="legacy-final-worker")
@@ -2269,8 +2268,7 @@ def test_terminal_final_ack_atomically_enqueues_and_acks_progress_cleanup(
     }
     pending_view = storage_context.store.query_one(
         """
-        SELECT discord_message_id, remote_message_seen_at,
-               cleanup_state, deleted_at
+        SELECT discord_message_id, cleanup_state, deleted_at
         FROM turn_progress_views
         WHERE turn_id = ?
         """,
@@ -2278,7 +2276,6 @@ def test_terminal_final_ack_atomically_enqueues_and_acks_progress_cleanup(
     )
     assert pending_view is not None
     assert pending_view["discord_message_id"] is not None
-    assert pending_view["remote_message_seen_at"] is not None
     assert pending_view["cleanup_state"] == "delete_pending"
     assert pending_view["deleted_at"] is None
 
@@ -2289,6 +2286,12 @@ def test_terminal_final_ack_atomically_enqueues_and_acks_progress_cleanup(
         "SELECT id FROM discord_outbox WHERE dedupe_key = ?",
         (cleanup_key,),
     )["id"]
+    assert repository.turn_progress_delete_target(claimed_cleanup.id) == (
+        TurnProgressDeleteTarget(
+            destination_key="thread:300",
+            discord_message_id=f"cleanup-{target.value}-progress-message",
+        )
+    )
     repository.ack_outbox(
         claimed_cleanup.id,
         lease_owner=claimed_cleanup.lease_owner,
@@ -2297,8 +2300,7 @@ def test_terminal_final_ack_atomically_enqueues_and_acks_progress_cleanup(
 
     deleted_view = storage_context.store.query_one(
         """
-        SELECT discord_message_id, remote_message_seen_at,
-               cleanup_state, deleted_at
+        SELECT discord_message_id, cleanup_state, deleted_at
         FROM turn_progress_views
         WHERE turn_id = ?
         """,
@@ -2306,10 +2308,58 @@ def test_terminal_final_ack_atomically_enqueues_and_acks_progress_cleanup(
     )
     assert deleted_view is not None
     assert deleted_view["discord_message_id"] is None
-    assert deleted_view["remote_message_seen_at"] is not None
     assert deleted_view["cleanup_state"] == "deleted"
     assert deleted_view["deleted_at"] is not None
     assert repository.get_turn(turn.id).state is target
+
+
+def test_progress_delete_ack_revalidates_trusted_target(
+    storage_context: StorageContext,
+) -> None:
+    repository = storage_context.repository
+    turn, final = _terminal_final_with_remote_progress(
+        storage_context,
+        "cleanup-ack-revalidation",
+    )
+    repository.ack_outbox(
+        final.id,
+        lease_owner=final.lease_owner,
+        lease_attempt=final.attempts,
+    )
+    cleanup = repository.claim_outbox(worker_id="cleanup-ack-worker")
+    assert cleanup is not None
+    assert repository.turn_progress_delete_target(cleanup.id).discord_message_id == (
+        "cleanup-ack-revalidation-progress-message"
+    )
+    with storage_context.store.transaction() as connection:
+        connection.execute(
+            "UPDATE discord_outbox SET destination_key = 'thread:999' WHERE id = ?",
+            (cleanup.id,),
+        )
+
+    with pytest.raises(InvariantError, match="cleanup outbox identity"):
+        repository.ack_outbox(
+            cleanup.id,
+            lease_owner=cleanup.lease_owner,
+            lease_attempt=cleanup.attempts,
+        )
+
+    cleanup_row = storage_context.store.query_one(
+        "SELECT state FROM discord_outbox WHERE id = ?",
+        (cleanup.id,),
+    )
+    assert cleanup_row is not None
+    assert cleanup_row["state"] == "sending"
+    view = storage_context.store.query_one(
+        "SELECT discord_message_id, cleanup_state FROM turn_progress_views "
+        "WHERE turn_id = ?",
+        (turn.id,),
+    )
+    assert view is not None
+    assert dict(view) == {
+        "discord_message_id": "cleanup-ack-revalidation-progress-message",
+        "cleanup_state": "delete_pending",
+    }
 
 
 def test_final_retry_and_dead_letter_do_not_unlock_progress_cleanup(
@@ -2385,39 +2435,6 @@ def test_final_retry_and_dead_letter_do_not_unlock_progress_cleanup(
     ) is None
 
 
-def test_final_ack_rolls_back_if_cleanup_dedupe_identity_conflicts(
-    storage_context: StorageContext,
-) -> None:
-    repository = storage_context.repository
-    turn, final = _terminal_final_with_remote_progress(
-        storage_context,
-        "cleanup-atomic-rollback",
-    )
-    repository.enqueue_outbox(
-        destination_key="thread:300",
-        operation="send",
-        payload={"content": "not a cleanup"},
-        dedupe_key=f"turn:{turn.id}:progress:delete",
-        delivery_marker="wrong-cleanup",
-    )
-
-    with pytest.raises(InvariantError, match="cleanup dedupe key"):
-        repository.ack_outbox(
-            final.id,
-            lease_owner=final.lease_owner,
-            lease_attempt=final.attempts,
-        )
-
-    assert storage_context.store.query_one(
-        "SELECT state FROM discord_outbox WHERE id = ?",
-        (final.id,),
-    )["state"] == "sending"
-    assert storage_context.store.query_one(
-        "SELECT cleanup_state FROM turn_progress_views WHERE turn_id = ?",
-        (turn.id,),
-    )["cleanup_state"] == "active"
-
-
 def test_final_ack_without_remote_progress_converges_without_delete_outbox(
     storage_context: StorageContext,
 ) -> None:
@@ -2454,8 +2471,7 @@ def test_final_ack_without_remote_progress_converges_without_delete_outbox(
     ) is None
     view = storage_context.store.query_one(
         """
-        SELECT discord_message_id, remote_message_seen_at,
-               cleanup_state, deleted_at
+        SELECT discord_message_id, cleanup_state, deleted_at
         FROM turn_progress_views
         WHERE turn_id = ?
         """,
@@ -2463,7 +2479,6 @@ def test_final_ack_without_remote_progress_converges_without_delete_outbox(
     )
     assert view is not None
     assert view["discord_message_id"] is None
-    assert view["remote_message_seen_at"] is None
     assert view["cleanup_state"] == "deleted"
     assert view["deleted_at"] is not None
 

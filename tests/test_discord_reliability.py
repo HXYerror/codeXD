@@ -19,6 +19,7 @@ from discord import app_commands
 
 from codexd.application.session_coordinator import ResolvedProject, SessionCoordinator
 from codexd.config import AppConfig, DiscordConfig, SecurityConfig, load_config
+from codexd.domain.conversations import SandboxProfile, ThreadConfig, ThreadIdentity
 from codexd.domain.ids import canonical_json, sha256_text
 from codexd.domain.turns import InterruptOrigin, TurnImage, TurnInput, TurnSource
 from codexd.errors import InvariantError
@@ -31,10 +32,12 @@ from codexd.rendering.discord import (
 from codexd.rendering.media_worker import NormalizedImage
 from codexd.runtime.codex_sdk import capability_manifest
 from codexd.security.signing import ComponentSigner
+from codexd.storage.progress import insert_progress_update
 from codexd.storage.records import (
     CommandIntentRecord,
     OutboxRecord,
     RenderPlanRecord,
+    TurnProgressDeleteTarget,
 )
 from codexd.transport.discord.attachments import (
     AttachmentError,
@@ -726,6 +729,184 @@ async def test_outbox_worker_waits_for_full_final_retry_before_progress_cleanup(
 
 
 @pytest.mark.asyncio
+async def test_recovery_reconciles_progress_fallback_send_before_terminal_cleanup(
+    storage_context: StorageContext,
+    tmp_path: Path,
+) -> None:
+    repository = storage_context.repository
+    repository.activate_thread_revision(
+        conversation_id=storage_context.conversation.id,
+        identity=ThreadIdentity(
+            thread_id="fallback-progress-provider-thread",
+            requested_thread_id=None,
+            provider_session_id="fallback-progress-provider-session",
+            forked_from_thread_id=None,
+            parent_thread_id=None,
+            provider_version="test",
+        ),
+        config=ThreadConfig(
+            model=None,
+            personality=None,
+            sandbox=SandboxProfile.FULL_ACCESS,
+        ),
+    )
+    turn = repository.enqueue_turn(
+        conversation_id=storage_context.conversation.id,
+        source=TurnSource.DISCORD,
+        turn_input=TurnInput(text="recover fallback progress replacement"),
+        input_message_id="fallback-progress-recovery",
+    )
+    lease = repository.create_runtime_lease(
+        scope_kind="project",
+        scope_key=storage_context.project.id,
+        project_id=storage_context.project.id,
+        environment_hash="fallback-progress-recovery-environment",
+    )
+    repository.mark_runtime_ready(
+        lease.id,
+        sdk_version="sdk-test",
+        runtime_version="runtime-test",
+        capability_hash="fallback-progress-recovery-capabilities",
+    )
+    repository.claim_turn(
+        turn.id,
+        runtime_lease_id=lease.id,
+        runtime_generation=lease.generation,
+    )
+    repository.mark_turn_running(
+        turn.id,
+        "fallback-progress-provider-turn",
+    )
+    initial = repository.claim_outbox(worker_id="initial-progress-worker")
+    assert initial is not None
+    repository.ack_outbox(
+        initial.id,
+        lease_owner=initial.lease_owner,
+        lease_attempt=initial.attempts,
+        discord_message_id="601",
+        turn_progress_id=turn.id,
+    )
+    with storage_context.store.transaction() as connection:
+        running_id = insert_progress_update(
+            connection,
+            turn_id=turn.id,
+            state="running",
+            content="Running · recovering replacement",
+            now=1,
+        )
+    assert running_id is not None
+    running = repository.claim_outbox(worker_id="crashed-progress-worker")
+    assert running is not None
+    assert running.id == running_id
+
+    bot_user = Mock(id=999)
+    delivered_messages: list[Mock] = []
+
+    async def send(content: str, **_kwargs: Any) -> Mock:
+        message = Mock(spec=discord.Message)
+        message.id = 602 + len(delivered_messages)
+        message.author = bot_user
+        message.content = content
+        message.attachments = []
+        message.edit = AsyncMock()
+        message.delete = AsyncMock()
+        delivered_messages.append(message)
+        return message
+
+    async def fetch_message(message_id: int) -> Mock:
+        if message_id == 601:
+            raise discord.NotFound(
+                Mock(status=404, reason="missing"),
+                "missing",
+            )
+        for delivered in delivered_messages:
+            if delivered.id == message_id:
+                return delivered
+        raise AssertionError(f"unexpected Discord message ID: {message_id}")
+
+    async def history(*, limit: int):
+        assert limit == 500
+        for delivered in delivered_messages:
+            yield delivered
+
+    thread = Mock(spec=discord.Thread)
+    thread.id = 300
+    thread.archived = False
+    thread.locked = False
+    thread.send = AsyncMock(side_effect=send)
+    thread.fetch_message = AsyncMock(side_effect=fetch_message)
+    thread.history = history
+    client = Mock(spec=discord.Client)
+    client.user = bot_user
+    client.get_channel.return_value = thread
+    plan = DurableDiscordRenderPlan(("Recovered final response",), ())
+    renderer = Mock(
+        artifact_root=tmp_path,
+        retention_days=30,
+        create_durable_plan=AsyncMock(return_value=plan),
+    )
+    renderer.load_durable_plan.return_value = plan
+    transport = DiscordOutboxTransport(
+        client=client,
+        repository=repository,
+        renderer=renderer,
+        signer=Mock(),
+    )
+
+    fallback = await transport.deliver(running)
+    assert fallback.discord_message_id == "602"
+    assert thread.send.await_count == 1
+    replacement = delivered_messages[0]
+    assert _message_has_delivery_marker(
+        replacement.content,
+        running.delivery_marker,
+    )
+
+    recovered_counts = repository.recover_startup(
+        current_boot_id="fallback-progress-recovery-boot"
+    )
+    assert recovered_counts["reconciling_outbox"] == 1
+    worker = OutboxWorker(
+        repository=repository,
+        transport=transport,
+        worker_id="recovered-progress-worker",
+    )
+
+    assert await worker.drain_once()
+    running_row = storage_context.store.query_one(
+        "SELECT state FROM discord_outbox WHERE id = ?",
+        (running.id,),
+    )
+    assert running_row is not None
+    assert running_row["state"] == "sent"
+    assert repository.turn_progress_message(turn.id) == "602"
+    assert thread.send.await_count == 1
+
+    assert await worker.drain_once()
+    replacement.edit.assert_awaited_once()
+    assert thread.send.await_count == 1
+
+    assert await worker.drain_once()
+    assert thread.send.await_count == 3
+
+    assert await worker.drain_once()
+    replacement.delete.assert_awaited_once_with()
+    assert not await worker.drain_once()
+    assert sum(
+        1 for call in thread.send.await_args_list if "embed" in call.kwargs
+    ) == 1
+    view = storage_context.store.query_one(
+        "SELECT discord_message_id, cleanup_state, deleted_at "
+        "FROM turn_progress_views WHERE turn_id = ?",
+        (turn.id,),
+    )
+    assert view is not None
+    assert view["discord_message_id"] is None
+    assert view["cleanup_state"] == "deleted"
+    assert view["deleted_at"] is not None
+
+
+@pytest.mark.asyncio
 async def test_final_outbox_renders_table_embed_with_markdown_copy(
     tmp_path: Path,
 ) -> None:
@@ -1204,6 +1385,41 @@ async def test_turn_progress_uses_one_editable_rich_embed() -> None:
     assert "Ordinary assistant text" in existing.edit.await_args.kwargs["content"]
 
 
+def _claim_terminal_progress_cleanup(
+    storage_context: StorageContext,
+    suffix: str,
+) -> tuple[str, OutboxRecord]:
+    repository = storage_context.repository
+    turn = repository.enqueue_turn(
+        conversation_id=storage_context.conversation.id,
+        source=TurnSource.DISCORD,
+        turn_input=TurnInput(text=f"cleanup validation {suffix}"),
+        input_message_id=f"cleanup-validation-{suffix}",
+    )
+    repository.request_cancel(turn.id, origin=InterruptOrigin.USER)
+    while True:
+        record = repository.claim_outbox(worker_id=f"cleanup-{suffix}-worker")
+        assert record is not None
+        payload = json.loads(record.payload_json)
+        if record.operation == "delete":
+            return turn.id, record
+        if payload.get("kind") == "turn_progress":
+            repository.ack_outbox(
+                record.id,
+                lease_owner=record.lease_owner,
+                lease_attempt=record.attempts,
+                discord_message_id="601",
+                turn_progress_id=turn.id,
+            )
+            continue
+        assert payload.get("kind") == "turn_final"
+        repository.ack_outbox(
+            record.id,
+            lease_owner=record.lease_owner,
+            lease_attempt=record.attempts,
+        )
+
+
 @pytest.mark.asyncio
 async def test_turn_progress_delete_uses_only_the_trusted_bot_message_id() -> None:
     message = Mock(spec=discord.Message)
@@ -1218,7 +1434,9 @@ async def test_turn_progress_delete_uses_only_the_trusted_bot_message_id() -> No
     client.user = Mock(id=999)
     client.get_channel.return_value = thread
     repository = Mock()
-    repository.turn_progress_message.return_value = "601"
+    repository.turn_progress_delete_target.return_value = (
+        TurnProgressDeleteTarget("thread:300", "601")
+    )
     payload = {
         "kind": "turn_progress_delete",
         "turn_id": "turn-delete",
@@ -1232,7 +1450,7 @@ async def test_turn_progress_delete_uses_only_the_trusted_bot_message_id() -> No
     ).deliver(
         OutboxRecord(
             id="progress-delete",
-            destination_key="thread:300",
+            destination_key="thread:777",
             operation="delete",
             payload_json=canonical_json(payload),
             delivery_marker="progress-delete",
@@ -1243,10 +1461,93 @@ async def test_turn_progress_delete_uses_only_the_trusted_bot_message_id() -> No
     )
 
     assert result == DeliveryResult()
-    repository.turn_progress_message.assert_called_once_with("turn-delete")
+    repository.turn_progress_delete_target.assert_called_once_with(
+        "progress-delete"
+    )
+    client.get_channel.assert_called_once_with(300)
     thread.fetch_message.assert_awaited_once_with(601)
     message.delete.assert_awaited_once_with()
     assert "message_id" not in payload
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tamper",
+    ("turn", "destination", "dependency", "state"),
+)
+async def test_turn_progress_delete_rejects_tampered_cleanup_identity_without_side_effect(
+    storage_context: StorageContext,
+    tamper: str,
+) -> None:
+    turn_id, cleanup = _claim_terminal_progress_cleanup(
+        storage_context,
+        tamper,
+    )
+    with storage_context.store.transaction() as connection:
+        if tamper == "turn":
+            connection.execute(
+                "UPDATE discord_outbox SET payload_json = ? WHERE id = ?",
+                (
+                    canonical_json(
+                        {
+                            "kind": "turn_progress_delete",
+                            "turn_id": "tampered-turn",
+                        }
+                    ),
+                    cleanup.id,
+                ),
+            )
+        elif tamper == "destination":
+            connection.execute(
+                "UPDATE discord_outbox SET destination_key = ? WHERE id = ?",
+                ("thread:999", cleanup.id),
+            )
+        elif tamper == "dependency":
+            connection.execute(
+                "UPDATE discord_outbox SET depends_on_outbox_id = NULL WHERE id = ?",
+                (cleanup.id,),
+            )
+        else:
+            connection.execute(
+                "UPDATE discord_outbox SET state = 'retry' WHERE id = ?",
+                (cleanup.id,),
+            )
+
+    message = Mock(spec=discord.Message)
+    message.author = Mock(id=999)
+    message.delete = AsyncMock()
+    thread = Mock(spec=discord.Thread)
+    thread.archived = False
+    thread.locked = False
+    thread.fetch_message = AsyncMock(return_value=message)
+    client = Mock(spec=discord.Client)
+    client.user = Mock(id=999)
+    client.get_channel.return_value = thread
+
+    with pytest.raises(DeliveryError) as raised:
+        await DiscordOutboxTransport(
+            client=client,
+            repository=storage_context.repository,
+            renderer=Mock(),
+            signer=Mock(),
+        ).deliver(cleanup)
+
+    assert raised.value.code == "turn_progress_delete_target_invalid"
+    assert raised.value.permanent is True
+    client.get_channel.assert_not_called()
+    client.fetch_channel.assert_not_called()
+    thread.fetch_message.assert_not_awaited()
+    message.delete.assert_not_awaited()
+    view = storage_context.store.query_one(
+        "SELECT discord_message_id, cleanup_state FROM turn_progress_views "
+        "WHERE turn_id = ?",
+        (turn_id,),
+    )
+    assert view is not None
+    assert dict(view) == {
+        "discord_message_id": "601",
+        "cleanup_state": "delete_pending",
+    }
 
 
 @pytest.mark.asyncio
@@ -1267,7 +1568,9 @@ async def test_turn_progress_delete_not_found_is_idempotent_success(
     client.user = Mock(id=999)
     client.get_channel.return_value = thread
     repository = Mock()
-    repository.turn_progress_message.return_value = "601"
+    repository.turn_progress_delete_target.return_value = (
+        TurnProgressDeleteTarget("thread:300", "601")
+    )
 
     result = await DiscordOutboxTransport(
         client=client,
@@ -1314,7 +1617,9 @@ async def test_turn_progress_delete_racing_not_found_is_idempotent_success() -> 
     client.user = Mock(id=999)
     client.get_channel.return_value = thread
     repository = Mock()
-    repository.turn_progress_message.return_value = "601"
+    repository.turn_progress_delete_target.return_value = (
+        TurnProgressDeleteTarget("thread:300", "601")
+    )
 
     result = await DiscordOutboxTransport(
         client=client,
@@ -1347,7 +1652,9 @@ async def test_turn_progress_delete_racing_not_found_is_idempotent_success() -> 
 async def test_turn_progress_delete_without_message_id_skips_discord() -> None:
     client = Mock(spec=discord.Client)
     repository = Mock()
-    repository.turn_progress_message.return_value = None
+    repository.turn_progress_delete_target.return_value = (
+        TurnProgressDeleteTarget("thread:300", None)
+    )
 
     result = await DiscordOutboxTransport(
         client=client,
@@ -1402,7 +1709,9 @@ async def test_turn_progress_delete_classifies_discord_failures(
     client.user = Mock(id=999)
     client.get_channel.return_value = thread
     repository = Mock()
-    repository.turn_progress_message.return_value = "601"
+    repository.turn_progress_delete_target.return_value = (
+        TurnProgressDeleteTarget("thread:300", "601")
+    )
 
     with pytest.raises(DeliveryError) as raised:
         await DiscordOutboxTransport(
@@ -1444,6 +1753,9 @@ async def test_turn_progress_delete_rejects_payload_message_id_and_non_bot_targe
         renderer=Mock(),
         signer=Mock(),
     )
+    repository.turn_progress_delete_target.side_effect = InvariantError(
+        "invalid cleanup identity"
+    )
     with pytest.raises(DeliveryError) as arbitrary_id:
         await transport.deliver(
             OutboxRecord(
@@ -1464,7 +1776,9 @@ async def test_turn_progress_delete_rejects_payload_message_id_and_non_bot_targe
             )
         )
     assert arbitrary_id.value.permanent is True
-    repository.turn_progress_message.assert_not_called()
+    repository.turn_progress_delete_target.assert_called_once_with(
+        "progress-delete-untrusted"
+    )
 
     message = Mock(spec=discord.Message)
     message.author = Mock(id=123)
@@ -1474,7 +1788,10 @@ async def test_turn_progress_delete_rejects_payload_message_id_and_non_bot_targe
     thread.locked = False
     thread.fetch_message = AsyncMock(return_value=message)
     client.get_channel.return_value = thread
-    repository.turn_progress_message.return_value = "601"
+    repository.turn_progress_delete_target.side_effect = None
+    repository.turn_progress_delete_target.return_value = (
+        TurnProgressDeleteTarget("thread:300", "601")
+    )
     with pytest.raises(DeliveryError) as author_mismatch:
         await transport.deliver(
             OutboxRecord(
