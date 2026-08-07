@@ -40,11 +40,9 @@ _FUTURE = 9_999_999_999_999
 def _secure_input_directory(data_dir: Path) -> Path:
     attachments = data_dir / "attachments"
     inputs = attachments / "input"
-    attachments.mkdir(mode=0o700, parents=True, exist_ok=True)
-    inputs.mkdir(mode=0o700, exist_ok=True)
-    if os.name != "nt":
-        attachments.chmod(0o700)
-        inputs.chmod(0o700)
+    private_files.ensure_private_directory(data_dir)
+    private_files.ensure_private_directory(attachments)
+    private_files.ensure_private_directory(inputs)
     return inputs
 
 
@@ -60,8 +58,7 @@ def _turn_file(
 ) -> TurnFile:
     path = _secure_input_directory(data_dir) / f"{attachment_id}.bin"
     path.write_bytes(content)
-    if os.name != "nt":
-        path.chmod(0o600)
+    private_files.secure_private_file(path)
     return TurnFile(
         attachment_id=attachment_id,
         ordinal=ordinal,
@@ -629,6 +626,8 @@ def test_repository_windows_permission_facade_never_skips_file_verification(
     storage_context: StorageContext,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    if os.name == "nt":
+        pytest.skip("the native Windows backend is available")
     file = _turn_file(storage_context.store.path.parent)
     turn = storage_context.repository.enqueue_turn(
         conversation_id=storage_context.conversation.id,

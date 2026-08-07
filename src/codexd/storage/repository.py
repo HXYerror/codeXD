@@ -45,12 +45,7 @@ from codexd.errors import (
     SecurityError,
     StorageError,
 )
-from codexd.security.private_files import (
-    validate_private_directory_metadata as _validate_owner_only_directory,
-)
-from codexd.security.private_files import (
-    validate_private_file_metadata as _validate_owner_only_file,
-)
+from codexd.security import private_files
 from codexd.security.redaction import redacted_summary, safe_thread_title_summary
 from codexd.storage.progress import (
     insert_initial_progress,
@@ -5919,13 +5914,17 @@ def _validate_input_artifact(
         relative=relative,
         require_private_permissions=require_private_permissions,
     )
-    descriptor = _open_input_artifact(root, relative)
+    descriptor = _open_input_artifact(
+        root,
+        relative,
+        require_private_permissions=require_private_permissions,
+    )
     try:
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode):
             raise _InvalidInputArtifact("target is not a regular file")
         if require_private_permissions:
-            _validate_private_file_metadata(before)
+            _validate_private_file_descriptor(descriptor)
         digest = hashlib.sha256()
         observed_size = 0
         while True:
@@ -5971,6 +5970,7 @@ def _validate_input_artifact(
 def _resolve_data_root(data_root: Path) -> Path:
     raw_root = data_root.absolute()
     try:
+        private_files.validate_directory_no_reparse(raw_root)
         metadata = raw_root.lstat()
     except OSError as exc:
         raise _InvalidInputArtifact("data directory is unavailable") from exc
@@ -6000,14 +6000,16 @@ def _inspect_input_artifact_path(
     )
     try:
         for directory in directories:
+            private_files.validate_directory_no_reparse(directory)
             metadata = directory.lstat()
             if stat.S_ISLNK(metadata.st_mode):
                 raise _InvalidInputArtifact("path contains a symlink")
             if not stat.S_ISDIR(metadata.st_mode):
                 raise _InvalidInputArtifact("path parent is not a directory")
             if require_private_permissions:
-                _validate_private_directory_metadata(metadata)
-        file_metadata = root.joinpath(*relative.parts).lstat()
+                _validate_private_directory_path(directory)
+        file_path = root.joinpath(*relative.parts)
+        file_metadata = file_path.lstat()
     except _InvalidInputArtifact:
         raise
     except OSError as exc:
@@ -6016,8 +6018,12 @@ def _inspect_input_artifact_path(
         raise _InvalidInputArtifact("path contains a symlink")
     if not stat.S_ISREG(file_metadata.st_mode):
         raise _InvalidInputArtifact("target is not a regular file")
+    try:
+        private_files.validate_file_no_reparse(file_path)
+    except OSError as exc:
+        raise _InvalidInputArtifact("path contains a symlink or reparse point") from exc
     if require_private_permissions:
-        _validate_private_file_metadata(file_metadata)
+        _validate_private_file_path(file_path)
     if expected_file is not None and (
         file_metadata.st_dev != expected_file.st_dev
         or file_metadata.st_ino != expected_file.st_ino
@@ -6025,7 +6031,23 @@ def _inspect_input_artifact_path(
         raise _InvalidInputArtifact("file was replaced during validation")
 
 
-def _open_input_artifact(root: Path, relative: Path) -> int:
+def _open_input_artifact(
+    root: Path,
+    relative: Path,
+    *,
+    require_private_permissions: bool,
+) -> int:
+    if os.name == "nt":
+        try:
+            return private_files.open_file_no_reparse(
+                root.joinpath(*relative.parts),
+                require_private=require_private_permissions,
+                deny_write_delete=require_private_permissions,
+            )
+        except OSError as exc:
+            raise _InvalidInputArtifact(
+                "file cannot be opened without following links"
+            ) from exc
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     cloexec = getattr(os, "O_CLOEXEC", 0)
     if os.open in os.supports_dir_fd and nofollow:
@@ -6064,18 +6086,25 @@ def _open_input_artifact(root: Path, relative: Path) -> int:
         raise _InvalidInputArtifact("file cannot be opened without following links") from exc
 
 
-def _validate_private_directory_metadata(metadata: os.stat_result) -> None:
+def _validate_private_directory_path(path: Path) -> None:
     try:
-        _validate_owner_only_directory(metadata)
+        private_files.validate_private_directory(path)
     except OSError:
         raise _InvalidInputArtifact(
             "input directory ownership or mode is unsafe"
         ) from None
 
 
-def _validate_private_file_metadata(metadata: os.stat_result) -> None:
+def _validate_private_file_path(path: Path) -> None:
     try:
-        _validate_owner_only_file(metadata)
+        private_files.validate_private_file(path)
+    except OSError:
+        raise _InvalidInputArtifact("input file ownership or mode is unsafe") from None
+
+
+def _validate_private_file_descriptor(descriptor: int) -> None:
+    try:
+        private_files.validate_private_file_descriptor(descriptor)
     except OSError:
         raise _InvalidInputArtifact("input file ownership or mode is unsafe") from None
 

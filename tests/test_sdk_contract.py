@@ -1610,8 +1610,49 @@ def test_windows_file_lease_facade_disables_mention_capability(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires native Windows semantics")
-def test_windows_runtime_reports_file_input_unsupported_without_handle_contract() -> None:
-    assert codex_sdk.capability_manifest().optional["mention.input"] is False
+def test_windows_runtime_reports_file_input_supported_with_handle_contract() -> None:
+    assert private_files.private_file_security_supported()
+    assert codex_sdk._file_input_leasing_supported()
+    assert codex_sdk.capability_manifest().optional["mention.input"] is True
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows semantics")
+def test_windows_file_lease_denies_write_and_delete_sharing(tmp_path: Path) -> None:
+    file = _turn_file(tmp_path / "leased.bin", ordinal=0, display_name="leased.txt")
+    descriptor = private_files.open_file_no_reparse(
+        file.canonical_path,
+        require_private=True,
+        deny_write_delete=True,
+    )
+    try:
+        private_files.validate_private_file_descriptor(descriptor)
+        with pytest.raises(OSError):
+            file.canonical_path.write_bytes(b"replacement")
+        with pytest.raises(OSError):
+            file.canonical_path.unlink()
+    finally:
+        os.close(descriptor)
+
+    file.canonical_path.write_bytes(b"replacement")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows semantics")
+def test_windows_file_validation_rejects_reparse_points(tmp_path: Path) -> None:
+    file = _turn_file(tmp_path / "target.bin", ordinal=0, display_name="target.txt")
+    link = file.canonical_path.with_name("linked.bin")
+    try:
+        link.symlink_to(file.canonical_path)
+    except OSError as exc:
+        pytest.skip(f"Windows symlink creation is unavailable: {exc.winerror}")
+
+    with pytest.raises(OSError, match="reparse"):
+        private_files.validate_file_no_reparse(link)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows semantics")
+def test_windows_private_storage_rejects_unc_paths() -> None:
+    with pytest.raises(OSError, match="UNC"):
+        private_files.validate_private_file(Path(r"\\server\share\attachment.bin"))
 
 
 @pytest.mark.asyncio
@@ -2209,13 +2250,12 @@ def _turn_file(
     data_root = path.parent
     attachment_root = data_root / "attachments"
     input_root = attachment_root / "input"
-    input_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    data_root.chmod(0o700)
-    attachment_root.chmod(0o700)
-    input_root.chmod(0o700)
+    private_files.ensure_private_directory(data_root)
+    private_files.ensure_private_directory(attachment_root)
+    private_files.ensure_private_directory(input_root)
     path = input_root / path.name
     path.write_bytes(content)
-    path.chmod(0o600)
+    private_files.secure_private_file(path)
     return TurnFile(
         attachment_id=f"file-{ordinal}",
         ordinal=ordinal,

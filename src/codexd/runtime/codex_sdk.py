@@ -1308,9 +1308,12 @@ def _file_input_supported(sdk_version: str) -> bool:
 
 
 def _file_input_leasing_supported() -> bool:
+    if not private_files.private_file_security_supported():
+        return False
+    if os.name == "nt":
+        return True
     return bool(
-        private_files.private_file_security_supported()
-        and os.name == "posix"
+        os.name == "posix"
         and _FCNTL is not None
         and getattr(os, "O_NOFOLLOW", 0)
         and getattr(os, "O_DIRECTORY", 0)
@@ -1344,12 +1347,13 @@ def _acquire_file_input_lease(file: TurnFile) -> int:
     try:
         _validate_file_lease_path(path)
         descriptor = _open_file_lease_descriptor(path)
-        assert _FCNTL is not None
-        _FCNTL.flock(descriptor, _FCNTL.LOCK_SH | _FCNTL.LOCK_NB)
+        if os.name != "nt":
+            assert _FCNTL is not None
+            _FCNTL.flock(descriptor, _FCNTL.LOCK_SH | _FCNTL.LOCK_NB)
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode):
             raise _FileInputLeaseError("leased target is not a regular file")
-        private_files.validate_private_file_metadata(before)
+        private_files.validate_private_file_descriptor(descriptor)
         if before.st_size != file.size_bytes:
             raise _FileInputLeaseError("leased file size changed")
 
@@ -1388,7 +1392,7 @@ def _acquire_file_input_lease(file: TurnFile) -> int:
             or named.st_size != after.st_size
         ):
             raise _FileInputLeaseError("leased file no longer matches its named path")
-        private_files.validate_private_file_metadata(named)
+        private_files.validate_private_file(path)
         return descriptor
     except (OSError, ValueError):
         if descriptor >= 0:
@@ -1405,15 +1409,22 @@ def _validate_file_lease_path(path: Path) -> None:
     current = Path(path.anchor)
     for part in path.parts[1:-1]:
         current /= part
+        private_files.validate_directory_no_reparse(current)
         metadata = current.lstat()
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
             raise _FileInputLeaseError("file lease path contains an unsafe parent")
 
     for directory in (path.parent.parent.parent, path.parent.parent, path.parent):
-        private_files.validate_private_directory_metadata(directory.lstat())
+        private_files.validate_private_directory(directory)
 
 
 def _open_file_lease_descriptor(path: Path) -> int:
+    if os.name == "nt":
+        return private_files.open_file_no_reparse(
+            path,
+            require_private=True,
+            deny_write_delete=True,
+        )
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     directory_flags = os.O_RDONLY | os.O_DIRECTORY | nofollow | getattr(os, "O_CLOEXEC", 0)
     directory_descriptor = os.open(path.anchor, directory_flags)
