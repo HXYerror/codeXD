@@ -13,7 +13,7 @@ from typing import Protocol
 import discord
 
 from codexd.domain.ids import sha256_text, utc_now_ms
-from codexd.errors import CodexDError
+from codexd.errors import CodexDError, NotFoundError
 from codexd.rendering.discord import (
     DISCORD_ATTACHMENT_LIMIT_BYTES,
     AttachmentKind,
@@ -361,8 +361,14 @@ class DiscordOutboxTransport:
             raise DeliveryError("payload_invalid", permanent=True) from exc
         if not isinstance(payload, dict):
             raise DeliveryError("payload_invalid", permanent=True)
-        channel = await self._destination(record.destination_key)
         try:
+            if payload.get("kind") == "turn_progress_delete":
+                return await self._deliver_turn_progress_delete(
+                    payload,
+                    operation=record.operation,
+                    destination_key=record.destination_key,
+                )
+            channel = await self._destination(record.destination_key)
             if payload.get("kind") == "prompt_reaction":
                 return await self._deliver_prompt_reaction(channel, payload)
             if payload.get("kind") == "create_thread":
@@ -432,6 +438,71 @@ class DiscordOutboxTransport:
                 code=f"discord_http_{exc.status}",
                 permanent=permanent,
             ) from exc
+
+    async def _deliver_turn_progress_delete(
+        self,
+        payload: dict[str, object],
+        *,
+        operation: str,
+        destination_key: str,
+    ) -> DeliveryResult:
+        turn_id = payload.get("turn_id")
+        if (
+            operation != "delete"
+            or not isinstance(turn_id, str)
+            or not turn_id
+            or payload
+            != {"kind": "turn_progress_delete", "turn_id": turn_id}
+        ):
+            raise DeliveryError(
+                "turn_progress_delete_payload_invalid",
+                permanent=True,
+            )
+        try:
+            message_id = await asyncio.to_thread(
+                self._repository.turn_progress_message,
+                turn_id,
+            )
+        except NotFoundError as exc:
+            raise DeliveryError(
+                "turn_progress_delete_view_not_found",
+                permanent=True,
+            ) from exc
+        if message_id is None:
+            return DeliveryResult()
+        try:
+            parsed_message_id = int(message_id)
+        except ValueError as exc:
+            raise DeliveryError(
+                "turn_progress_delete_message_id_invalid",
+                permanent=True,
+            ) from exc
+        if parsed_message_id <= 0:
+            raise DeliveryError(
+                "turn_progress_delete_message_id_invalid",
+                permanent=True,
+            )
+        channel = await self._destination(destination_key)
+        try:
+            message = await channel.fetch_message(parsed_message_id)
+        except discord.NotFound:
+            return DeliveryResult()
+        bot_user = self._client.user
+        if bot_user is None:
+            raise DeliveryError(
+                "discord_bot_identity_unavailable",
+                permanent=False,
+            )
+        if message.author.id != bot_user.id:
+            raise DeliveryError(
+                "turn_progress_delete_author_mismatch",
+                permanent=True,
+            )
+        try:
+            await message.delete()
+        except discord.NotFound:
+            return DeliveryResult()
+        return DeliveryResult()
 
     async def _deliver_create_thread(
         self,

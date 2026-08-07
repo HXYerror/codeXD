@@ -21,6 +21,7 @@ from codexd.domain.conversations import (
     WebSearchMode,
 )
 from codexd.domain.events import NormalizedEvent
+from codexd.domain.ids import canonical_json
 from codexd.domain.schedules import MisfirePolicy, ScheduleKind, ScheduleState
 from codexd.domain.turns import (
     InterruptOrigin,
@@ -32,7 +33,9 @@ from codexd.domain.turns import (
 from codexd.errors import ConflictError, InvariantError, SecurityError
 from codexd.rendering.markdown import MarkdownContentParser
 from codexd.runtime.codex_sdk import _normalize_notification
+from codexd.storage.progress import insert_progress_update
 from codexd.storage.projectors import ProjectingEventSink
+from codexd.storage.records import OutboxRecord, TurnRecord
 from codexd.storage.repository import Repository
 from codexd.storage.schedules import ScheduleRepository
 from codexd.storage.sqlite import SQLiteStore
@@ -91,6 +94,37 @@ def _running_turn(
     )
     repository.mark_turn_running(turn.id, f"{suffix}-provider-turn")
     return turn, lease
+
+
+def _terminal_final_with_remote_progress(
+    storage_context: StorageContext,
+    suffix: str,
+    *,
+    target: TurnState = TurnState.COMPLETED,
+) -> tuple[TurnRecord, OutboxRecord]:
+    repository = storage_context.repository
+    turn, _lease = _running_turn(storage_context, suffix)
+    if target is TurnState.CANCELLED:
+        repository.request_cancel(turn.id, origin=InterruptOrigin.USER)
+    repository.terminal_turn(
+        turn.id,
+        target=target,
+        terminal_code=f"{suffix}-terminal",
+    )
+    while True:
+        claimed = repository.claim_outbox(worker_id=f"{suffix}-worker")
+        assert claimed is not None
+        payload = json.loads(claimed.payload_json)
+        if payload.get("kind") == "turn_final":
+            return turn, claimed
+        assert payload.get("kind") == "turn_progress"
+        repository.ack_outbox(
+            claimed.id,
+            lease_owner=claimed.lease_owner,
+            lease_attempt=claimed.attempts,
+            discord_message_id=f"{suffix}-progress-message",
+            turn_progress_id=turn.id,
+        )
 
 
 def test_migration_integrity(storage_context: StorageContext) -> None:
@@ -875,7 +909,7 @@ def test_channel_binding_migration_preserves_legacy_conversation_identity(
             )
 
         monkeypatch.setattr(sqlite_module, "_load_migrations", lambda: migrations)
-        assert store.migrate() == 14
+        assert store.migrate() == 15
         assert store.foreign_key_check() == ()
         repository = Repository(store)
         project = repository.get_project("legacy-project")
@@ -898,6 +932,75 @@ def test_channel_binding_migration_preserves_legacy_conversation_identity(
             input_message_id="legacy-after-upgrade",
         )
         assert turn.conversation_id == conversation.id
+
+
+def test_terminal_progress_cleanup_migration_preserves_remote_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import codexd.storage.sqlite as sqlite_module
+
+    migrations = sqlite_module._load_migrations()
+    root = tmp_path / "cleanup-upgrade-project"
+    root.mkdir()
+    with SQLiteStore(tmp_path / "cleanup-upgrade.sqlite3") as store:
+        monkeypatch.setattr(
+            sqlite_module,
+            "_load_migrations",
+            lambda: tuple(
+                migration for migration in migrations if migration.version < 15
+            ),
+        )
+        assert store.migrate() == 14
+        repository = Repository(store)
+        project = repository.bind_project(
+            name="cleanup-upgrade",
+            root_path=root,
+            guild_id=100,
+            channel_id=200,
+            sandbox_profile=SandboxProfile.FULL_ACCESS,
+        )
+        conversation = repository.create_conversation(
+            project_id=project.id,
+            discord_thread_id=300,
+            discord_guild_id=100,
+            discord_parent_channel_id=200,
+            owner_user_id=400,
+        )
+        turn = repository.enqueue_turn(
+            conversation_id=conversation.id,
+            source=TurnSource.DISCORD,
+            turn_input=TurnInput(text="legacy progress"),
+            input_message_id="legacy-progress-message",
+        )
+        with store.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE turn_progress_views
+                SET discord_message_id = 'legacy-remote-progress', updated_at = 42
+                WHERE turn_id = ?
+                """,
+                (turn.id,),
+            )
+
+        monkeypatch.setattr(sqlite_module, "_load_migrations", lambda: migrations)
+        assert store.migrate() == 15
+        row = store.query_one(
+            """
+            SELECT discord_message_id, remote_message_seen_at,
+                   cleanup_state, deleted_at
+            FROM turn_progress_views
+            WHERE turn_id = ?
+            """,
+            (turn.id,),
+        )
+        assert row is not None
+        assert dict(row) == {
+            "discord_message_id": "legacy-remote-progress",
+            "remote_message_seen_at": 42,
+            "cleanup_state": "active",
+            "deleted_at": None,
+        }
 
 
 def test_component_scope_migrations_expire_and_guard_legacy_pending_drafts(
@@ -970,7 +1073,7 @@ def test_component_scope_migrations_expire_and_guard_legacy_pending_drafts(
             )
 
         monkeypatch.setattr(sqlite_module, "_load_migrations", lambda: migrations)
-        assert store.migrate() == 14
+        assert store.migrate() == 15
         row = store.query_one(
             """
             SELECT state, discord_guild_id, discord_channel_id
@@ -1094,7 +1197,7 @@ def test_turn_enqueue_sequence_migration_backfills_existing_turns(
                 )
 
         monkeypatch.setattr(sqlite_module, "_load_migrations", lambda: migrations)
-        assert store.migrate() == 14
+        assert store.migrate() == 15
         repository = Repository(store)
         third = repository.enqueue_turn(
             conversation_id="upgrade-conversation",
@@ -1201,7 +1304,7 @@ def test_schedule_fire_turn_fk_upgrade_preserves_pairs(
             )
 
         monkeypatch.setattr(sqlite_module, "_load_migrations", lambda: migrations)
-        assert store.migrate() == 14
+        assert store.migrate() == 15
         assert store.foreign_key_check() == ()
         fire_fks = store.query_all("PRAGMA foreign_key_list(schedule_fires)")
         assert any(
@@ -1966,6 +2069,377 @@ def test_local_terminal_projection_is_complete_and_unblocked_by_dead_progress(
     assert claimed_final.id == final["id"]
 
 
+@pytest.mark.parametrize(
+    "target",
+    (
+        TurnState.COMPLETED,
+        TurnState.FAILED,
+        TurnState.CANCELLED,
+        TurnState.INTERRUPTED,
+    ),
+)
+def test_terminal_final_ack_atomically_enqueues_and_acks_progress_cleanup(
+    storage_context: StorageContext,
+    target: TurnState,
+) -> None:
+    repository = storage_context.repository
+    turn, final = _terminal_final_with_remote_progress(
+        storage_context,
+        f"cleanup-{target.value}",
+        target=target,
+    )
+    cleanup_key = f"turn:{turn.id}:progress:delete"
+
+    assert storage_context.store.query_one(
+        "SELECT 1 FROM discord_outbox WHERE dedupe_key = ?",
+        (cleanup_key,),
+    ) is None
+    repository.ack_outbox(
+        final.id,
+        lease_owner=final.lease_owner,
+        lease_attempt=final.attempts,
+        discord_message_id=f"{target.value}-final-message",
+    )
+
+    cleanup = storage_context.store.query_one(
+        """
+        SELECT operation, destination_key, depends_on_outbox_id,
+               payload_json, coalesce_key, state
+        FROM discord_outbox
+        WHERE dedupe_key = ?
+        """,
+        (cleanup_key,),
+    )
+    assert cleanup is not None
+    assert dict(cleanup) == {
+        "operation": "delete",
+        "destination_key": "thread:300",
+        "depends_on_outbox_id": final.id,
+        "payload_json": canonical_json(
+            {"kind": "turn_progress_delete", "turn_id": turn.id}
+        ),
+        "coalesce_key": None,
+        "state": "pending",
+    }
+    pending_view = storage_context.store.query_one(
+        """
+        SELECT discord_message_id, remote_message_seen_at,
+               cleanup_state, deleted_at
+        FROM turn_progress_views
+        WHERE turn_id = ?
+        """,
+        (turn.id,),
+    )
+    assert pending_view is not None
+    assert pending_view["discord_message_id"] is not None
+    assert pending_view["remote_message_seen_at"] is not None
+    assert pending_view["cleanup_state"] == "delete_pending"
+    assert pending_view["deleted_at"] is None
+
+    claimed_cleanup = repository.claim_outbox(worker_id="cleanup-worker")
+    assert claimed_cleanup is not None
+    assert claimed_cleanup.operation == "delete"
+    assert claimed_cleanup.id == storage_context.store.query_one(
+        "SELECT id FROM discord_outbox WHERE dedupe_key = ?",
+        (cleanup_key,),
+    )["id"]
+    repository.ack_outbox(
+        claimed_cleanup.id,
+        lease_owner=claimed_cleanup.lease_owner,
+        lease_attempt=claimed_cleanup.attempts,
+    )
+
+    deleted_view = storage_context.store.query_one(
+        """
+        SELECT discord_message_id, remote_message_seen_at,
+               cleanup_state, deleted_at
+        FROM turn_progress_views
+        WHERE turn_id = ?
+        """,
+        (turn.id,),
+    )
+    assert deleted_view is not None
+    assert deleted_view["discord_message_id"] is None
+    assert deleted_view["remote_message_seen_at"] is not None
+    assert deleted_view["cleanup_state"] == "deleted"
+    assert deleted_view["deleted_at"] is not None
+    assert repository.get_turn(turn.id).state is target
+
+
+def test_final_retry_and_dead_letter_do_not_unlock_progress_cleanup(
+    storage_context: StorageContext,
+) -> None:
+    repository = storage_context.repository
+    retry_turn, retry_final = _terminal_final_with_remote_progress(
+        storage_context,
+        "cleanup-final-retry",
+    )
+    repository.retry_outbox(
+        retry_final.id,
+        lease_owner=retry_final.lease_owner,
+        lease_attempt=retry_final.attempts,
+        error_code="discord_http_503",
+        next_attempt_at=0,
+    )
+    assert storage_context.store.query_one(
+        "SELECT 1 FROM discord_outbox WHERE dedupe_key = ?",
+        (f"turn:{retry_turn.id}:progress:delete",),
+    ) is None
+    retry_final = repository.claim_outbox(worker_id="retry-final-worker")
+    assert retry_final is not None
+    repository.ack_outbox(
+        retry_final.id,
+        lease_owner=retry_final.lease_owner,
+        lease_attempt=retry_final.attempts,
+    )
+    assert storage_context.store.query_one(
+        "SELECT state FROM discord_outbox WHERE dedupe_key = ?",
+        (f"turn:{retry_turn.id}:progress:delete",),
+    )["state"] == "pending"
+    retry_cleanup = repository.claim_outbox(worker_id="retry-cleanup-worker")
+    assert retry_cleanup is not None and retry_cleanup.operation == "delete"
+    repository.ack_outbox(
+        retry_cleanup.id,
+        lease_owner=retry_cleanup.lease_owner,
+        lease_attempt=retry_cleanup.attempts,
+    )
+
+    superseded_turn, superseded_final = _terminal_final_with_remote_progress(
+        storage_context,
+        "cleanup-final-superseded",
+    )
+    with storage_context.store.transaction() as connection:
+        connection.execute(
+            """
+            UPDATE discord_outbox
+            SET state = 'superseded', lease_owner = NULL,
+                lease_expires_at = NULL
+            WHERE id = ?
+            """,
+            (superseded_final.id,),
+        )
+    assert storage_context.store.query_one(
+        "SELECT 1 FROM discord_outbox WHERE dedupe_key = ?",
+        (f"turn:{superseded_turn.id}:progress:delete",),
+    ) is None
+
+    dead_turn, dead_final = _terminal_final_with_remote_progress(
+        storage_context,
+        "cleanup-final-dead-letter",
+    )
+    repository.fail_outbox_permanently(
+        dead_final.id,
+        lease_owner=dead_final.lease_owner,
+        lease_attempt=dead_final.attempts,
+        error_code="discord_forbidden",
+    )
+    assert storage_context.store.query_one(
+        "SELECT 1 FROM discord_outbox WHERE dedupe_key = ?",
+        (f"turn:{dead_turn.id}:progress:delete",),
+    ) is None
+
+
+def test_final_ack_rolls_back_if_cleanup_dedupe_identity_conflicts(
+    storage_context: StorageContext,
+) -> None:
+    repository = storage_context.repository
+    turn, final = _terminal_final_with_remote_progress(
+        storage_context,
+        "cleanup-atomic-rollback",
+    )
+    repository.enqueue_outbox(
+        destination_key="thread:300",
+        operation="send",
+        payload={"content": "not a cleanup"},
+        dedupe_key=f"turn:{turn.id}:progress:delete",
+        delivery_marker="wrong-cleanup",
+    )
+
+    with pytest.raises(InvariantError, match="cleanup dedupe key"):
+        repository.ack_outbox(
+            final.id,
+            lease_owner=final.lease_owner,
+            lease_attempt=final.attempts,
+        )
+
+    assert storage_context.store.query_one(
+        "SELECT state FROM discord_outbox WHERE id = ?",
+        (final.id,),
+    )["state"] == "sending"
+    assert storage_context.store.query_one(
+        "SELECT cleanup_state FROM turn_progress_views WHERE turn_id = ?",
+        (turn.id,),
+    )["cleanup_state"] == "active"
+
+
+def test_final_ack_without_remote_progress_converges_without_delete_outbox(
+    storage_context: StorageContext,
+) -> None:
+    repository = storage_context.repository
+    turn, _lease = _running_turn(storage_context, "cleanup-no-message")
+    repository.terminal_turn(
+        turn.id,
+        target=TurnState.COMPLETED,
+        terminal_code="completed-without-progress",
+    )
+    terminal_progress = repository.claim_outbox(worker_id="no-message-worker")
+    assert terminal_progress is not None
+    assert json.loads(terminal_progress.payload_json)["kind"] == "turn_progress"
+    repository.retry_outbox(
+        terminal_progress.id,
+        lease_owner=terminal_progress.lease_owner,
+        lease_attempt=terminal_progress.attempts,
+        error_code="discord_forbidden",
+        next_attempt_at=0,
+        permanent=True,
+    )
+    final = repository.claim_outbox(worker_id="no-message-worker")
+    assert final is not None
+    assert json.loads(final.payload_json)["kind"] == "turn_final"
+    repository.ack_outbox(
+        final.id,
+        lease_owner=final.lease_owner,
+        lease_attempt=final.attempts,
+    )
+
+    assert storage_context.store.query_one(
+        "SELECT 1 FROM discord_outbox WHERE dedupe_key = ?",
+        (f"turn:{turn.id}:progress:delete",),
+    ) is None
+    view = storage_context.store.query_one(
+        """
+        SELECT discord_message_id, remote_message_seen_at,
+               cleanup_state, deleted_at
+        FROM turn_progress_views
+        WHERE turn_id = ?
+        """,
+        (turn.id,),
+    )
+    assert view is not None
+    assert view["discord_message_id"] is None
+    assert view["remote_message_seen_at"] is None
+    assert view["cleanup_state"] == "deleted"
+    assert view["deleted_at"] is not None
+
+
+def test_progress_cleanup_recovery_is_idempotent_after_remote_delete(
+    storage_context: StorageContext,
+) -> None:
+    repository = storage_context.repository
+    turn, final = _terminal_final_with_remote_progress(
+        storage_context,
+        "cleanup-crash-before-ack",
+    )
+    repository.ack_outbox(
+        final.id,
+        lease_owner=final.lease_owner,
+        lease_attempt=final.attempts,
+    )
+    with storage_context.store.transaction() as connection:
+        before = connection.execute(
+            "SELECT content_revision FROM turn_progress_views WHERE turn_id = ?",
+            (turn.id,),
+        ).fetchone()
+        assert before is not None
+        assert insert_progress_update(
+            connection,
+            turn_id=turn.id,
+            state="running",
+            content="Running · late revision",
+            now=1,
+        ) is None
+        after = connection.execute(
+            "SELECT content_revision FROM turn_progress_views WHERE turn_id = ?",
+            (turn.id,),
+        ).fetchone()
+        assert after is not None
+        assert after["content_revision"] == before["content_revision"]
+    cleanup = repository.claim_outbox(worker_id="old-cleanup-worker")
+    assert cleanup is not None and cleanup.operation == "delete"
+
+    repository.recover_startup(current_boot_id="cleanup-recovery-boot")
+    recovered = repository.claim_outbox(worker_id="new-cleanup-worker")
+    assert recovered is not None
+    assert recovered.id == cleanup.id
+    assert recovered.state == "reconciling"
+    repository.ack_outbox(
+        recovered.id,
+        lease_owner=recovered.lease_owner,
+        lease_attempt=recovered.attempts,
+    )
+
+    rows = storage_context.store.query_all(
+        "SELECT state FROM discord_outbox WHERE dedupe_key = ?",
+        (f"turn:{turn.id}:progress:delete",),
+    )
+    assert [row["state"] for row in rows] == ["sent"]
+    with pytest.raises(ConflictError, match="lease was lost"):
+        repository.ack_outbox(
+            final.id,
+            lease_owner=final.lease_owner,
+            lease_attempt=final.attempts,
+        )
+    assert len(
+        storage_context.store.query_all(
+            "SELECT 1 FROM discord_outbox WHERE dedupe_key = ?",
+            (f"turn:{turn.id}:progress:delete",),
+        )
+    ) == 1
+
+
+def test_permanent_progress_cleanup_failure_preserves_terminal_result(
+    storage_context: StorageContext,
+) -> None:
+    repository = storage_context.repository
+    turn, final = _terminal_final_with_remote_progress(
+        storage_context,
+        "cleanup-permanent-failure",
+        target=TurnState.FAILED,
+    )
+    repository.ack_outbox(
+        final.id,
+        lease_owner=final.lease_owner,
+        lease_attempt=final.attempts,
+    )
+    cleanup = repository.claim_outbox(worker_id="cleanup-failure-worker")
+    assert cleanup is not None and cleanup.operation == "delete"
+    repository.fail_outbox_permanently(
+        cleanup.id,
+        lease_owner=cleanup.lease_owner,
+        lease_attempt=cleanup.attempts,
+        error_code="discord_forbidden",
+    )
+
+    assert repository.get_turn(turn.id).state is TurnState.FAILED
+    assert repository.get_conversation(turn.conversation_id).state.value == "active"
+    assert storage_context.store.query_one(
+        "SELECT state FROM discord_outbox WHERE id = ?",
+        (final.id,),
+    )["state"] == "sent"
+    failed_view = storage_context.store.query_one(
+        "SELECT cleanup_state, discord_message_id FROM turn_progress_views WHERE turn_id = ?",
+        (turn.id,),
+    )
+    assert failed_view is not None
+    assert failed_view["cleanup_state"] == "delete_failed"
+    assert failed_view["discord_message_id"] is not None
+    incident = storage_context.store.query_one(
+        "SELECT code, turn_id FROM incidents WHERE code = ?",
+        ("discord_progress_delete_permanent",),
+    )
+    assert incident is not None
+    assert dict(incident) == {
+        "code": "discord_progress_delete_permanent",
+        "turn_id": turn.id,
+    }
+    assert len(
+        storage_context.store.query_all(
+            "SELECT 1 FROM discord_outbox WHERE dedupe_key = ?",
+            (f"turn:{turn.id}:final",),
+        )
+    ) == 1
+
+
 def test_terminal_progress_reconciles_running_send_before_terminal_revision(
     storage_context: StorageContext,
 ) -> None:
@@ -1991,10 +2465,33 @@ def test_terminal_progress_reconciles_running_send_before_terminal_revision(
         lease_owner=recovered.lease_owner,
         lease_attempt=recovered.attempts,
         discord_message_id="reconciled-progress",
+        turn_progress_id=turn.id,
     )
     terminal = repository.claim_outbox(worker_id="new-worker")
     assert terminal is not None
     assert json.loads(terminal.payload_json)["state"] == "terminal"
+    repository.ack_outbox(
+        terminal.id,
+        lease_owner=terminal.lease_owner,
+        lease_attempt=terminal.attempts,
+        discord_message_id="reconciled-progress",
+        turn_progress_id=turn.id,
+    )
+    final = repository.claim_outbox(worker_id="new-worker")
+    assert final is not None
+    assert json.loads(final.payload_json)["kind"] == "turn_final"
+    repository.ack_outbox(
+        final.id,
+        lease_owner=final.lease_owner,
+        lease_attempt=final.attempts,
+    )
+    cleanup = repository.claim_outbox(worker_id="new-worker")
+    assert cleanup is not None
+    assert cleanup.operation == "delete"
+    assert json.loads(cleanup.payload_json) == {
+        "kind": "turn_progress_delete",
+        "turn_id": turn.id,
+    }
     sent = storage_context.store.query_one(
         "SELECT state FROM discord_outbox WHERE id = ?",
         (running.id,),

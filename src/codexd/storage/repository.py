@@ -4383,6 +4383,11 @@ class Repository:
             ).rowcount
             if changed != 1:
                 raise ConflictError("outbox delivery lease was lost")
+            outbox = connection.execute(
+                "SELECT * FROM discord_outbox WHERE id = ?",
+                (outbox_id,),
+            ).fetchone()
+            assert outbox is not None
             if task_card_view_id is not None and discord_message_id is not None:
                 view_changed = connection.execute(
                     """
@@ -4400,15 +4405,24 @@ class Repository:
                 progress_changed = connection.execute(
                     """
                     UPDATE turn_progress_views
-                    SET discord_message_id = ?, updated_at = ?
-                    WHERE turn_id = ?
+                    SET discord_message_id = ?,
+                        remote_message_seen_at = COALESCE(
+                            remote_message_seen_at, ?
+                        ),
+                        updated_at = ?
+                    WHERE turn_id = ? AND cleanup_state = 'active'
                     """,
-                    (discord_message_id, now, turn_progress_id),
+                    (discord_message_id, now, now, turn_progress_id),
                 ).rowcount
                 if progress_changed != 1:
                     raise NotFoundError(
                         f"Turn progress view not found: {turn_progress_id}"
                     )
+            _apply_progress_cleanup_after_ack(
+                connection,
+                outbox=outbox,
+                now=now,
+            )
 
     def retry_outbox(
         self,
@@ -4537,6 +4551,37 @@ class Repository:
                 if scope is not None and scope["schedule_id"] is not None
                 else None
             )
+            if isinstance(payload, dict) and payload.get("kind") == (
+                "turn_progress_delete"
+            ):
+                if (
+                    isinstance(turn_id, str)
+                    and outbox["dedupe_key"]
+                    == f"turn:{turn_id}:progress:delete"
+                ):
+                    connection.execute(
+                        """
+                        UPDATE turn_progress_views
+                        SET cleanup_state = 'delete_failed', updated_at = ?
+                        WHERE turn_id = ? AND cleanup_state = 'delete_pending'
+                        """,
+                        (now, turn_id),
+                    )
+                _upsert_incident(
+                    connection,
+                    severity="error",
+                    code="discord_progress_delete_permanent",
+                    summary=(
+                        "Discord progress cleanup failed permanently; "
+                        "the terminal result remains delivered"
+                    ),
+                    project_id=project_id,
+                    conversation_id=conversation_id,
+                    turn_id=scoped_turn_id,
+                    details={"error_code": error_code, "outbox_id": outbox_id},
+                    now=now,
+                )
+                return
             if conversation_id is not None:
                 connection.execute(
                     """
@@ -4746,13 +4791,18 @@ class Repository:
 
     def set_turn_progress_message(self, turn_id: str, message_id: str) -> None:
         with self.store.transaction() as connection:
+            now = utc_now_ms()
             changed = connection.execute(
                 """
                 UPDATE turn_progress_views
-                SET discord_message_id = ?, updated_at = ?
-                WHERE turn_id = ?
+                SET discord_message_id = ?,
+                    remote_message_seen_at = COALESCE(
+                        remote_message_seen_at, ?
+                    ),
+                    updated_at = ?
+                WHERE turn_id = ? AND cleanup_state = 'active'
                 """,
-                (message_id, utc_now_ms(), turn_id),
+                (message_id, now, now, turn_id),
             ).rowcount
             if changed != 1:
                 raise NotFoundError(f"Turn progress view not found: {turn_id}")
@@ -5880,6 +5930,177 @@ def _turn(row: sqlite3.Row) -> TurnRecord:
         error_message_redacted=row["error_message_redacted"],
         usage_scope=row["usage_scope"],
     )
+
+
+def _apply_progress_cleanup_after_ack(
+    connection: sqlite3.Connection,
+    *,
+    outbox: sqlite3.Row,
+    now: int,
+) -> None:
+    try:
+        payload = json.loads(str(outbox["payload_json"]))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return
+    if not isinstance(payload, dict):
+        return
+    if payload.get("kind") == "turn_final":
+        _enqueue_terminal_progress_cleanup(
+            connection,
+            outbox=outbox,
+            payload=payload,
+            now=now,
+        )
+    elif payload.get("kind") == "turn_progress_delete":
+        _mark_terminal_progress_deleted(
+            connection,
+            outbox=outbox,
+            payload=payload,
+            now=now,
+        )
+
+
+def _enqueue_terminal_progress_cleanup(
+    connection: sqlite3.Connection,
+    *,
+    outbox: sqlite3.Row,
+    payload: dict[str, Any],
+    now: int,
+) -> None:
+    turn_id = payload.get("turn_id")
+    if not isinstance(turn_id, str) or not turn_id:
+        raise InvariantError("turn final outbox is missing its Turn identity")
+    expected_final_key = f"turn:{turn_id}:final"
+    if outbox["operation"] != "send" or outbox["dedupe_key"] != expected_final_key:
+        raise InvariantError("turn final outbox identity is invalid")
+    view = connection.execute(
+        """
+        SELECT v.*, t.state AS turn_state
+        FROM turn_progress_views v
+        JOIN turns t ON t.id = v.turn_id
+        WHERE v.turn_id = ?
+        """,
+        (turn_id,),
+    ).fetchone()
+    if view is None:
+        raise NotFoundError(f"Turn progress view not found: {turn_id}")
+    if not TurnState(str(view["turn_state"])).terminal or view["state"] != "terminal":
+        raise InvariantError("turn final was acknowledged before terminal progress")
+    if view["cleanup_state"] != "active":
+        return
+    if (
+        view["discord_message_id"] is None
+        and view["remote_message_seen_at"] is None
+    ):
+        connection.execute(
+            """
+            UPDATE turn_progress_views
+            SET cleanup_state = 'deleted', deleted_at = ?, updated_at = ?
+            WHERE turn_id = ? AND cleanup_state = 'active'
+            """,
+            (now, now, turn_id),
+        )
+        return
+
+    cleanup_payload = canonical_json(
+        {"kind": "turn_progress_delete", "turn_id": turn_id}
+    )
+    cleanup_key = f"turn:{turn_id}:progress:delete"
+    cleanup_marker = f"turn-{turn_id[:8]}-progress-delete"
+    expected = (
+        None,
+        view["destination_key"],
+        "delete",
+        outbox["id"],
+        cleanup_payload,
+        None,
+        cleanup_marker,
+    )
+    existing = connection.execute(
+        """
+        SELECT event_sequence, destination_key, operation,
+               depends_on_outbox_id, payload_json, coalesce_key,
+               delivery_marker
+        FROM discord_outbox
+        WHERE dedupe_key = ?
+        """,
+        (cleanup_key,),
+    ).fetchone()
+    if existing is not None:
+        actual = (
+            existing["event_sequence"],
+            existing["destination_key"],
+            existing["operation"],
+            existing["depends_on_outbox_id"],
+            existing["payload_json"],
+            existing["coalesce_key"],
+            existing["delivery_marker"],
+        )
+        if actual != expected:
+            raise InvariantError(
+                "progress cleanup dedupe key was reused for a different operation"
+            )
+    else:
+        connection.execute(
+            """
+            INSERT INTO discord_outbox(
+                id, event_sequence, destination_key, operation,
+                depends_on_outbox_id, payload_json, dedupe_key,
+                delivery_marker, state, attempts, next_attempt_at,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, 'delete', ?, ?, ?, ?, 'pending', 0, ?, ?, ?)
+            """,
+            (
+                new_id(),
+                None,
+                view["destination_key"],
+                outbox["id"],
+                cleanup_payload,
+                cleanup_key,
+                cleanup_marker,
+                now,
+                now,
+                now,
+            ),
+        )
+    connection.execute(
+        """
+        UPDATE turn_progress_views
+        SET cleanup_state = 'delete_pending', updated_at = ?
+        WHERE turn_id = ? AND cleanup_state = 'active'
+        """,
+        (now, turn_id),
+    )
+
+
+def _mark_terminal_progress_deleted(
+    connection: sqlite3.Connection,
+    *,
+    outbox: sqlite3.Row,
+    payload: dict[str, Any],
+    now: int,
+) -> None:
+    turn_id = payload.get("turn_id")
+    expected_payload = {"kind": "turn_progress_delete", "turn_id": turn_id}
+    if (
+        not isinstance(turn_id, str)
+        or not turn_id
+        or payload != expected_payload
+        or outbox["operation"] != "delete"
+        or outbox["dedupe_key"] != f"turn:{turn_id}:progress:delete"
+    ):
+        raise InvariantError("turn progress cleanup outbox identity is invalid")
+    changed = connection.execute(
+        """
+        UPDATE turn_progress_views
+        SET discord_message_id = NULL, cleanup_state = 'deleted',
+            deleted_at = COALESCE(deleted_at, ?), updated_at = ?
+        WHERE turn_id = ? AND cleanup_state <> 'active'
+        """,
+        (now, now, turn_id),
+    ).rowcount
+    if changed != 1:
+        raise NotFoundError(f"Turn progress view not found: {turn_id}")
 
 
 def _outbox(
