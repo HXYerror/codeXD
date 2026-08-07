@@ -1742,10 +1742,14 @@ async def test_thread_creation_outbox_reconciles_existing_remote_thread(
     assert record is not None
     channel = Mock(spec=discord.TextChannel)
     channel.id = 200
+    starter = Mock(spec=discord.Message)
+    starter.create_thread = AsyncMock()
+    channel.fetch_message = AsyncMock(return_value=starter)
     thread = Mock(spec=discord.Thread)
     thread.id = 302
     thread.archived = False
     thread.locked = False
+    thread.edit = AsyncMock()
     client = Mock(spec=discord.Client)
     client.get_channel.side_effect = (
         lambda channel_id: channel if channel_id == 200 else thread
@@ -1768,6 +1772,9 @@ async def test_thread_creation_outbox_reconciles_existing_remote_thread(
         storage_context.repository.get_ingress_message("302").state
         == "pending_preflight"
     )
+    channel.fetch_message.assert_not_awaited()
+    starter.create_thread.assert_not_awaited()
+    thread.edit.assert_not_awaited()
 
 
 @pytest.mark.asyncio

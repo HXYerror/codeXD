@@ -1908,13 +1908,41 @@ def test_thread_creation_intent_is_durable_and_idempotent(
     )
 
 
+def test_fresh_image_only_thread_creation_uses_image_title(
+    storage_context: StorageContext,
+) -> None:
+    repository = storage_context.repository
+
+    created, _ = repository.request_thread_creation(
+        discord_message_id="306",
+        content_hash="content",
+        attachment_manifest_hash="image-attachments",
+        first_request_text="",
+        has_image_attachment=True,
+        project_id=storage_context.project.id,
+        discord_guild_id=100,
+        discord_channel_id=200,
+        owner_user_id=400,
+        boot_id="boot",
+    )
+
+    assert created
+    ingress = repository.get_ingress_message("306")
+    outbox = repository.claim_outbox(worker_id="worker")
+    assert outbox is not None
+    payload = json.loads(outbox.payload_json)
+    assert payload["name"] == f"图片任务 · {ingress.id[:4]}"
+
+
 def test_thread_creation_title_is_redacted_bounded_and_only_persists_safe_name(
     storage_context: StorageContext,
 ) -> None:
     repository = storage_context.repository
     secret = "provider-secret-value"
+    github_pat = "github_pat_" + "a" * 22 + "_" + "b" * 59
     raw_request = (
-        f"inspect {storage_context.root}/private OPENAI_API_KEY={secret} "
+        f"rotate {github_pat} inspect {storage_context.root}/private "
+        f"OPENAI_API_KEY={secret} "
         + "界🙂" * 100
     )
 
@@ -1942,6 +1970,8 @@ def test_thread_creation_title_is_redacted_bounded_and_only_persists_safe_name(
     assert raw_request not in outbox.payload_json
     assert str(storage_context.root) not in outbox.payload_json
     assert secret not in outbox.payload_json
+    assert github_pat not in outbox.payload_json
+    assert "<redacted>" in payload["name"]
     assert set(payload) == {
         "expected_thread_id",
         "kind",

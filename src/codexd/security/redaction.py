@@ -4,6 +4,7 @@ import base64
 import binascii
 import re
 import shlex
+import unicodedata
 from pathlib import Path, PureWindowsPath
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -16,6 +17,9 @@ _SECRET_NAME = re.compile(
 _AUTH_HEADER = re.compile(
     r"(?i)\b(?P<header>authorization|proxy-authorization)\s*:\s*"
     r"(?P<scheme>[A-Za-z][A-Za-z0-9_-]*)\s+(?P<value>\S+)"
+)
+_COOKIE_HEADER = re.compile(
+    r"(?im)\b(?P<header>set-cookie|cookie)\s*:\s*(?P<value>[^\r\n]*)"
 )
 _STANDALONE_BEARER = re.compile(
     r"\b(?P<scheme>(?i:bearer))\s+"
@@ -37,6 +41,13 @@ _SECRET_FLAG = re.compile(
     r"authorization|credential)(?:=|\s+))"
     r"(?P<value>\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;&]+)"
 )
+_SESSION_COOKIE_ASSIGNMENT = re.compile(
+    r"(?i)(?P<prefix>[\"']?"
+    r"(?:session(?:[._-]?(?:id|key|token|cookie))?|"
+    r"(?:auth[._-]?)?cookies?(?:[._-]?(?:id|key|token|value|session))?)"
+    r"[\"']?\s*[:=]\s*)"
+    r"(?P<value>\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;&]+)"
+)
 _TOKEN_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"),
     re.compile(
@@ -44,6 +55,25 @@ _TOKEN_PATTERNS = (
         r"\.[A-Za-z0-9_-]{20,}\b"
     ),
     re.compile(r"\bmfa\.[A-Za-z0-9_-]{20,}\b"),
+    re.compile(
+        r"(?<![A-Za-z0-9_])ghp_[A-Za-z0-9]{36}(?![A-Za-z0-9_])"
+    ),
+    re.compile(
+        r"(?<![A-Za-z0-9_])github_pat_[A-Za-z0-9]{22}_"
+        r"[A-Za-z0-9]{59}(?![A-Za-z0-9_])"
+    ),
+    re.compile(
+        r"(?<![A-Za-z0-9-])xox[baprs]-[A-Za-z0-9-]{10,198}"
+        r"[A-Za-z0-9](?![A-Za-z0-9-])"
+    ),
+    re.compile(r"(?<![A-Za-z0-9])(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Za-z0-9])"),
+    re.compile(
+        r"(?<![A-Za-z0-9_-])AIza[A-Za-z0-9_-]{35}(?![A-Za-z0-9_-])"
+    ),
+    re.compile(
+        r"(?<![A-Za-z0-9_])(?:sk|rk)_(?:live|test)_"
+        r"[A-Za-z0-9]{16,200}(?![A-Za-z0-9_])"
+    ),
 )
 _URL = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 _HOME_PATHS = (
@@ -63,9 +93,13 @@ _DIFF_PATH_HEADER = re.compile(
 
 
 def redact_text(value: str, *, project_root: Path | None = None) -> str:
-    redacted = _URL.sub(_redact_url, value)
+    redacted = _strip_unsafe_unicode_controls(value)
+    redacted = _URL.sub(_redact_url, redacted)
     if project_root is not None:
-        variants = {str(project_root), project_root.as_posix()}
+        variants = {
+            _strip_unsafe_unicode_controls(str(project_root)),
+            _strip_unsafe_unicode_controls(project_root.as_posix()),
+        }
         for variant in sorted(variants, key=len, reverse=True):
             if variant:
                 redacted = redacted.replace(variant, "<project>")
@@ -73,6 +107,10 @@ def redact_text(value: str, *, project_root: Path | None = None) -> str:
         lambda match: (
             f"{match.group('header')}: {match.group('scheme')} <redacted>"
         ),
+        redacted,
+    )
+    redacted = _COOKIE_HEADER.sub(
+        lambda match: f"{match.group('header')}: <redacted>",
         redacted,
     )
     redacted = _STANDALONE_BEARER.sub(
@@ -85,11 +123,12 @@ def redact_text(value: str, *, project_root: Path | None = None) -> str:
     )
     redacted = _SECRET_FLAG.sub(_redact_named_value, redacted)
     redacted = _SECRET_ASSIGNMENT.sub(_redact_named_value, redacted)
+    redacted = _SESSION_COOKIE_ASSIGNMENT.sub(_redact_named_value, redacted)
     for pattern in _TOKEN_PATTERNS:
         redacted = pattern.sub("<redacted>", redacted)
     for pattern in _HOME_PATHS:
         redacted = pattern.sub("<home>", redacted)
-    return _CONTROL_CHARACTERS.sub("", redacted)
+    return redacted
 
 
 def redacted_summary(
@@ -119,12 +158,17 @@ def safe_thread_title_summary(
     mention_stripped = _strip_discord_mentions(value)
     redacted = redact_text(mention_stripped, project_root=project_root)
     safe_summary = " ".join(_strip_discord_mentions(redacted).split())
-    if not safe_summary:
+    if not _has_visible_character(safe_summary):
         return "新任务"
-    return redacted_summary(
+    truncated = redacted_summary(
         safe_summary,
+        project_root=project_root,
         max_chars=_THREAD_TITLE_SUMMARY_MAX_CHARS,
     )
+    final_summary = " ".join(
+        _strip_discord_mentions(_strip_unsafe_unicode_controls(truncated)).split()
+    )
+    return final_summary if _has_visible_character(final_summary) else "新任务"
 
 
 def redact_value(value: Any, *, project_root: Path | None = None) -> Any:
@@ -173,6 +217,54 @@ def _redact_named_value(match: re.Match[str]) -> str:
 def _strip_discord_mentions(value: str) -> str:
     without_entities = _DISCORD_ENTITY_MENTION.sub(" ", value)
     return _DISCORD_BROADCAST_MENTION.sub(" ", without_entities)
+
+
+def _strip_unsafe_unicode_controls(value: str) -> str:
+    without_controls = _CONTROL_CHARACTERS.sub("", value)
+    without_formats = "".join(
+        character
+        for character in without_controls
+        if unicodedata.category(character) != "Cf" or character == "\u200d"
+    )
+    return "".join(
+        character
+        for index, character in enumerate(without_formats)
+        if character != "\u200d" or _valid_emoji_joiner(without_formats, index)
+    )
+
+
+def _valid_emoji_joiner(value: str, index: int) -> bool:
+    before = _adjacent_emoji_base(value, index, -1)
+    after = _adjacent_emoji_base(value, index, 1)
+    return before is not None and after is not None
+
+
+def _adjacent_emoji_base(value: str, index: int, direction: int) -> str | None:
+    position = index + direction
+    while 0 <= position < len(value) and (
+        _variation_selector(value[position]) or _emoji_modifier(value[position])
+    ):
+        position += direction
+    if 0 <= position < len(value) and _emoji_base(value[position]):
+        return value[position]
+    return None
+
+
+def _emoji_base(value: str) -> bool:
+    codepoint = ord(value)
+    return 0x2600 <= codepoint <= 0x27BF or 0x1F000 <= codepoint <= 0x1FAFF
+
+
+def _variation_selector(value: str) -> bool:
+    return "\ufe00" <= value <= "\ufe0f" or "\U000e0100" <= value <= "\U000e01ef"
+
+
+def _emoji_modifier(value: str) -> bool:
+    return "\U0001f3fb" <= value <= "\U0001f3ff"
+
+
+def _has_visible_character(value: str) -> bool:
+    return any(unicodedata.category(character)[0] in {"L", "N", "P", "S"} for character in value)
 
 
 def _redact_basic_auth(match: re.Match[str]) -> str:

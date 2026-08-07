@@ -353,6 +353,27 @@ def test_thread_title_summary_removes_discord_mentions_and_controls() -> None:
     )
 
 
+def test_thread_title_summary_removes_unsafe_unicode_formats() -> None:
+    assert safe_thread_title_summary("\u200b\u200c\u200d\ufeff") == "新任务"
+    assert (
+        safe_thread_title_summary("\u202efix\u2069 \u2066login\u2069")
+        == "fix login"
+    )
+
+
+def test_thread_title_summary_preserves_emoji_zwj_sequences() -> None:
+    value = "repair the 👩‍💻 workflow"
+
+    assert safe_thread_title_summary(value) == value
+
+
+def test_thread_title_summary_removes_dangling_zwj_after_truncation() -> None:
+    summary = safe_thread_title_summary("x" * 67 + "👩‍💻 tail")
+
+    assert summary == "x" * 67 + "👩..."
+    assert "\u200d" not in summary
+
+
 @pytest.mark.parametrize(
     ("value", "forbidden"),
     (
@@ -386,6 +407,77 @@ def test_thread_title_summary_redacts_full_project_root(tmp_path: Path) -> None:
     assert "<project>/src/main.py" in summary
 
 
+def test_thread_title_summary_redacts_control_interleaved_project_root(
+    tmp_path: Path,
+) -> None:
+    project_root = tmp_path / "private-project"
+    raw_root = str(project_root)
+    midpoint = len(raw_root) // 2
+    interleaved_root = f"{raw_root[:midpoint]}\x00{raw_root[midpoint:]}"
+
+    summary = safe_thread_title_summary(
+        f"inspect {interleaved_root}/src/main.py",
+        project_root=project_root,
+    )
+
+    assert raw_root not in summary
+    assert "<project>/src/main.py" in summary
+
+
+def test_thread_title_summary_redacts_control_interleaved_secret_name() -> None:
+    secret = "control-interleaved-secret"
+
+    summary = safe_thread_title_summary(
+        f"OPENAI_API_KE\u200bY={secret} fix authentication"
+    )
+
+    assert secret not in summary
+    assert "<redacted>" in summary
+
+
+@pytest.mark.parametrize(
+    "credential",
+    (
+        "ghp_" + "a" * 36,
+        "github_pat_" + "a" * 22 + "_" + "b" * 59,
+        "xoxb-" + "1234567890-" + "a" * 24,
+        "AKIA" + "A" * 16,
+        "AIza" + "a" * 35,
+        "sk_live_" + "a" * 24,
+        "rk_live_" + "a" * 24,
+    ),
+)
+def test_thread_title_summary_redacts_recognizable_credentials(
+    credential: str,
+) -> None:
+    summary = safe_thread_title_summary(f"rotate {credential} now")
+
+    assert credential not in summary
+    assert "<redacted>" in summary
+
+
+@pytest.mark.parametrize(
+    ("value", "secret"),
+    (
+        ("Cookie: session_id=cookie-header-secret; theme=dark", "cookie-header-secret"),
+        (
+            "Set-Cookie: session_id=set-cookie-secret; HttpOnly",
+            "set-cookie-secret",
+        ),
+        ("session_id=session-assignment-secret", "session-assignment-secret"),
+        ("cookie=cookie-assignment-secret", "cookie-assignment-secret"),
+    ),
+)
+def test_thread_title_summary_redacts_cookie_and_session_values(
+    value: str,
+    secret: str,
+) -> None:
+    summary = safe_thread_title_summary(value)
+
+    assert secret not in summary
+    assert "<redacted>" in summary
+
+
 @pytest.mark.parametrize(
     "value",
     (
@@ -404,6 +496,24 @@ def test_thread_title_summary_is_bounded_in_unicode_characters() -> None:
     assert len(summary) == 72
     assert summary.endswith("...")
     assert summary.encode("utf-8")
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    (
+        ("x" * 60 + "@everyonexxx tail", "x" * 60 + " ..."),
+        ("x" * 64 + "@herexxx tail", "x" * 64 + " ..."),
+    ),
+)
+def test_thread_title_summary_resanitizes_mentions_created_by_truncation(
+    value: str,
+    expected: str,
+) -> None:
+    summary = safe_thread_title_summary(value)
+
+    assert summary == expected
+    assert "@everyone" not in summary.casefold()
+    assert "@here" not in summary.casefold()
 
 
 @pytest.mark.parametrize(
