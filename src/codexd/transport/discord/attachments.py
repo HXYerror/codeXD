@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import os
 import re
+import stat
 import unicodedata
 import uuid
 from collections.abc import Iterable, Sequence
@@ -22,6 +23,7 @@ from codexd.rendering.media_worker import (
     AttachmentMediaResult,
     MediaWorker,
 )
+from codexd.security import private_files
 from codexd.security.private_files import (
     PrivateFileSecurityUnavailable,
     ensure_private_directory,
@@ -272,15 +274,15 @@ class DiscordAttachmentIngestor:
         display_name = _sanitize_display_name(attachment.filename)
         quarantine = self._attachments_dir / ".quarantine"
         inputs = self._attachments_dir / "input"
-        _ensure_private_directory(self._attachments_dir)
-        _ensure_private_directory(quarantine)
-        _ensure_private_directory(inputs)
+        _ensure_image_ingest_directory(self._attachments_dir)
+        _ensure_image_ingest_directory(quarantine)
         source = quarantine / f"{attachment_id}.download"
         staging = quarantine / f"{attachment_id}.normalized"
         image_final = inputs / f"{attachment_id}.png"
         file_final = inputs / f"{attachment_id}{_storage_extension(display_name)}"
         committed: Path | None = None
         try:
+            _ensure_image_ingest_directory(inputs)
             downloaded_result = await self._download(attachment.url, source)
             if isinstance(downloaded_result, _DownloadedAttachment):
                 downloaded = downloaded_result
@@ -311,7 +313,7 @@ class DiscordAttachmentIngestor:
                         "image decode or normalization failed",
                         code="image_decode_failed",
                     )
-                _commit_file(staging, image_final)
+                _commit_normalized_image(staging, image_final)
                 committed = image_final
                 normalized = replace(normalized, output_path=image_final)
                 return TurnImage(
@@ -338,7 +340,8 @@ class DiscordAttachmentIngestor:
                     "file attachment exceeds the configured byte limit",
                     code="attachment_size_limit",
                 )
-            _commit_file(source, file_final)
+            _ensure_private_directory(inputs)
+            _commit_private_file(source, file_final)
             committed = file_final
             return TurnFile(
                 attachment_id=attachment_id,
@@ -488,7 +491,10 @@ class DiscordAttachmentIngestor:
                         "attachment download was empty or incomplete",
                         code="attachment_integrity_failed",
                     )
-                await asyncio.to_thread(secure_private_file, destination)
+                await asyncio.to_thread(
+                    _secure_image_classification_download,
+                    destination,
+                )
                 return _DownloadedAttachment(
                     size_bytes=size,
                     sha256=digest.hexdigest(),
@@ -691,7 +697,76 @@ def _ensure_private_directory(path: Path) -> None:
         ) from exc
 
 
-def _commit_file(source: Path, destination: Path) -> None:
+def _ensure_image_ingest_directory(path: Path) -> None:
+    """Create storage used only by bounded raster classification/normalization.
+
+    Windows retains this legacy image-only path. This helper is deliberately
+    separate from the private-file facade and must never authorize a durable
+    opaque ``TurnFile``.
+    """
+
+    try:
+        ensure_private_directory(path)
+        return
+    except PrivateFileSecurityUnavailable:
+        if not private_files.legacy_image_ingestion_supported():
+            raise AttachmentError(
+                "attachment storage is unavailable on this platform",
+                code="file_input_unsupported",
+            ) from None
+    except OSError as exc:
+        raise AttachmentError(
+            "attachment storage directory is unsafe",
+            code="attachment_integrity_failed",
+        ) from exc
+
+    try:
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        metadata = path.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise OSError("legacy image storage path is not a regular directory")
+    except OSError as exc:
+        raise AttachmentError(
+            "attachment storage directory is unsafe",
+            code="attachment_integrity_failed",
+        ) from exc
+
+
+def _secure_image_classification_download(path: Path) -> None:
+    """Secure a transient classifier input where supported.
+
+    On Windows these bytes remain only long enough for bounded image
+    classification and are unlinked unless normalization produces a PNG.
+    """
+
+    try:
+        secure_private_file(path)
+    except PrivateFileSecurityUnavailable:
+        if not private_files.legacy_image_ingestion_supported():
+            raise
+
+
+def _commit_normalized_image(source: Path, destination: Path) -> None:
+    """Commit decoder-produced PNG output, including the legacy Windows path."""
+
+    if destination.exists() or destination.is_symlink():
+        raise OSError("attachment destination already exists")
+    os.replace(source, destination)
+    try:
+        secure_private_file(destination)
+    except PrivateFileSecurityUnavailable:
+        if private_files.legacy_image_ingestion_supported():
+            return
+        destination.unlink(missing_ok=True)
+        raise
+    except OSError:
+        destination.unlink(missing_ok=True)
+        raise
+
+
+def _commit_private_file(source: Path, destination: Path) -> None:
+    """Commit an opaque file only through the strict private-file facade."""
+
     if destination.exists() or destination.is_symlink():
         raise OSError("attachment destination already exists")
     os.replace(source, destination)

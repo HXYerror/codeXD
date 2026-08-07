@@ -277,6 +277,65 @@ def test_windows_private_storage_facade_fails_closed_on_this_host(
     assert not (tmp_path / "attachments").exists()
 
 
+@pytest.mark.asyncio
+async def test_windows_platform_facade_keeps_content_detected_image_flow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    content = _png_bytes()
+    monkeypatch.setattr(private_files, "_platform_name", lambda: "nt")
+    ingestor = _ingestor(
+        tmp_path,
+        _FakeSession(_FakeResponse(chunks=(content,))),
+    )
+
+    result = await ingestor.ingest(
+        [
+            _attachment(
+                content,
+                filename="misleading-document.txt",
+                content_type="text/plain",
+            )
+        ]
+    )
+
+    assert result.files == ()
+    assert len(result.images) == 1
+    assert result.images[0].canonical_path.suffix == ".png"
+    with Image.open(result.images[0].canonical_path) as normalized:
+        assert normalized.format == "PNG"
+    assert list((tmp_path / ".quarantine").iterdir()) == []
+    ingestor.cleanup(result)
+
+
+@pytest.mark.asyncio
+async def test_windows_platform_facade_rejects_opaque_file_without_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    content = b"opaque file bytes"
+    monkeypatch.setattr(private_files, "_platform_name", lambda: "nt")
+    ingestor = _ingestor(
+        tmp_path,
+        _FakeSession(_FakeResponse(chunks=(content,))),
+    )
+
+    with pytest.raises(AttachmentError) as failure:
+        await ingestor.ingest(
+            [
+                _attachment(
+                    content,
+                    filename="picture.png.txt",
+                    content_type="application/octet-stream",
+                )
+            ]
+        )
+
+    assert failure.value.code == "file_input_unsupported"
+    assert list((tmp_path / ".quarantine").iterdir()) == []
+    assert list((tmp_path / "input").iterdir()) == []
+
+
 @pytest.mark.skipif(os.name != "nt", reason="requires native Windows semantics")
 def test_windows_attachment_storage_is_explicitly_unavailable_without_dacl_support(
     tmp_path: Path,

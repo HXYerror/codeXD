@@ -103,6 +103,7 @@ _MAX_DELTA = 16 * 1024
 _THREAD_COMPACT_START_TIMEOUT_SECONDS = 30.0
 _SUBAGENT_DETAIL_TIMEOUT_SECONDS = 2.0
 _CANCELLED_STARTUP_CLEANUP_TIMEOUT_SECONDS = 30.0
+_FILE_INPUT_RUNTIME_RETIRE_TIMEOUT_SECONDS = 30.0
 _NEW_THREAD_PERSISTENCE_NAME = "codexD session"
 _ARCHIVE_DIRECT_HANDLE_CONTRACT_VERIFIED = False
 _MIN_SDK_VERSION = (0, 144, 4)
@@ -178,22 +179,23 @@ async def _finish_cancelled_startup(
     client: AsyncCodex,
     enter_task: asyncio.Task[Any],
 ) -> None:
+    process = _app_server_process(client)
     try:
         async with asyncio.timeout(_CANCELLED_STARTUP_CLEANUP_TIMEOUT_SECONDS):
             await client.close()
             await asyncio.shield(enter_task)
             await client.close()
     except asyncio.CancelledError:
-        _force_terminate_cancelled_startup_process(client)
+        _force_terminate_cancelled_startup_process(client, process=process)
         await _cancel_startup_entry(enter_task)
         raise
     except TimeoutError:
         logger.error("Cancelled Codex runtime startup cleanup exceeded its deadline")
-        _force_terminate_cancelled_startup_process(client)
+        _force_terminate_cancelled_startup_process(client, process=process)
         await _cancel_startup_entry(enter_task)
     except Exception:
         logger.exception("Cancelled Codex runtime startup cleanup failed")
-        _force_terminate_cancelled_startup_process(client)
+        _force_terminate_cancelled_startup_process(client, process=process)
         await _cancel_startup_entry(enter_task)
 
 
@@ -207,18 +209,42 @@ async def _cancel_startup_entry(enter_task: asyncio.Task[Any]) -> None:
         logger.exception("Cancelled Codex runtime startup task failed during cleanup")
 
 
-def _force_terminate_cancelled_startup_process(client: AsyncCodex) -> None:
+def _app_server_process(client: AsyncCodex) -> Any | None:
     async_client = getattr(client, "_client", None)
     sync_client = getattr(async_client, "_sync", None)
-    process = getattr(sync_client, "_proc", None)
+    return getattr(sync_client, "_proc", None)
+
+
+def _force_terminate_app_server(
+    client: AsyncCodex,
+    *,
+    process: Any | None = None,
+) -> bool:
+    """Synchronously stop the SDK process captured before ``client.close``.
+
+    The SDK clears its private process field at the beginning of close, so a
+    close failure can otherwise make the still-running process unreachable.
+    """
+
+    process = process if process is not None else _app_server_process(client)
     if process is None:
-        return
+        return True
     try:
         process.kill()
     except ProcessLookupError:
-        pass
-    except OSError:
-        logger.exception("Could not force-terminate cancelled Codex startup process")
+        return True
+    except Exception:
+        logger.exception("Could not force-terminate Codex app-server process")
+        return False
+    return True
+
+
+def _force_terminate_cancelled_startup_process(
+    client: AsyncCodex,
+    *,
+    process: Any | None = None,
+) -> None:
+    _force_terminate_app_server(client, process=process)
 
 
 _UNKNOWN_OUTCOME_MUTATIONS = frozenset(
@@ -252,6 +278,8 @@ class CodexSDKRuntime:
         self._threads: dict[str, AsyncThread] = {}
         self._turn_handles: dict[str, AsyncTurnHandle] = {}
         self._file_input_leases: dict[str, _FileInputLeases] = {}
+        self._pending_file_input_leases: set[_FileInputLeases] = set()
+        self._file_lease_release_blocked = False
         self._subagent_details: dict[str, dict[str, str]] = {}
         self._closed = False
         self._close_lock = asyncio.Lock()
@@ -583,6 +611,7 @@ class CodexSDKRuntime:
             for image in input.images
         ]
         leases = _acquire_file_input_leases(input.files)
+        provider_start_attempted = False
         try:
             if input.files:
                 assert mention_input is not None
@@ -600,6 +629,9 @@ class CodexSDKRuntime:
                     key=lambda entry: entry[0],
                 )
             )
+            if leases.descriptors:
+                self._pending_file_input_leases.add(leases)
+            provider_start_attempted = True
             handle = await handle_thread.turn(
                 wire_input,
                 approval_mode=_approval(config.approval_mode),
@@ -612,21 +644,59 @@ class CodexSDKRuntime:
                 service_tier=config.service_tier,
                 summary=_summary(config.reasoning_summary),
             )
-        except CodexError as exc:
+        except BaseException as exc:
+            if input.files and provider_start_attempted:
+                close_error = await self._retire_after_uncertain_file_start()
+                if close_error is not None:
+                    exc.add_note(
+                        "Codex app-server close failed during uncertain file Turn cleanup; "
+                        "synchronous force-termination was attempted before lease release"
+                    )
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                raise _uncertain_file_turn_start(
+                    exc,
+                    generation=self.generation,
+                    thread_id=thread.thread_id,
+                    turn_id=local_turn_id,
+                ) from exc
+            self._pending_file_input_leases.discard(leases)
             leases.close()
-            raise _adapter_error(
-                exc,
-                operation="turn.start",
+            if isinstance(exc, CodexError):
+                raise _adapter_error(
+                    exc,
+                    operation="turn.start",
+                    generation=self.generation,
+                    thread_id=thread.thread_id,
+                    turn_id=local_turn_id,
+                ) from exc
+            raise
+        if input.files and self._closed:
+            self._pending_file_input_leases.discard(leases)
+            leases.close()
+            closed_error = RuntimeError(
+                "Codex runtime closed while starting a file Turn"
+            )
+            raise _uncertain_file_turn_start(
+                closed_error,
                 generation=self.generation,
                 thread_id=thread.thread_id,
                 turn_id=local_turn_id,
-            ) from exc
-        except BaseException:
-            leases.close()
-            raise
+            ) from closed_error
         if handle.id in self._file_input_leases:
-            leases.close()
+            if input.files:
+                duplicate_error = InvariantError(
+                    "Codex Turn handle already owns a file input lease"
+                )
+                await self._retire_after_uncertain_file_start()
+                raise _uncertain_file_turn_start(
+                    duplicate_error,
+                    generation=self.generation,
+                    thread_id=thread.thread_id,
+                    turn_id=local_turn_id,
+                ) from duplicate_error
             raise InvariantError("Codex Turn handle already owns a file input lease")
+        self._pending_file_input_leases.discard(leases)
         if leases.descriptors:
             self._file_input_leases[handle.id] = leases
         self._turn_handles[handle.id] = handle
@@ -815,16 +885,50 @@ class CodexSDKRuntime:
         async with self._close_lock:
             if self._closed:
                 return
+            process = _app_server_process(self._client)
+            termination_confirmed = False
+            self._file_lease_release_blocked = True
             try:
                 await self._client.close()
+                termination_confirmed = True
+            except BaseException:
+                termination_confirmed = _force_terminate_app_server(
+                    self._client,
+                    process=process,
+                )
+                raise
             finally:
-                leases = tuple(self._file_input_leases.values())
-                self._file_input_leases.clear()
-                for lease in leases:
-                    lease.close()
+                if termination_confirmed:
+                    self._release_all_file_input_leases()
             self._closed = True
             self._turn_handles.clear()
             self._threads.clear()
+
+    async def _retire_after_uncertain_file_start(self) -> BaseException | None:
+        async with self._close_lock:
+            if self._closed:
+                self._release_all_file_input_leases()
+                return None
+            process = _app_server_process(self._client)
+            close_error: BaseException | None = None
+            termination_confirmed = False
+            self._file_lease_release_blocked = True
+            try:
+                async with asyncio.timeout(_FILE_INPUT_RUNTIME_RETIRE_TIMEOUT_SECONDS):
+                    await self._client.close()
+                termination_confirmed = True
+            except BaseException as exc:
+                close_error = exc
+                termination_confirmed = _force_terminate_app_server(
+                    self._client,
+                    process=process,
+                )
+            if termination_confirmed:
+                self._release_all_file_input_leases()
+                self._closed = True
+                self._turn_handles.clear()
+                self._threads.clear()
+            return close_error
 
     async def _identity(
         self,
@@ -887,9 +991,22 @@ class CodexSDKRuntime:
             raise NotFoundError("active Codex Turn handle not found") from exc
 
     def _release_file_input_lease(self, provider_turn_id: str) -> None:
+        if self._file_lease_release_blocked:
+            return
         lease = self._file_input_leases.pop(provider_turn_id, None)
         if lease is not None:
             lease.close()
+
+    def _release_all_file_input_leases(self) -> None:
+        leases = (
+            *self._file_input_leases.values(),
+            *self._pending_file_input_leases,
+        )
+        self._file_input_leases.clear()
+        self._pending_file_input_leases.clear()
+        for lease in leases:
+            lease.close()
+        self._file_lease_release_blocked = False
 
     def _ensure_open(self) -> None:
         if self._closed:
@@ -2368,6 +2485,30 @@ def _provider_outcome_unknown(
             retryable=False,
             runtime_generation=generation,
             thread_id=thread_id,
+            cause_chain_hash=hashlib.sha256(chain.encode()).hexdigest(),
+        )
+    )
+
+
+def _uncertain_file_turn_start(
+    exc: BaseException,
+    *,
+    generation: int,
+    thread_id: str,
+    turn_id: str,
+) -> RuntimeUnavailable:
+    chain = f"turn.start:{type(exc).__name__}:{exc}"
+    return RuntimeUnavailable(
+        AdapterFailure(
+            code="provider_effect_outcome_unknown",
+            provider_exception=type(exc).__name__,
+            message=(
+                "Codex file Turn start outcome is unknown; the runtime was retired"
+            ),
+            retryable=False,
+            runtime_generation=generation,
+            thread_id=thread_id,
+            turn_id=turn_id,
             cause_chain_hash=hashlib.sha256(chain.encode()).hexdigest(),
         )
     )

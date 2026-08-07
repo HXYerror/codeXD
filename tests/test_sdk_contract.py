@@ -372,6 +372,130 @@ async def test_runtime_releases_file_lease_on_start_failure_and_close(
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "posix", reason="secure file leasing requires POSIX")
+@pytest.mark.parametrize("cancelled", (False, True))
+async def test_uncertain_file_start_force_terminates_before_descriptor_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cancelled: bool,
+) -> None:
+    file = _turn_file(tmp_path / "leased.bin", ordinal=0, display_name="leased.txt")
+    acquired: list[int] = []
+    events: list[str] = []
+    original_acquire = codex_sdk._acquire_file_input_lease
+    original_close = codex_sdk.os.close
+
+    def record_acquire(value: TurnFile) -> int:
+        descriptor = original_acquire(value)
+        acquired.append(descriptor)
+        return descriptor
+
+    def record_close(descriptor: int) -> None:
+        if acquired and descriptor == acquired[0]:
+            events.append("fd-close")
+        original_close(descriptor)
+
+    def kill() -> None:
+        assert acquired
+        os.fstat(acquired[0])
+        events.append("kill")
+
+    class FailingThread:
+        async def turn(self, *_args: object, **_kwargs: object) -> object:
+            if cancelled:
+                raise asyncio.CancelledError
+            raise CodexError("start failed")
+
+    process = SimpleNamespace(kill=kill)
+    sync_client = SimpleNamespace(_proc=process)
+
+    async def close() -> None:
+        events.append("client-close")
+        # Match the SDK: it drops this reference before process shutdown.
+        sync_client._proc = None
+        raise OSError("close failed")
+
+    monkeypatch.setattr(codex_sdk, "_acquire_file_input_lease", record_acquire)
+    monkeypatch.setattr(codex_sdk.os, "close", record_close)
+    runtime = _runtime_for_input_capture(tmp_path, cast(Any, FailingThread()))
+    runtime._client = cast(
+        Any,
+        SimpleNamespace(
+            close=close,
+            _client=SimpleNamespace(_sync=sync_client),
+        ),
+    )
+
+    expected = asyncio.CancelledError if cancelled else RuntimeUnavailable
+    with pytest.raises(expected):
+        await runtime.start_turn(
+            local_turn_id="failed",
+            thread=ThreadIdentity("thread", None, "session", None, None, "test"),
+            input=TurnInput(files=(file,)),
+            config=_turn_config(tmp_path),
+        )
+
+    assert events == ["client-close", "kill", "fd-close"]
+    assert runtime._closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "posix", reason="secure file leasing requires POSIX")
+@pytest.mark.parametrize("cancelled", (False, True))
+async def test_runtime_close_force_terminates_before_descriptor_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cancelled: bool,
+) -> None:
+    runtime = _runtime_for_input_capture(tmp_path, _InputCaptureThread())
+    file = _turn_file(tmp_path / "leased.bin", ordinal=0, display_name="leased.txt")
+    await runtime.start_turn(
+        local_turn_id="closing",
+        thread=ThreadIdentity("thread", None, "session", None, None, "test"),
+        input=TurnInput(files=(file,)),
+        config=_turn_config(tmp_path),
+    )
+    descriptor = runtime._file_input_leases["turn"].descriptors[0]
+    events: list[str] = []
+    original_close = codex_sdk.os.close
+
+    def record_close(value: int) -> None:
+        if value == descriptor:
+            events.append("fd-close")
+        original_close(value)
+
+    def kill() -> None:
+        os.fstat(descriptor)
+        events.append("kill")
+
+    process = SimpleNamespace(kill=kill)
+    sync_client = SimpleNamespace(_proc=process)
+
+    async def close() -> None:
+        events.append("client-close")
+        sync_client._proc = None
+        if cancelled:
+            raise asyncio.CancelledError
+        raise OSError("close failed")
+
+    runtime._client = cast(
+        Any,
+        SimpleNamespace(
+            close=close,
+            _client=SimpleNamespace(_sync=sync_client),
+        ),
+    )
+    monkeypatch.setattr(codex_sdk.os, "close", record_close)
+
+    expected = asyncio.CancelledError if cancelled else OSError
+    with pytest.raises(expected):
+        await runtime.close()
+
+    assert events == ["client-close", "kill", "fd-close"]
+    assert runtime._file_input_leases == {}
+
+
+@pytest.mark.asyncio
 async def test_runtime_rejects_files_before_provider_when_mention_capability_is_missing(
     tmp_path: Path,
 ) -> None:

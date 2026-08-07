@@ -18,6 +18,17 @@ def private_file_security_supported() -> bool:
     return _platform_name() != "nt"
 
 
+def legacy_image_ingestion_supported() -> bool:
+    """Return whether the pre-existing bounded Windows image path is available.
+
+    This is deliberately not an owner-only storage capability.  It exists only
+    so Discord raster images keep their legacy Windows behavior; opaque file
+    storage must continue to use :func:`private_file_security_supported`.
+    """
+
+    return _platform_name() == "nt"
+
+
 def ensure_private_directory(path: Path) -> None:
     _require_supported()
     path.mkdir(mode=0o700, parents=True, exist_ok=True)

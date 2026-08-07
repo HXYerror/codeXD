@@ -2057,8 +2057,10 @@ Windows：
 ```
 
 当前版本尚未提供经验证的 owner-only DACL 与 no-reparse/no-write-delete-sharing
-handle 组合，因此 Windows attachment ingestion 与 ordinary-file capability 均以
-`file_input_unsupported` fail closed；不得把普通 NTFS mode 检查冒充上述保证。
+handle 组合，因此 Windows ordinary-file capability 以 `file_input_unsupported`
+fail closed；不得把普通 NTFS mode 检查冒充上述保证。既有图片入口仍可在独立的
+legacy 路径中执行有界下载、内容分类与 normalized PNG commit，但该路径绝不 commit
+opaque `TurnFile`，也不宣称提供 ordinary-file 的 owner-only contract。
 
 数据目录与 project root 分离。任何 Discord attachment 都不能直接写入项目根。
 数据库中的 attachment path 始终相对 data dir；CDN URL、文件内容和公开绝对本地
@@ -4185,6 +4187,11 @@ capability/catalog await 完成后、构造 SDK `MentionInput` 前执行最后�
 POSIX 上持有 shared descriptor lock 到 Turn terminal/stream finally/runtime close；
 retention 删除前使用 non-blocking exclusive lock。Windows 在等价 handle contract
 实现并验证前不报告 `mention.input=true`。
+
+该边界明确把 same-service-UID 进程视为 trusted：descriptor lease 防御其他
+principal、retention cleanup 与遵守 lease 协议的协作 mutation；它不声称能防御已经
+控制 full-access service account 的进程。后者可直接控制 daemon、文件与 app-server，
+不属于 ordinary-file lease 的安全保证。
 
 文件 retention 与图片同为 7 天。terminal deadline 到期后删除；任何
 queued/starting/running/cancelling Turn 引用期间均保留。orphan sweep 同时覆盖
