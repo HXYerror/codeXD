@@ -38,6 +38,7 @@ from codexd.storage.records import (
 )
 from codexd.transport.discord.attachments import (
     AttachmentError,
+    DiscordAttachmentIngestResult,
     DiscordImageIngestor,
 )
 from codexd.transport.discord.bot import (
@@ -1534,8 +1535,8 @@ async def test_mention_creates_conversation_and_exactly_one_durable_turn(
     message.thread = None
     message.create_thread = AsyncMock(return_value=thread)
     parent.fetch_message = AsyncMock(return_value=message)
-    bot._image_ingestor = Mock(
-        ingest=AsyncMock(return_value=()),
+    bot._attachment_ingestor = Mock(
+        ingest=AsyncMock(return_value=DiscordAttachmentIngestResult()),
         cleanup=Mock(),
     )
 
@@ -1603,8 +1604,8 @@ async def test_conversation_thread_message_needs_no_mention_and_is_idempotent(
         return_value=storage_context.conversation
     )
     bot.turns.enqueue = AsyncMock(return_value=Mock(id="turn"))
-    bot._image_ingestor = Mock(
-        ingest=AsyncMock(return_value=()),
+    bot._attachment_ingestor = Mock(
+        ingest=AsyncMock(return_value=DiscordAttachmentIngestResult()),
         cleanup=Mock(),
     )
     channel = Mock(spec=discord.Thread)

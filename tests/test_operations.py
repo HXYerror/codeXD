@@ -122,6 +122,7 @@ def test_diagnostics_bundle_is_redacted_by_default(
     with zipfile.ZipFile(bundle) as archive:
         names = set(archive.namelist())
         content = b"\n".join(archive.read(name) for name in names)
+        redacted_config = archive.read("config.redacted.toml")
     assert "content.json" not in names
     assert {
         "manifest.json",
@@ -141,6 +142,9 @@ def test_diagnostics_bundle_is_redacted_by_default(
     assert b"command-secret" not in content
     assert b"query-secret" not in content
     assert b"/Users/alice" not in content
+    assert b"max_attachment_count = 10" in redacted_config
+    assert b"file_max_bytes = 26214400" in redacted_config
+    assert b"message_max_bytes = 52428800" in redacted_config
 
 
 def test_doctor_fails_when_discord_startup_prerequisites_are_missing(
@@ -164,6 +168,7 @@ def test_doctor_fails_when_discord_startup_prerequisites_are_missing(
     output = capsys.readouterr().out
     assert '"discord_config"' in output
     assert '"discord_secret"' in output
+    assert '"attachment_limits"' in output
     assert '"state": "missing"' in output
 
 

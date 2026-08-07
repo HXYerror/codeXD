@@ -2,22 +2,28 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
+import importlib
 import importlib.metadata
 import inspect
 import logging
+import os
 import re
+import stat
 import tomllib
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
+import openai_codex
 from openai_codex import (
     ApprovalMode,
     AsyncCodex,
     CodexConfig,
     CodexError,
+    InputItem,
     InternalRpcError,
     InvalidParamsError,
     InvalidRequestError,
@@ -69,8 +75,8 @@ from codexd.domain.models import (
     ModelDescriptor,
     ServiceTierDescriptor,
 )
-from codexd.domain.turns import TurnIdentity, TurnInput
-from codexd.errors import InvariantError, NotFoundError
+from codexd.domain.turns import TurnFile, TurnIdentity, TurnInput
+from codexd.errors import AttachmentIntegrityError, InvariantError, NotFoundError
 from codexd.runtime.errors import (
     AdapterError,
     AdapterFailure,
@@ -81,6 +87,7 @@ from codexd.runtime.errors import (
     ProviderRejected,
     RuntimeUnavailable,
     UnsupportedCapability,
+    file_input_unsupported,
 )
 from codexd.runtime.port import (
     CompactStartResult,
@@ -88,6 +95,7 @@ from codexd.runtime.port import (
     StartedTurn,
     TurnStream,
 )
+from codexd.security import private_files
 from codexd.security.redaction import redact_diff, redact_text, redact_value
 
 SDK_DECLARED_RANGE = ">=0.144.4,<0.145"
@@ -95,10 +103,17 @@ _MAX_DELTA = 16 * 1024
 _THREAD_COMPACT_START_TIMEOUT_SECONDS = 30.0
 _SUBAGENT_DETAIL_TIMEOUT_SECONDS = 2.0
 _CANCELLED_STARTUP_CLEANUP_TIMEOUT_SECONDS = 30.0
+_FILE_INPUT_RUNTIME_RETIRE_TIMEOUT_SECONDS = 30.0
+_APP_SERVER_FORCE_WAIT_TIMEOUT_SECONDS = 2.0
 _NEW_THREAD_PERSISTENCE_NAME = "codexD session"
 _ARCHIVE_DIRECT_HANDLE_CONTRACT_VERIFIED = False
 _MIN_SDK_VERSION = (0, 144, 4)
 _MAX_SDK_VERSION = (0, 145, 0)
+_MENTION_INPUT_VERIFIED_SDK_VERSIONS = frozenset({"0.144.4"})
+try:
+    _FCNTL: Any | None = importlib.import_module("fcntl")
+except ImportError:
+    _FCNTL = None
 logger = logging.getLogger(__name__)
 _PENDING_STARTUP_CLEANUPS: set[asyncio.Task[None]] = set()
 _COMPAT_UNKNOWN_NOTIFICATION_METHODS = frozenset(
@@ -122,6 +137,28 @@ _COMPAT_UNKNOWN_NOTIFICATION_METHODS = frozenset(
 )
 
 
+class _FileInputLeaseError(OSError):
+    pass
+
+
+class _FileInputLeases:
+    def __init__(self, descriptors: tuple[int, ...] = ()) -> None:
+        self._descriptors = descriptors
+
+    @property
+    def descriptors(self) -> tuple[int, ...]:
+        return self._descriptors
+
+    def close(self) -> None:
+        descriptors, self._descriptors = self._descriptors, ()
+        for descriptor in descriptors:
+            if _FCNTL is not None:
+                with suppress(OSError):
+                    _FCNTL.flock(descriptor, _FCNTL.LOCK_UN)
+            with suppress(OSError):
+                os.close(descriptor)
+
+
 def _schedule_cancelled_startup_cleanup(
     client: AsyncCodex,
     enter_task: asyncio.Task[Any],
@@ -143,22 +180,23 @@ async def _finish_cancelled_startup(
     client: AsyncCodex,
     enter_task: asyncio.Task[Any],
 ) -> None:
+    process = _app_server_process(client)
     try:
         async with asyncio.timeout(_CANCELLED_STARTUP_CLEANUP_TIMEOUT_SECONDS):
             await client.close()
             await asyncio.shield(enter_task)
             await client.close()
     except asyncio.CancelledError:
-        _force_terminate_cancelled_startup_process(client)
+        _force_terminate_cancelled_startup_process(client, process=process)
         await _cancel_startup_entry(enter_task)
         raise
     except TimeoutError:
         logger.error("Cancelled Codex runtime startup cleanup exceeded its deadline")
-        _force_terminate_cancelled_startup_process(client)
+        _force_terminate_cancelled_startup_process(client, process=process)
         await _cancel_startup_entry(enter_task)
     except Exception:
         logger.exception("Cancelled Codex runtime startup cleanup failed")
-        _force_terminate_cancelled_startup_process(client)
+        _force_terminate_cancelled_startup_process(client, process=process)
         await _cancel_startup_entry(enter_task)
 
 
@@ -172,18 +210,69 @@ async def _cancel_startup_entry(enter_task: asyncio.Task[Any]) -> None:
         logger.exception("Cancelled Codex runtime startup task failed during cleanup")
 
 
-def _force_terminate_cancelled_startup_process(client: AsyncCodex) -> None:
+def _app_server_process(client: AsyncCodex) -> Any | None:
     async_client = getattr(client, "_client", None)
     sync_client = getattr(async_client, "_sync", None)
-    process = getattr(sync_client, "_proc", None)
+    return getattr(sync_client, "_proc", None)
+
+
+def _force_terminate_app_server(
+    client: AsyncCodex,
+    *,
+    process: Any | None = None,
+) -> bool:
+    """Synchronously stop the SDK process captured before ``client.close``.
+
+    The SDK clears its private process field at the beginning of close, so a
+    close failure can otherwise make the still-running process unreachable.
+    """
+
+    process = process if process is not None else _app_server_process(client)
     if process is None:
-        return
+        return True
     try:
         process.kill()
     except ProcessLookupError:
-        pass
-    except OSError:
-        logger.exception("Could not force-terminate cancelled Codex startup process")
+        return True
+    except Exception:
+        logger.exception("Could not force-terminate Codex app-server process")
+        return False
+    if _confirm_app_server_exit(process):
+        return True
+    logger.error("Could not confirm Codex app-server process termination")
+    return False
+
+
+def _confirm_app_server_exit(process: Any | None) -> bool:
+    if process is None:
+        return True
+    poll = getattr(process, "poll", None)
+    if callable(poll):
+        try:
+            if poll() is not None:
+                return True
+        except ProcessLookupError:
+            return True
+        except Exception:
+            return False
+    wait = getattr(process, "wait", None)
+    if not callable(wait):
+        return False
+    try:
+        wait(timeout=_APP_SERVER_FORCE_WAIT_TIMEOUT_SECONDS)
+    except ProcessLookupError:
+        return True
+    except Exception:
+        return False
+    return True
+
+
+def _force_terminate_cancelled_startup_process(
+    client: AsyncCodex,
+    *,
+    process: Any | None = None,
+) -> None:
+    _force_terminate_app_server(client, process=process)
 
 
 _UNKNOWN_OUTCOME_MUTATIONS = frozenset(
@@ -216,6 +305,10 @@ class CodexSDKRuntime:
         self._manifest = manifest
         self._threads: dict[str, AsyncThread] = {}
         self._turn_handles: dict[str, AsyncTurnHandle] = {}
+        self._file_input_leases: dict[str, _FileInputLeases] = {}
+        self._pending_file_input_leases: set[_FileInputLeases] = set()
+        self._file_lease_release_blocked = False
+        self._file_lease_process: Any | None = None
         self._subagent_details: dict[str, dict[str, str]] = {}
         self._closed = False
         self._close_lock = asyncio.Lock()
@@ -523,16 +616,52 @@ class CodexSDKRuntime:
         input: TurnInput,
         config: TurnConfig,
     ) -> StartedTurn:
+        mention_input = _resolve_mention_input_constructor(self._manifest.sdk_version)
+        if input.files and (
+            self._manifest.optional.get("mention.input") is not True
+            or mention_input is None
+            or not _file_input_leasing_supported()
+        ):
+            raise file_input_unsupported(
+                generation=self.generation,
+                thread_id=thread.thread_id,
+                turn_id=local_turn_id,
+            )
         handle_thread = self._thread(thread.thread_id)
-        wire_input: list[Any] = []
+        wire_input: list[InputItem] = []
         if input.text:
             wire_input.append(TextInput(input.text))
         wire_input.extend(
             SkillInput(skill.name, str(skill.canonical_path))
             for skill in input.skill_inputs
         )
-        wire_input.extend(LocalImageInput(str(image.canonical_path)) for image in input.images)
+        attachment_input: list[tuple[int, InputItem]] = [
+            (image.ordinal, LocalImageInput(str(image.canonical_path)))
+            for image in input.images
+        ]
+        leases = _acquire_file_input_leases(input.files)
+        provider_start_attempted = False
         try:
+            if input.files:
+                assert mention_input is not None
+                attachment_input.extend(
+                    (
+                        file.ordinal,
+                        mention_input(file.display_name, str(file.canonical_path)),
+                    )
+                    for file in input.files
+                )
+            wire_input.extend(
+                item
+                for _ordinal, item in sorted(
+                    attachment_input,
+                    key=lambda entry: entry[0],
+                )
+            )
+            if leases.descriptors:
+                self._pending_file_input_leases.add(leases)
+                self._remember_app_server_process()
+            provider_start_attempted = True
             handle = await handle_thread.turn(
                 wire_input,
                 approval_mode=_approval(config.approval_mode),
@@ -545,14 +674,61 @@ class CodexSDKRuntime:
                 service_tier=config.service_tier,
                 summary=_summary(config.reasoning_summary),
             )
-        except CodexError as exc:
-            raise _adapter_error(
-                exc,
-                operation="turn.start",
+        except BaseException as exc:
+            if input.files and provider_start_attempted:
+                close_error = await self._retire_after_uncertain_file_start()
+                if close_error is not None:
+                    exc.add_note(
+                        "Codex app-server close failed during uncertain file Turn cleanup; "
+                        "synchronous force-termination was attempted before lease release"
+                    )
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                raise _uncertain_file_turn_start(
+                    exc,
+                    generation=self.generation,
+                    thread_id=thread.thread_id,
+                    turn_id=local_turn_id,
+                ) from exc
+            self._pending_file_input_leases.discard(leases)
+            leases.close()
+            if isinstance(exc, CodexError):
+                raise _adapter_error(
+                    exc,
+                    operation="turn.start",
+                    generation=self.generation,
+                    thread_id=thread.thread_id,
+                    turn_id=local_turn_id,
+                ) from exc
+            raise
+        if input.files and self._closed:
+            self._pending_file_input_leases.discard(leases)
+            leases.close()
+            closed_error = RuntimeError(
+                "Codex runtime closed while starting a file Turn"
+            )
+            raise _uncertain_file_turn_start(
+                closed_error,
                 generation=self.generation,
                 thread_id=thread.thread_id,
                 turn_id=local_turn_id,
-            ) from exc
+            ) from closed_error
+        if handle.id in self._file_input_leases:
+            if input.files:
+                duplicate_error = InvariantError(
+                    "Codex Turn handle already owns a file input lease"
+                )
+                await self._retire_after_uncertain_file_start()
+                raise _uncertain_file_turn_start(
+                    duplicate_error,
+                    generation=self.generation,
+                    thread_id=thread.thread_id,
+                    turn_id=local_turn_id,
+                ) from duplicate_error
+            raise InvariantError("Codex Turn handle already owns a file input lease")
+        self._pending_file_input_leases.discard(leases)
+        if leases.descriptors:
+            self._file_input_leases[handle.id] = leases
         self._turn_handles[handle.id] = handle
         identity = TurnIdentity(local_turn_id, handle.id, self.generation)
 
@@ -580,6 +756,20 @@ class CodexSDKRuntime:
                         )
                         if detail:
                             event = replace(event, payload={**event.payload, **detail})
+                    terminal_event = event.kind in {
+                        "turn.completed",
+                        "turn.failed",
+                        "turn.interrupted",
+                    }
+                    provider_terminal = (
+                        unknown_terminal
+                        or event.kind == "turn.terminal_unparseable"
+                        or terminal_event
+                    )
+                    if provider_terminal:
+                        terminal_seen = True
+                        self._turn_handles.pop(handle.id, None)
+                        self._release_file_input_lease(handle.id)
                     yield event
                     if unknown_terminal or event.kind == "turn.terminal_unparseable":
                         raise _protocol_incompatible(
@@ -587,12 +777,7 @@ class CodexSDKRuntime:
                             thread_id=thread.thread_id,
                             turn_id=handle.id,
                         )
-                    if event.kind in {
-                        "turn.completed",
-                        "turn.failed",
-                        "turn.interrupted",
-                    }:
-                        terminal_seen = True
+                    if terminal_event:
                         break
             except CodexError as exc:
                 raise _adapter_error(
@@ -602,8 +787,6 @@ class CodexSDKRuntime:
                     thread_id=thread.thread_id,
                     turn_id=handle.id,
                 ) from exc
-            finally:
-                self._turn_handles.pop(handle.id, None)
             if not terminal_seen:
                 failure = AdapterFailure(
                     code="stream_ended_unexpectedly",
@@ -733,10 +916,69 @@ class CodexSDKRuntime:
         async with self._close_lock:
             if self._closed:
                 return
-            await self._client.close()
-            self._closed = True
-            self._turn_handles.clear()
-            self._threads.clear()
+            process = self._remember_app_server_process()
+            self._file_lease_release_blocked = True
+            try:
+                await self._client.close()
+            except BaseException:
+                if _force_terminate_app_server(
+                    self._client,
+                    process=process,
+                ):
+                    self._finalize_closed_runtime()
+                raise
+            if not _confirm_app_server_exit(process) and not _force_terminate_app_server(
+                self._client,
+                process=process,
+            ):
+                raise OSError("Codex app-server termination could not be confirmed")
+            self._finalize_closed_runtime()
+
+    async def _retire_after_uncertain_file_start(self) -> BaseException | None:
+        async with self._close_lock:
+            if self._closed:
+                self._release_all_file_input_leases()
+                return None
+            process = self._remember_app_server_process()
+            close_error: BaseException | None = None
+            termination_confirmed = False
+            self._file_lease_release_blocked = True
+            try:
+                async with asyncio.timeout(_FILE_INPUT_RUNTIME_RETIRE_TIMEOUT_SECONDS):
+                    await self._client.close()
+                termination_confirmed = True
+            except BaseException as exc:
+                close_error = exc
+                termination_confirmed = _force_terminate_app_server(
+                    self._client,
+                    process=process,
+                )
+            else:
+                termination_confirmed = _confirm_app_server_exit(process)
+                if not termination_confirmed:
+                    termination_confirmed = _force_terminate_app_server(
+                        self._client,
+                        process=process,
+                    )
+                if not termination_confirmed:
+                    close_error = OSError(
+                        "Codex app-server termination could not be confirmed"
+                    )
+            if termination_confirmed:
+                self._finalize_closed_runtime()
+            return close_error
+
+    def _remember_app_server_process(self) -> Any | None:
+        if self._file_lease_process is None:
+            self._file_lease_process = _app_server_process(self._client)
+        return self._file_lease_process
+
+    def _finalize_closed_runtime(self) -> None:
+        self._release_all_file_input_leases()
+        self._file_lease_process = None
+        self._closed = True
+        self._turn_handles.clear()
+        self._threads.clear()
 
     async def _identity(
         self,
@@ -798,9 +1040,31 @@ class CodexSDKRuntime:
         except KeyError as exc:
             raise NotFoundError("active Codex Turn handle not found") from exc
 
+    def _release_file_input_lease(self, provider_turn_id: str) -> None:
+        if self._file_lease_release_blocked:
+            return
+        lease = self._file_input_leases.pop(provider_turn_id, None)
+        if lease is not None:
+            lease.close()
+        if not self._file_input_leases and not self._pending_file_input_leases:
+            self._file_lease_process = None
+
+    def _release_all_file_input_leases(self) -> None:
+        leases = (
+            *self._file_input_leases.values(),
+            *self._pending_file_input_leases,
+        )
+        self._file_input_leases.clear()
+        self._pending_file_input_leases.clear()
+        for lease in leases:
+            lease.close()
+        self._file_lease_release_blocked = False
+
     def _ensure_open(self) -> None:
         if self._closed:
             raise InvariantError("Codex runtime is closed")
+        if self._file_lease_release_blocked:
+            raise InvariantError("Codex runtime termination is unconfirmed")
 
 
 def _sdk_config(slot: RuntimeSlotConfig, *, generation: int) -> CodexConfig:
@@ -1005,6 +1269,172 @@ def _callable_accepts(
     return callable(candidate) and parameters <= set(inspect.signature(candidate).parameters)
 
 
+def _resolve_mention_input_constructor(
+    sdk_version: str,
+) -> Callable[[str, str], InputItem] | None:
+    if sdk_version not in _MENTION_INPUT_VERIFIED_SDK_VERSIONS:
+        return None
+    try:
+        candidate = getattr(openai_codex, "MentionInput", None)
+    except Exception:
+        return None
+    if not callable(candidate):
+        return None
+    try:
+        parameters = tuple(inspect.signature(candidate).parameters.values())
+        probe = candidate("contract-name", "contract-path")
+    except Exception:
+        return None
+    if not (
+        tuple(parameter.name for parameter in parameters) == ("name", "path")
+        and all(
+            parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+            and parameter.default is inspect.Parameter.empty
+            for parameter in parameters
+        )
+        and getattr(probe, "name", None) == "contract-name"
+        and getattr(probe, "path", None) == "contract-path"
+    ):
+        return None
+    return cast(Callable[[str, str], InputItem], candidate)
+
+
+def _mention_input_contract_supported(sdk_version: str) -> bool:
+    return _resolve_mention_input_constructor(sdk_version) is not None
+
+
+def _file_input_supported(sdk_version: str) -> bool:
+    return _mention_input_contract_supported(sdk_version) and _file_input_leasing_supported()
+
+
+def _file_input_leasing_supported() -> bool:
+    return bool(
+        private_files.private_file_security_supported()
+        and os.name == "posix"
+        and _FCNTL is not None
+        and getattr(os, "O_NOFOLLOW", 0)
+        and getattr(os, "O_DIRECTORY", 0)
+        and os.open in os.supports_dir_fd
+    )
+
+
+def _acquire_file_input_leases(files: tuple[TurnFile, ...]) -> _FileInputLeases:
+    if not files:
+        return _FileInputLeases()
+    descriptors: list[int] = []
+    current: TurnFile | None = None
+    try:
+        for current in files:
+            descriptors.append(_acquire_file_input_lease(current))
+    except _FileInputLeaseError:
+        _FileInputLeases(tuple(descriptors)).close()
+        attachment_id = current.attachment_id if current is not None else "unknown"
+        raise AttachmentIntegrityError(
+            "ordinary file attachment failed final integrity validation: "
+            f"{attachment_id}"
+        ) from None
+    return _FileInputLeases(tuple(descriptors))
+
+
+def _acquire_file_input_lease(file: TurnFile) -> int:
+    if not _file_input_leasing_supported():
+        raise _FileInputLeaseError("secure file leasing is unavailable")
+    path = file.canonical_path
+    descriptor = -1
+    try:
+        _validate_file_lease_path(path)
+        descriptor = _open_file_lease_descriptor(path)
+        assert _FCNTL is not None
+        _FCNTL.flock(descriptor, _FCNTL.LOCK_SH | _FCNTL.LOCK_NB)
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise _FileInputLeaseError("leased target is not a regular file")
+        private_files.validate_private_file_metadata(before)
+        if before.st_size != file.size_bytes:
+            raise _FileInputLeaseError("leased file size changed")
+
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        digest = hashlib.sha256()
+        observed_size = 0
+        while observed_size <= file.size_bytes:
+            chunk = os.read(
+                descriptor,
+                min(1024 * 1024, file.size_bytes + 1 - observed_size),
+            )
+            if not chunk:
+                break
+            observed_size += len(chunk)
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        if (
+            before.st_dev != after.st_dev
+            or before.st_ino != after.st_ino
+            or before.st_size != after.st_size
+            or observed_size != after.st_size
+        ):
+            raise _FileInputLeaseError("leased file changed while hashing")
+        if observed_size != file.size_bytes or not hmac.compare_digest(
+            digest.hexdigest(), file.sha256
+        ):
+            raise _FileInputLeaseError("leased file content changed")
+
+        _validate_file_lease_path(path)
+        named = path.lstat()
+        if (
+            stat.S_ISLNK(named.st_mode)
+            or not stat.S_ISREG(named.st_mode)
+            or named.st_dev != after.st_dev
+            or named.st_ino != after.st_ino
+            or named.st_size != after.st_size
+        ):
+            raise _FileInputLeaseError("leased file no longer matches its named path")
+        private_files.validate_private_file_metadata(named)
+        return descriptor
+    except (OSError, ValueError):
+        if descriptor >= 0:
+            _FileInputLeases((descriptor,)).close()
+        raise _FileInputLeaseError("file lease validation failed") from None
+
+
+def _validate_file_lease_path(path: Path) -> None:
+    if not path.is_absolute() or ".." in path.parts or path.name in {"", ".", ".."}:
+        raise _FileInputLeaseError("file lease path is invalid")
+    if path.parent.name != "input" or path.parent.parent.name != "attachments":
+        raise _FileInputLeaseError("file lease path is outside private attachment storage")
+
+    current = Path(path.anchor)
+    for part in path.parts[1:-1]:
+        current /= part
+        metadata = current.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise _FileInputLeaseError("file lease path contains an unsafe parent")
+
+    for directory in (path.parent.parent.parent, path.parent.parent, path.parent):
+        private_files.validate_private_directory_metadata(directory.lstat())
+
+
+def _open_file_lease_descriptor(path: Path) -> int:
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | nofollow | getattr(os, "O_CLOEXEC", 0)
+    directory_descriptor = os.open(path.anchor, directory_flags)
+    try:
+        for part in path.parts[1:-1]:
+            child = os.open(
+                part,
+                directory_flags,
+                dir_fd=directory_descriptor,
+            )
+            os.close(directory_descriptor)
+            directory_descriptor = child
+        return os.open(
+            path.name,
+            os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=directory_descriptor,
+        )
+    finally:
+        os.close(directory_descriptor)
+
+
 def _verify_public_contract() -> None:
     required_parameters: dict[Any, set[str]] = {
         CodexConfig: {"cwd", "env", "experimental_api"},
@@ -1167,6 +1597,7 @@ def capability_manifest(*, runtime_version: str | None = None) -> CapabilityMani
             "web_search.item": EventCapability.SUPPORTED,
             "web_search.config": True,
             "skill.input": True,
+            "mention.input": _file_input_supported(sdk_version),
             "mcp.item": EventCapability.SUPPORTED_NOT_OBSERVED,
             "dynamic_tool.item": EventCapability.SUPPORTED_NOT_OBSERVED,
             "collab.item": EventCapability.SUPPORTED_NOT_OBSERVED,
@@ -2108,6 +2539,30 @@ def _provider_outcome_unknown(
             retryable=False,
             runtime_generation=generation,
             thread_id=thread_id,
+            cause_chain_hash=hashlib.sha256(chain.encode()).hexdigest(),
+        )
+    )
+
+
+def _uncertain_file_turn_start(
+    exc: BaseException,
+    *,
+    generation: int,
+    thread_id: str,
+    turn_id: str,
+) -> RuntimeUnavailable:
+    chain = f"turn.start:{type(exc).__name__}:{exc}"
+    return RuntimeUnavailable(
+        AdapterFailure(
+            code="provider_effect_outcome_unknown",
+            provider_exception=type(exc).__name__,
+            message=(
+                "Codex file Turn start outcome is unknown; the runtime was retired"
+            ),
+            retryable=False,
+            runtime_generation=generation,
+            thread_id=thread_id,
+            turn_id=turn_id,
             cause_chain_hash=hashlib.sha256(chain.encode()).hexdigest(),
         )
     )
