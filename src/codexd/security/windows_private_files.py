@@ -430,16 +430,39 @@ def _secure_path(path: Path, *, directory: bool) -> None:
         share = _FILE_SHARE_READ
     handle = _open_path(
         path,
-        access=_READ_CONTROL | _WRITE_DAC | _WRITE_OWNER | _FILE_READ_ATTRIBUTES,
+        access=_READ_CONTROL | _WRITE_DAC | _FILE_READ_ATTRIBUTES,
         share=share,
         directory=directory,
     )
     try:
         api = _api()
-        _apply_owner_only_security(api, handle, directory=directory)
+        current = _current_user_sid(api)
+        current_sid = _sid_to_string(api, current.pointer)
+        owner_matches = _security_snapshot(api, handle).owner_sid == current_sid
+        if not owner_matches:
+            _close_handle(handle)
+            handle = -1
+            handle = _open_path(
+                path,
+                access=(
+                    _READ_CONTROL
+                    | _WRITE_DAC
+                    | _WRITE_OWNER
+                    | _FILE_READ_ATTRIBUTES
+                ),
+                share=share,
+                directory=directory,
+            )
+        _apply_owner_only_security(
+            api,
+            handle,
+            directory=directory,
+            set_owner=not owner_matches,
+        )
         _validate_owner_only(handle, directory=directory)
     finally:
-        _close_handle(handle)
+        if handle >= 0:
+            _close_handle(handle)
 
 
 def _open_path(
@@ -526,7 +549,13 @@ def _current_user_sid(api: _API) -> _SIDBuffer:
         api.kernel32.CloseHandle(token)
 
 
-def _apply_owner_only_security(api: _API, handle: int, *, directory: bool) -> None:
+def _apply_owner_only_security(
+    api: _API,
+    handle: int,
+    *,
+    directory: bool,
+    set_owner: bool,
+) -> None:
     current = _current_user_sid(api)
     sid_length = int(api.advapi32.GetLengthSid(ctypes.c_void_p(current.pointer)))
     if sid_length <= 0:
@@ -550,14 +579,19 @@ def _apply_owner_only_security(api: _API, handle: int, *, directory: bool) -> No
         ctypes.c_void_p(current.pointer),
     ):
         raise OSError(_last_error(), "AddAccessAllowedAceEx failed")
+    security_information = (
+        _DACL_SECURITY_INFORMATION | _PROTECTED_DACL_SECURITY_INFORMATION
+    )
+    owner = None
+    if set_owner:
+        security_information |= _OWNER_SECURITY_INFORMATION
+        owner = ctypes.c_void_p(current.pointer)
     result = int(
         api.advapi32.SetSecurityInfo(
             wintypes.HANDLE(handle),
             _SE_FILE_OBJECT,
-            _OWNER_SECURITY_INFORMATION
-            | _DACL_SECURITY_INFORMATION
-            | _PROTECTED_DACL_SECURITY_INFORMATION,
-            ctypes.c_void_p(current.pointer),
+            security_information,
+            owner,
             None,
             acl,
             None,
