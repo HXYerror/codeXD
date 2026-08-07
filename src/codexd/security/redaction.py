@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import re
 import shlex
 from pathlib import Path, PureWindowsPath
@@ -14,6 +16,14 @@ _SECRET_NAME = re.compile(
 _AUTH_HEADER = re.compile(
     r"(?i)\b(?P<header>authorization|proxy-authorization)\s*:\s*"
     r"(?P<scheme>[A-Za-z][A-Za-z0-9_-]*)\s+(?P<value>\S+)"
+)
+_STANDALONE_BEARER = re.compile(
+    r"\b(?P<scheme>(?i:bearer))\s+"
+    r"(?P<value>[A-Za-z0-9._~+/=-]+)"
+)
+_STANDALONE_BASIC = re.compile(
+    r"\b(?P<scheme>(?i:basic))\s+"
+    r"(?P<value>[A-Za-z0-9+/]{4,}={0,2})(?![A-Za-z0-9+/=])"
 )
 _SECRET_ASSIGNMENT = re.compile(
     r"(?i)(?P<prefix>[\"']?"
@@ -59,6 +69,14 @@ def redact_text(value: str, *, project_root: Path | None = None) -> str:
         lambda match: (
             f"{match.group('header')}: {match.group('scheme')} <redacted>"
         ),
+        redacted,
+    )
+    redacted = _STANDALONE_BEARER.sub(
+        lambda match: f"{match.group('scheme')} <redacted>",
+        redacted,
+    )
+    redacted = _STANDALONE_BASIC.sub(
+        _redact_basic_auth,
         redacted,
     )
     redacted = _SECRET_FLAG.sub(_redact_named_value, redacted)
@@ -129,6 +147,27 @@ def _redact_named_value(match: re.Match[str]) -> str:
     return f"{match.group('prefix')}{replacement}"
 
 
+def _redact_basic_auth(match: re.Match[str]) -> str:
+    scheme = match.group("scheme")
+    value = match.group("value")
+    if not _is_basic_credential(value):
+        return match.group(0)
+    return f"{scheme} <redacted>"
+
+
+def _is_basic_credential(value: str) -> bool:
+    if re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", value) is None:
+        return False
+    try:
+        decoded = base64.b64decode(
+            value + "=" * (-len(value) % 4),
+            validate=True,
+        )
+    except (binascii.Error, ValueError):
+        return False
+    return b":" in decoded
+
+
 def _redact_url(match: re.Match[str]) -> str:
     raw = match.group(0)
     suffix = ""
@@ -138,6 +177,7 @@ def _redact_url(match: re.Match[str]) -> str:
     try:
         parsed = urlsplit(raw)
         query = parse_qsl(parsed.query, keep_blank_values=True)
+        fragment = parse_qsl(parsed.fragment, keep_blank_values=True)
         port = parsed.port
     except ValueError:
         return "<redacted-url>" + suffix
@@ -161,12 +201,25 @@ def _redact_url(match: re.Match[str]) -> str:
             changed = True
         else:
             safe_query.append((name, value))
+    safe_fragment: list[tuple[str, str]] = []
+    for name, value in fragment:
+        if _SECRET_NAME.search(name) or name.casefold() in {
+            "auth",
+            "code",
+            "key",
+            "sig",
+        }:
+            safe_fragment.append((name, "<redacted>"))
+            changed = True
+        else:
+            safe_fragment.append((name, value))
     if not changed:
         return raw + suffix
     return (
         urlunsplit(
             parsed._replace(
-                query=urlencode(safe_query) if query else parsed.query
+                query=urlencode(safe_query) if query else parsed.query,
+                fragment=urlencode(safe_fragment) if fragment else parsed.fragment,
             )
         )
         + suffix

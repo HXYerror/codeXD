@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import os
+import stat
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+
+from codexd.errors import SecurityError
 
 
 @dataclass(frozen=True)
@@ -48,7 +51,11 @@ class AppPaths:
             self.diagnostics,
             self.backups,
         ):
+            if path.is_symlink():
+                raise SecurityError(f"codexD data path must not be a symlink: {path}")
             path.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if not stat.S_ISDIR(path.lstat().st_mode):
+                raise SecurityError(f"codexD data path is not a directory: {path}")
             if os.name != "nt":
                 path.chmod(0o700)
 

@@ -64,6 +64,8 @@ from codexd.transport.discord.presentation import (
 )
 
 logger = logging.getLogger(__name__)
+_DISCORD_INTERACTION_ACK_DEADLINE_SECONDS = 3.0
+_MODAL_RESPONSE_NETWORK_BUDGET_SECONDS = 1.0
 
 
 @dataclass(frozen=True)
@@ -119,34 +121,7 @@ class _DeferredFollowup:
         self._calls.clear()
 
     def result_message(self, command_name: str) -> str:
-        summaries: list[str] = []
-        for call in self._calls:
-            content = (
-                str(call.args[0])
-                if call.args and isinstance(call.args[0], str)
-                else call.kwargs.get("content")
-            )
-            if isinstance(content, str) and content.strip():
-                summaries.append(content.strip())
-            embed = call.kwargs.get("embed")
-            if isinstance(embed, discord.Embed):
-                heading = " · ".join(
-                    part
-                    for part in (
-                        embed.title,
-                        embed.description,
-                    )
-                    if part
-                )
-                if heading:
-                    summaries.append(heading)
-            file = call.kwargs.get("file")
-            if isinstance(file, discord.File):
-                summaries.append(f"Attached `{file.filename}`.")
-        message = "\n".join(summaries).strip()
-        if not message:
-            message = f"`/{command_name}` completed."
-        return _bounded_result(message)
+        return _bounded_result(f"`/{command_name}` completed.")
 
 
 class _DeferredInteraction:
@@ -209,10 +184,16 @@ class CodexDBot(discord.Client):
         self._image_ingestor: DiscordImageIngestor | None = None
         self._outbox: OutboxWorker | None = None
         self._command_sync_task: asyncio.Task[None] | None = None
+        self._startup_recovery_task: asyncio.Task[None] | None = None
         self._command_sync_stop = asyncio.Event()
         self._command_sync_degraded = False
         self._command_sync_retry_seconds = 5.0
+        self._startup_recovery_retry_seconds = 5.0
         self._ready_preflight_degraded = False
+        self._startup_preflight_complete = False
+        self._runtime_preflight_complete = False
+        self._provider_recovery_complete = False
+        self._startup_preflight_lock = asyncio.Lock()
         self._commands_registered = False
         self._accepting_ingress = True
         self._ingress_lock = asyncio.Lock()
@@ -267,6 +248,11 @@ class CodexDBot(discord.Client):
             with suppress(asyncio.CancelledError):
                 await self._command_sync_task
             self._command_sync_task = None
+        if self._startup_recovery_task is not None:
+            self._startup_recovery_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._startup_recovery_task
+            self._startup_recovery_task = None
         if self._outbox is not None:
             await self._outbox.close()
         await self.schedules.close()
@@ -319,11 +305,25 @@ class CodexDBot(discord.Client):
                 if not self._accepting_ingress:
                     return
                 self._gateway_ready = True
-                await self._ready_preflight()
+                if not self._startup_preflight_complete:
+                    await self._ready_preflight()
+                else:
+                    self._update_discord_ready_status()
         finally:
             self._untrack_ingress(task)
 
-    async def _ready_preflight(self) -> None:
+    async def _ready_preflight(self) -> bool:
+        async with self._startup_preflight_lock:
+            self._runtime_preflight_complete = await self._runtime_ready_preflight()
+            self._provider_recovery_complete = await self._restore_startup_state(
+                retry=False
+            )
+            complete = self._commit_startup_preflight_state()
+            if not complete:
+                self._schedule_startup_recovery()
+            return complete
+
+    async def _runtime_ready_preflight(self) -> bool:
         degraded = False
         auth_states: set[str] = set()
         projects = await asyncio.to_thread(self.repository.list_enabled_projects)
@@ -358,14 +358,68 @@ class CodexDBot(discord.Client):
             else "unknown"
         )
         self._codex_auth_status(self._codex_auth_state)
+        return not degraded
+
+    async def _restore_startup_state(self, *, retry: bool) -> bool:
         try:
             await self.session_lifecycle.restore_provider_barriers()
             await self.turns.restore()
         except Exception:
-            degraded = True
-            logger.exception("Discord ready preflight failed")
-        self._ready_preflight_degraded = degraded
+            logger.exception(
+                "Discord startup recovery retry failed"
+                if retry
+                else "Discord ready preflight failed"
+            )
+            return False
+        return True
+
+    def _commit_startup_preflight_state(self) -> bool:
+        complete = (
+            self._runtime_preflight_complete and self._provider_recovery_complete
+        )
+        self._startup_preflight_complete = complete
+        self._ready_preflight_degraded = not complete
         self._update_discord_ready_status()
+        return complete
+
+    def _schedule_startup_recovery(self) -> None:
+        if (
+            self._command_sync_stop.is_set()
+            or self._startup_recovery_task is not None
+        ):
+            return
+        self._startup_recovery_task = asyncio.create_task(
+            self._retry_startup_recovery(),
+            name="codexd-startup-recovery",
+        )
+
+    async def _retry_startup_recovery(self) -> None:
+        delay = self._startup_recovery_retry_seconds
+        try:
+            while not self._command_sync_stop.is_set():
+                with suppress(TimeoutError):
+                    await asyncio.wait_for(
+                        self._command_sync_stop.wait(),
+                        timeout=delay,
+                    )
+                if self._command_sync_stop.is_set():
+                    return
+                async with self._startup_preflight_lock:
+                    if not self._runtime_preflight_complete:
+                        self._runtime_preflight_complete = (
+                            await self._runtime_ready_preflight()
+                        )
+                    if not self._provider_recovery_complete:
+                        self._provider_recovery_complete = (
+                            await self._restore_startup_state(retry=True)
+                        )
+                    complete = self._commit_startup_preflight_state()
+                if not complete:
+                    delay = min(delay * 2, 300.0)
+                    continue
+                return
+        finally:
+            self._startup_recovery_task = None
 
     async def on_disconnect(self) -> None:
         self._gateway_ready = False
@@ -498,57 +552,65 @@ class CodexDBot(discord.Client):
         self,
         interaction: discord.Interaction[Any],
     ) -> None:
-        if not self._authorized_interaction(interaction):
-            await interaction.response.send_message(
-                embed=notice_embed(
-                    "This table control is restricted to the configured codexD user.",
-                    level="error",
-                    title="Not authorized",
+        task = self._track_ingress()
+        try:
+            if not self._accepting_ingress:
+                await self._respond_shutting_down(interaction)
+                return
+            if not self._authorized_interaction(interaction):
+                await interaction.response.send_message(
+                    embed=notice_embed(
+                        "This table control is restricted to the configured codexD user.",
+                        level="error",
+                        title="Not authorized",
+                    ),
+                    ephemeral=True,
+                )
+                return
+            message = interaction.message
+            if message is None:
+                raise ConflictError("table copy interaction has no source message")
+            source = next(
+                (
+                    attachment
+                    for attachment in message.attachments
+                    if attachment.filename.startswith("table-")
+                    and attachment.filename.endswith(".md")
                 ),
-                ephemeral=True,
+                None,
             )
-            return
-        message = interaction.message
-        if message is None:
-            raise ConflictError("table copy interaction has no source message")
-        source = next(
-            (
-                attachment
-                for attachment in message.attachments
-                if attachment.filename.startswith("table-")
-                and attachment.filename.endswith(".md")
-            ),
-            None,
-        )
-        if source is None:
-            raise ConflictError("table Markdown source is missing")
-        try:
-            content = await source.read()
-            markdown = content.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise InvariantError("table Markdown source is not UTF-8") from exc
-        chunks = split_discord_code(markdown, language="markdown", limit=1800)
-        if len(chunks) == 1:
-            await interaction.response.send_message(
-                chunks[0],
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
+            if source is None:
+                raise ConflictError("table Markdown source is missing")
+            await interaction.response.defer(ephemeral=True)
+            try:
+                content = await source.read()
+                markdown = content.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise InvariantError("table Markdown source is not UTF-8") from exc
+            chunks = split_discord_code(markdown, language="markdown", limit=1800)
+            if len(chunks) == 1:
+                await interaction.followup.send(
+                    chunks[0],
+                    ephemeral=True,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                return
+            file = discord.File(
+                io.BytesIO(content),
+                filename=source.filename,
+                description="Markdown source for the rendered Codex table",
             )
-            return
-        file = discord.File(
-            io.BytesIO(content),
-            filename=source.filename,
-            description="Markdown source for the rendered Codex table",
-        )
-        try:
-            await interaction.response.send_message(
-                "The table source is too large for an ephemeral code block.",
-                file=file,
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
+            try:
+                await interaction.followup.send(
+                    "The table source is too large for an ephemeral code block.",
+                    file=file,
+                    ephemeral=True,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            finally:
+                file.close()
         finally:
-            file.close()
+            self._untrack_ingress(task)
 
     async def _apply_schedule_draft_action(
         self,
@@ -596,6 +658,24 @@ class CodexDBot(discord.Client):
             if isinstance(error, app_commands.CommandInvokeError)
             else error
         )
+        try:
+            intent = await asyncio.to_thread(
+                self.repository.get_command_intent,
+                str(interaction.id),
+            )
+        except CodexDError:
+            intent = None
+        if intent is not None and intent.state == "unknown" and intent.result_json:
+            result = json.loads(intent.result_json)
+            message = _bounded_response(
+                f"`{result.get('code', 'command_effect_outcome_unknown')}`: "
+                f"{result.get('message', 'The command outcome is unknown.')}"
+            )
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+            return
         if isinstance(original, SecurityError):
             interaction_id = str(interaction.id)
             if interaction_id in self._security_responses_sent:
@@ -1000,7 +1080,9 @@ class CodexDBot(discord.Client):
                 return
         except (CodexDError, ValueError) as exc:
             await message.channel.send(
-                f"codexD `{getattr(exc, 'code', 'invalid_input')}`: {exc}",
+                _bounded_response(
+                    f"codexD `{getattr(exc, 'code', 'invalid_input')}`: {exc}"
+                ),
                 allowed_mentions=discord.AllowedMentions.none(),
                 suppress_embeds=True,
             )
@@ -1226,13 +1308,19 @@ class CodexDBot(discord.Client):
         )
 
     async def on_thread_delete(self, thread: discord.Thread) -> None:
+        await self._mark_thread_deleted(thread.id)
+
+    async def on_raw_thread_delete(self, payload: discord.RawThreadDeleteEvent) -> None:
+        await self._mark_thread_deleted(payload.thread_id)
+
+    async def _mark_thread_deleted(self, thread_id: int) -> None:
         task = self._track_ingress()
         try:
             async with self._ingress_lock:
                 if not self._accepting_ingress:
                     return
                 await asyncio.to_thread(
-                    self.repository.mark_conversation_deleted, thread.id
+                    self.repository.mark_conversation_deleted, thread_id
                 )
         finally:
             self._untrack_ingress(task)
@@ -1254,23 +1342,17 @@ class CodexDBot(discord.Client):
             except asyncio.CancelledError:
                 raise
             except CodexDError as exc:
-                await interaction.response.send_message(
-                    embed=notice_embed(
-                        f"`{exc.code}`: {exc}",
-                        level="error",
-                        title="Table source unavailable",
-                    ),
-                    ephemeral=True,
+                await self._send_component_error(
+                    interaction,
+                    message=f"`{exc.code}`: {exc}",
+                    title="Table source unavailable",
                 )
             except Exception:
                 logger.exception("Table copy component failed")
-                await interaction.response.send_message(
-                    embed=notice_embed(
-                        "The table source could not be returned; see diagnostics.",
-                        level="error",
-                        title="Table copy failed",
-                    ),
-                    ephemeral=True,
+                await self._send_component_error(
+                    interaction,
+                    message="The table source could not be returned; see diagnostics.",
+                    title="Table copy failed",
                 )
             return
         if custom_id.startswith("sd:v1:"):
@@ -1321,6 +1403,19 @@ class CodexDBot(discord.Client):
                     "`internal_error`: task-card update failed.",
                     ephemeral=True,
                 )
+
+    @staticmethod
+    async def _send_component_error(
+        interaction: discord.Interaction[Any],
+        *,
+        message: str,
+        title: str,
+    ) -> None:
+        embed = notice_embed(message, level="error", title=title)
+        if interaction.response.is_done():
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        else:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
 
     async def _handle_modal_submit(
         self,
@@ -1660,7 +1755,10 @@ class CodexDBot(discord.Client):
             session.command(name="fork", description="Fork the active Codex Thread")(
                 intent("session fork", self._session_fork)
             )
-        if self._optional_available("thread.archive"):
+        if (
+            self._optional_available("thread.archive")
+            and self._optional_available("thread.unarchive")
+        ):
             session.command(
                 name="archive", description="Archive the active Codex Thread"
             )(intent("session archive", self._session_archive))
@@ -2140,7 +2238,7 @@ class CodexDBot(discord.Client):
         )
         if not incidents:
             lines.append("No unresolved incidents.")
-        await interaction.followup.send("\n".join(lines)[:1900], ephemeral=True)
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
 
     async def _turn_cancel(
         self,
@@ -2284,26 +2382,63 @@ class CodexDBot(discord.Client):
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
+    async def _open_modal(
+        self,
+        interaction: discord.Interaction[Any],
+        prepare: Callable[[], Awaitable[discord.ui.Modal]],
+    ) -> None:
+        task = self._track_ingress()
+        try:
+            if not self._accepting_ingress:
+                await self._respond_shutting_down(interaction)
+                return
+            preparation_budget = _modal_preparation_budget(interaction)
+            try:
+                if preparation_budget <= 0:
+                    raise TimeoutError
+                async with asyncio.timeout(preparation_budget):
+                    modal = await prepare()
+            except TimeoutError:
+                message = (
+                    "`interaction_timeout`: modal preparation took too long; "
+                    "retry the command."
+                )
+                if interaction.response.is_done():
+                    await interaction.followup.send(message, ephemeral=True)
+                else:
+                    await interaction.response.send_message(message, ephemeral=True)
+                return
+            if not self._accepting_ingress:
+                await self._respond_shutting_down(interaction)
+                return
+            await interaction.response.send_modal(modal)
+        finally:
+            self._untrack_ingress(task)
+
     async def _steer(self, interaction: discord.Interaction[Any]) -> None:
-        if not self._authorized_interaction(interaction):
-            await interaction.response.send_message("Not authorized.", ephemeral=True)
-            return
-        conversation = await self._conversation(interaction)
-        active = await asyncio.to_thread(
-            self.repository.active_turn_for_conversation, conversation.id
-        )
-        if active is None:
-            await interaction.response.send_message("There is no active Turn.", ephemeral=True)
-            return
-        modal_id = await self._create_modal_intent(
-            interaction,
-            kind="steer",
-            conversation=conversation,
-            turn_id=active.id,
-        )
-        await interaction.response.send_modal(
-            _SteerModal(custom_id=modal_id)
-        )
+        async def prepare() -> discord.ui.Modal:
+            if not self._authorized_interaction(interaction):
+                raise SecurityError("not authorized to steer this Conversation")
+            conversation = await self._conversation(interaction)
+            active = await asyncio.to_thread(
+                self.repository.active_turn_for_conversation,
+                conversation.id,
+            )
+            if active is None:
+                raise ConflictError("there is no active Turn")
+            if active.state.value == "starting":
+                raise ConflictError("wait until the Turn is running before steering")
+            if active.state.value != "running":
+                raise ConflictError(f"the Turn is {active.state.value} and cannot be steered")
+            modal_id = await self._create_modal_intent(
+                interaction,
+                kind="steer",
+                conversation=conversation,
+                turn_id=active.id,
+            )
+            return _SteerModal(custom_id=modal_id)
+
+        await self._open_modal(interaction, prepare)
 
     async def _model_show(self, interaction: discord.Interaction[Any]) -> None:
         await self._defer_authorized(interaction)
@@ -2730,21 +2865,22 @@ class CodexDBot(discord.Client):
         self,
         interaction: discord.Interaction[Any],
     ) -> None:
-        await self._require_owner(interaction)
-        conversation = await self._conversation(interaction)
-        modal_id = await self._create_modal_intent(
-            interaction,
-            kind="schedule_create",
-            conversation=conversation,
-        )
-        await interaction.response.send_modal(
-            _ScheduleModal(
+        async def prepare() -> discord.ui.Modal:
+            await self._require_owner(interaction)
+            conversation = await self._conversation(interaction)
+            modal_id = await self._create_modal_intent(
+                interaction,
+                kind="schedule_create",
+                conversation=conversation,
+            )
+            return _ScheduleModal(
                 schedule=None,
                 custom_id=modal_id,
                 default_timezone=self.config.schedule.default_timezone,
                 default_misfire_policy=self.config.schedule.default_misfire_policy,
             )
-        )
+
+        await self._open_modal(interaction, prepare)
 
     async def _schedule_list(self, interaction: discord.Interaction[Any]) -> None:
         await self._defer_owner(interaction)
@@ -2753,7 +2889,7 @@ class CodexDBot(discord.Client):
             self.schedule_repository.list_for_conversation, conversation.id
         )
         text = "\n".join(
-            f"`{schedule.id[:8]}` **{schedule.name}** · "
+            f"`{schedule.id[:8]}` **{_safe_embed_text(schedule.name)}** · "
             f"`{schedule.state.value}` · `{schedule.expression}` · "
             f"`{_timezone_with_offset(schedule.timezone, now_ms=schedule.next_due_at)}` · "
             f"next {_discord_time(schedule.next_due_at)} · "
@@ -2785,7 +2921,7 @@ class CodexDBot(discord.Client):
         await interaction.followup.send(
             "\n".join(
                 (
-                    f"Schedule `{schedule.id}` · **{schedule.name}** · "
+                    f"Schedule `{schedule.id}` · **{_safe_embed_text(schedule.name)}** · "
                     f"{schedule.state.value} · v{schedule.version}",
                     f"Kind: `{schedule.kind.value}` · expression: "
                     f"`{schedule.expression}` · timezone: "
@@ -2824,26 +2960,29 @@ class CodexDBot(discord.Client):
         interaction: discord.Interaction[Any],
         schedule_id: str,
     ) -> None:
-        await self._require_owner(interaction)
-        conversation = await self._conversation(interaction)
-        target = await asyncio.to_thread(
-            self.schedule_repository.resolve, conversation.id, schedule_id
-        )
-        modal_id = await self._create_modal_intent(
-            interaction,
-            kind="schedule_update",
-            conversation=conversation,
-            schedule_id=target.id,
-            expected_version=target.version,
-        )
-        await interaction.response.send_modal(
-            _ScheduleModal(
+        async def prepare() -> discord.ui.Modal:
+            await self._require_owner(interaction)
+            conversation = await self._conversation(interaction)
+            target = await asyncio.to_thread(
+                self.schedule_repository.resolve,
+                conversation.id,
+                schedule_id,
+            )
+            modal_id = await self._create_modal_intent(
+                interaction,
+                kind="schedule_update",
+                conversation=conversation,
+                schedule_id=target.id,
+                expected_version=target.version,
+            )
+            return _ScheduleModal(
                 schedule=target,
                 custom_id=modal_id,
                 default_timezone=self.config.schedule.default_timezone,
                 default_misfire_policy=self.config.schedule.default_misfire_policy,
             )
-        )
+
+        await self._open_modal(interaction, prepare)
 
     async def _create_modal_intent(
         self,
@@ -3242,7 +3381,31 @@ def _modal_values(data: object) -> dict[str, str]:
 
 
 def _bounded_response(value: str) -> str:
-    return value if len(value) <= 1900 else value[:1899] + "…"
+    if len(value) <= 1900:
+        return value
+    try:
+        first = split_discord_text(value, limit=1899)[0]
+    except ValueError:
+        first = split_discord_code(value, limit=1899)[0]
+    return first[:1899] + "…"
+
+
+def _modal_preparation_budget(interaction: discord.Interaction[Any]) -> float:
+    created_at = getattr(interaction, "created_at", None)
+    elapsed = 0.0
+    if isinstance(created_at, datetime):
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=UTC)
+        elapsed = max(
+            0.0,
+            (datetime.now(UTC) - created_at.astimezone(UTC)).total_seconds(),
+        )
+    return max(
+        0.0,
+        _DISCORD_INTERACTION_ACK_DEADLINE_SECONDS
+        - elapsed
+        - _MODAL_RESPONSE_NETWORK_BUDGET_SECONDS,
+    )
 
 
 def _bounded_result(value: str) -> str:

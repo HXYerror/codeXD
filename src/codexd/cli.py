@@ -101,17 +101,31 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         scrub_process_environment(prepared)
         config.paths.ensure()
-        return _dispatch(args, config, prepared.discord_token)
+        return _dispatch(
+            args,
+            config,
+            prepared.discord_token,
+            prepared.child_environment,
+        )
     except CodexDError as exc:
         print(f"codexd: {exc.code}: {exc}", file=sys.stderr)
         return 2
 
 
-def _dispatch(args: argparse.Namespace, config: AppConfig, discord_token: str | None) -> int:
+def _dispatch(
+    args: argparse.Namespace,
+    config: AppConfig,
+    discord_token: str | None,
+    bootstrap_environment: dict[str, str],
+) -> int:
     if args.command == "doctor":
         from codexd.service.doctor import run_doctor
 
-        return run_doctor(config)
+        return run_doctor(
+            config,
+            expected_environment=bootstrap_environment,
+            bootstrap_token_available=bool(discord_token),
+        )
     if args.command == "db":
         from codexd.storage.sqlite import SQLiteStore
 
@@ -334,6 +348,7 @@ def _service(
     from dataclasses import asdict
 
     from codexd.security.secrets import SecretStore
+    from codexd.service.locking import InstanceLock
     from codexd.service.manager import (
         install_service,
         restart_service,
@@ -379,8 +394,13 @@ def _service(
             "Discord guild, owner, and allowed user configuration is required "
             "before install"
         )
-    if not SecretStore().discord_token():
+    secrets = SecretStore()
+    if not secrets.discord_token():
         raise ConfigurationError("Discord token is not configured")
+    with InstanceLock(config.paths.data_dir / "durable-keys.lock"):
+        allow_create = not config.paths.database.exists()
+        secrets.projection_key(allow_create=allow_create)
+        secrets.component_key(allow_create=allow_create)
     path = install_service(config, config_path)
     print(f"codexD user service installed at {path}.")
     return 0

@@ -19,6 +19,7 @@ from codexd.domain.turns import InterruptOrigin, TurnImage, TurnInput, TurnSourc
 from codexd.errors import StorageError
 from codexd.paths import AppPaths
 from codexd.service.diagnostics import export_diagnostics
+from codexd.service.doctor import run_doctor
 from codexd.service.manager import ServiceStatus
 from codexd.storage.retention import run_retention
 from codexd.storage.schedules import ScheduleRepository
@@ -140,6 +141,105 @@ def test_diagnostics_bundle_is_redacted_by_default(
     assert b"command-secret" not in content
     assert b"query-secret" not in content
     assert b"/Users/alice" not in content
+
+
+def test_doctor_fails_when_discord_startup_prerequisites_are_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    paths = AppPaths(tmp_path / "data", tmp_path / "logs")
+    paths.ensure()
+    monkeypatch.setattr(
+        "codexd.service.doctor.SecretStore.discord_token",
+        lambda _self: None,
+    )
+
+    result = run_doctor(
+        AppConfig(paths=paths),
+        expected_environment=dict(os.environ),
+    )
+
+    assert result == 1
+    output = capsys.readouterr().out
+    assert '"discord_config"' in output
+    assert '"discord_secret"' in output
+    assert '"state": "missing"' in output
+
+
+def test_diagnostics_included_content_is_still_redacted(
+    storage_context: StorageContext,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = AppPaths(storage_context.store.path.parent, tmp_path / "logs")
+    paths.ensure()
+    config = AppConfig(paths=paths)
+    turn = storage_context.repository.enqueue_turn(
+        conversation_id=storage_context.conversation.id,
+        source=TurnSource.DISCORD,
+        turn_input=TurnInput(text="diagnostic redaction"),
+        input_message_id="diagnostic-redaction",
+    )
+    secret = "sk-diagnostic-secret-value"
+    now = utc_now_ms()
+    with storage_context.store.transaction() as connection:
+        event = connection.execute(
+            """
+            INSERT INTO events(
+                event_id, turn_id, project_id, conversation_id,
+                local_event_index, kind, schema_version, payload_json,
+                occurred_at, recorded_at
+            ) VALUES (?, ?, ?, ?, 1, 'assistant.text.completed', 1, ?, ?, ?)
+            """,
+            (
+                new_id(),
+                turn.id,
+                storage_context.project.id,
+                storage_context.conversation.id,
+                canonical_json(
+                    {
+                        "authorization": f"Bearer {secret}",
+                        "text": f"OPENAI_API_KEY={secret}",
+                    }
+                ),
+                now,
+                now,
+            ),
+        )
+        assert event.lastrowid is not None
+        connection.execute(
+            """
+            INSERT INTO message_projections(
+                id, turn_id, content_revision, content_ast_json,
+                plain_text, is_final, last_event_sequence
+            ) VALUES (?, ?, 1, '[]', ?, 1, ?)
+            """,
+            (
+                new_id(),
+                turn.id,
+                f"Authorization: Bearer {secret}",
+                event.lastrowid,
+            ),
+        )
+    monkeypatch.setattr(
+        "codexd.service.diagnostics.service_status",
+        lambda _config: ServiceStatus(
+            installed=True,
+            heartbeat="fresh",
+            process="running",
+            service_manager="loaded",
+            database_lease="fresh",
+            boot_id="boot",
+        ),
+    )
+
+    bundle = export_diagnostics(config, include_content=True)
+
+    with zipfile.ZipFile(bundle) as archive:
+        payload = archive.read("content.json")
+    assert secret.encode() not in payload
+    assert b"<redacted>" in payload
 
 
 def test_retention_preserves_active_and_removes_terminal_artifacts(

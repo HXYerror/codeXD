@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import tomllib
 from collections.abc import Mapping
@@ -101,6 +102,8 @@ def load_config(
     paths = default_paths(env)
     config_path = path or Path(env.get("CODEXD_CONFIG", paths.data_dir / "config.toml"))
     raw: dict[str, Any] = {}
+    if config_path.is_symlink():
+        raise ConfigurationError(f"config path must not be a symlink: {config_path}")
     if config_path.exists():
         try:
             with config_path.open("rb") as stream:
@@ -136,6 +139,10 @@ def load_config(
 def resolve_project_path(value: str, allowed_roots: tuple[Path, ...]) -> Path:
     if not value or "\x00" in value:
         raise SecurityError("project path is empty or contains NUL")
+    if os.name == "nt":
+        windows_value = value.replace("/", "\\")
+        if windows_value.startswith(("\\\\", "\\\\?\\", "\\\\.\\")):
+            raise SecurityError("UNC and Windows device paths are not allowed")
     candidate = Path(value)
     if not candidate.is_absolute():
         raise SecurityError("project path must be absolute")
@@ -145,6 +152,11 @@ def resolve_project_path(value: str, allowed_roots: tuple[Path, ...]) -> Path:
         raise SecurityError(f"project path cannot be resolved: {exc}") from exc
     if not resolved.is_dir():
         raise SecurityError("project path must be a directory")
+    if resolved in _protected_system_directories():
+        raise SecurityError("project path is a protected system directory")
+    access_mode = os.R_OK | (os.X_OK if os.name != "nt" else 0)
+    if not os.access(resolved, access_mode):
+        raise SecurityError("project path is not readable by the service user")
     if not allowed_roots:
         raise SecurityError("security.allowed_roots must contain at least one root")
     if not any(_is_relative_to(resolved, root) for root in allowed_roots):
@@ -258,7 +270,15 @@ def _schedule_config(raw: dict[str, Any]) -> ScheduleConfig:
         raise ConfigurationError(f"invalid schedule.default_misfire_policy: {policy}")
     poll = raw.get("poll_seconds", 1.0)
     if not isinstance(poll, (int, float)) or isinstance(poll, bool) or poll <= 0:
-        raise ConfigurationError("schedule.poll_seconds must be positive")
+        raise ConfigurationError("schedule.poll_seconds must be finite and positive")
+    try:
+        finite_poll = math.isfinite(poll)
+    except OverflowError as exc:
+        raise ConfigurationError(
+            "schedule.poll_seconds must be finite and positive"
+        ) from exc
+    if not finite_poll:
+        raise ConfigurationError("schedule.poll_seconds must be finite and positive")
     return ScheduleConfig(
         default_timezone=_string(raw.get("default_timezone", "UTC"), "schedule.default_timezone"),
         default_misfire_policy=policy,
@@ -359,8 +379,8 @@ def _snowflake(value: object, name: str) -> int:
         result = int(value)
     except (TypeError, ValueError) as exc:
         raise ConfigurationError(f"{name} must be a Discord snowflake") from exc
-    if result <= 0:
-        raise ConfigurationError(f"{name} must be positive")
+    if result <= 0 or result >= 1 << 64:
+        raise ConfigurationError(f"{name} must be a positive 64-bit snowflake")
     return result
 
 
@@ -398,3 +418,27 @@ def _is_relative_to(path: Path, root: Path) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _protected_system_directories() -> frozenset[Path]:
+    if os.name == "nt":
+        candidates = (
+            os.environ.get("SYSTEMROOT"),
+            os.environ.get("PROGRAMFILES"),
+            os.environ.get("PROGRAMFILES(X86)"),
+            os.environ.get("PROGRAMDATA"),
+        )
+        return frozenset(Path(value).resolve() for value in candidates if value)
+    return frozenset(
+        Path(value).resolve()
+        for value in (
+            "/",
+            "/bin",
+            "/sbin",
+            "/usr",
+            "/etc",
+            "/var",
+            "/System",
+            "/Library",
+        )
+    )

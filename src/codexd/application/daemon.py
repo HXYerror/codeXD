@@ -322,7 +322,7 @@ async def _run_daemon(config: AppConfig, bootstrap_token: str | None) -> int:
             await _cleanup_step(
                 "runtimes",
                 runtimes.close(),
-                deadline_seconds=15,
+                deadline_seconds=35,
                 logger=logger,
             )
             if not bot.is_closed():
@@ -396,6 +396,7 @@ async def _start_discord_with_initial_retries(
         except asyncio.CancelledError:
             raise
         except (
+            TimeoutError,
             aiohttp.ClientError,
             OSError,
             discord.ConnectionClosed,

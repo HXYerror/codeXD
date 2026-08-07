@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import platform
 import sys
+from collections.abc import Mapping
 
 from codexd.bootstrap import assert_environment_scrubbed
 from codexd.config import AppConfig
@@ -11,14 +12,19 @@ from codexd.security.secrets import SecretStore
 from codexd.storage.sqlite import SQLiteStore
 
 
-def run_doctor(config: AppConfig) -> int:
+def run_doctor(
+    config: AppConfig,
+    *,
+    expected_environment: Mapping[str, str],
+    bootstrap_token_available: bool = False,
+) -> int:
     checks: dict[str, dict[str, str]] = {}
     checks["python"] = {
         "state": "ok" if sys.version_info >= (3, 12) else "failed",
         "value": platform.python_version(),
     }
     try:
-        assert_environment_scrubbed(dict(sys_environ()))
+        assert_environment_scrubbed(expected_environment)
         checks["environment"] = {"state": "ok", "value": "scrubbed"}
     except Exception as exc:
         checks["environment"] = {"state": "failed", "value": str(exc)}
@@ -57,7 +63,7 @@ def run_doctor(config: AppConfig) -> int:
     except Exception as exc:
         checks["sdk"] = {"state": "failed", "value": str(exc)}
     try:
-        token = SecretStore().discord_token()
+        token = bootstrap_token_available or bool(SecretStore().discord_token())
         checks["discord_secret"] = {
             "state": "ok" if token else "missing",
             "value": "configured" if token else "not configured",
@@ -73,10 +79,10 @@ def run_doctor(config: AppConfig) -> int:
         ),
     }
     print(json.dumps(checks, ensure_ascii=False, indent=2, sort_keys=True))
-    return 1 if any(check["state"] == "failed" for check in checks.values()) else 0
-
-
-def sys_environ() -> tuple[tuple[str, str], ...]:
-    import os
-
-    return tuple(os.environ.items())
+    blocking = {
+        name
+        for name, check in checks.items()
+        if check["state"] == "failed"
+        or (check["state"] == "missing" and name != "database")
+    }
+    return 1 if blocking else 0

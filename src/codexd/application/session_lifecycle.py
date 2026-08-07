@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass, replace
@@ -28,6 +29,8 @@ from codexd.storage.records import (
     ThreadRevisionRecord,
 )
 from codexd.storage.repository import Repository
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -68,7 +71,7 @@ class SessionLifecycleCoordinator:
                 await task
 
     async def list_revisions(
-        self, conversation_id: str, *, limit: int = 20
+        self, conversation_id: str, *, limit: int | None = None
     ) -> tuple[ThreadRevisionRecord, ...]:
         return await asyncio.to_thread(
             self._repository.list_thread_revisions, conversation_id, limit=limit
@@ -241,7 +244,7 @@ class SessionLifecycleCoordinator:
                 if (
                     identity.thread_id == source.provider_thread_id
                     or identity.forked_from_thread_id != source.provider_thread_id
-                    or not identity.provider_session_id.strip()
+                    or identity.provider_session_id != source.provider_session_id
                 ):
                     await asyncio.to_thread(
                         self._repository.record_incident,
@@ -530,7 +533,7 @@ class SessionLifecycleCoordinator:
         if task is not None and not task.done():
             return
         task = asyncio.create_task(
-            self._monitor_provider_barrier(conversation_id),
+            self._run_provider_barrier_monitor(conversation_id),
             name=f"codexd-provider-barrier-{conversation_id}",
         )
         self._barrier_tasks[conversation_id] = task
@@ -540,6 +543,41 @@ class SessionLifecycleCoordinator:
                 self._barrier_tasks.pop(conversation_id, None)
 
         task.add_done_callback(discard)
+
+    async def _run_provider_barrier_monitor(self, conversation_id: str) -> None:
+        try:
+            await self._monitor_provider_barrier(conversation_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception(
+                "Provider barrier monitor stopped unexpectedly",
+                extra={"conversation_id": conversation_id},
+            )
+            try:
+                conversation = await asyncio.to_thread(
+                    self._repository.get_conversation,
+                    conversation_id,
+                )
+                await asyncio.to_thread(
+                    self._repository.record_incident,
+                    severity="error",
+                    code="provider_barrier_monitor_failed",
+                    summary="Provider barrier recovery stopped unexpectedly",
+                    project_id=conversation.project_id,
+                    conversation_id=conversation_id,
+                    details={"exception_type": type(exc).__name__},
+                )
+                await asyncio.to_thread(
+                    self._repository.block_conversation,
+                    conversation_id,
+                    reason="provider_barrier_monitor_failed",
+                )
+            except Exception:
+                logger.exception(
+                    "Could not persist provider barrier monitor failure",
+                    extra={"conversation_id": conversation_id},
+                )
 
     async def _monitor_provider_barrier(self, conversation_id: str) -> None:
         while not self._closed:

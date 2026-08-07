@@ -1757,21 +1757,22 @@ class Repository:
             )
 
     def list_thread_revisions(
-        self, conversation_id: str, *, limit: int = 20
+        self, conversation_id: str, *, limit: int | None = None
     ) -> tuple[ThreadRevisionRecord, ...]:
-        if limit < 1 or limit > 100:
-            raise InvariantError("revision list limit must be between 1 and 100")
+        if limit is not None and limit < 1:
+            raise InvariantError("revision list limit must be positive")
+        sql = """
+            SELECT * FROM thread_revisions
+            WHERE conversation_id = ?
+            ORDER BY created_at DESC, id DESC
+        """
+        parameters: tuple[object, ...] = (conversation_id,)
+        if limit is not None:
+            sql += " LIMIT ?"
+            parameters = (conversation_id, limit)
         return tuple(
             _revision(row)
-            for row in self.store.query_all(
-                """
-                SELECT * FROM thread_revisions
-                WHERE conversation_id = ?
-                ORDER BY created_at DESC, id DESC
-                LIMIT ?
-                """,
-                (conversation_id, limit),
-            )
+            for row in self.store.query_all(sql, parameters)
         )
 
     def resolve_thread_revision(
@@ -3313,6 +3314,35 @@ class Repository:
 
     def attach_turn_revision(self, turn_id: str, revision_id: str) -> None:
         with self.store.transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT t.state AS turn_state,
+                       t.thread_revision_id,
+                       t.conversation_id,
+                       c.state AS conversation_state,
+                       c.active_revision_id,
+                       r.conversation_id AS revision_conversation_id,
+                       r.state AS revision_state
+                FROM turns t
+                JOIN conversations c ON c.id = t.conversation_id
+                LEFT JOIN thread_revisions r ON r.id = ?
+                WHERE t.id = ?
+                """,
+                (revision_id, turn_id),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"Turn not found: {turn_id}")
+            if (
+                row["turn_state"] != "queued"
+                or row["thread_revision_id"] is not None
+                or row["conversation_state"] != "active"
+                or row["active_revision_id"] != revision_id
+                or row["revision_conversation_id"] != row["conversation_id"]
+                or row["revision_state"] != "active"
+            ):
+                raise ConflictError(
+                    "Turn revision is not the active revision for this Conversation"
+                )
             changed = connection.execute(
                 """
                 UPDATE turns SET thread_revision_id = ?
@@ -3334,9 +3364,14 @@ class Repository:
         with self.store.transaction() as connection:
             row = connection.execute(
                 """
-                SELECT t.*, c.project_id
+                SELECT t.*, c.project_id,
+                       c.state AS conversation_state,
+                       c.active_revision_id,
+                       r.conversation_id AS revision_conversation_id,
+                       r.state AS revision_state
                 FROM turns t
                 JOIN conversations c ON c.id = t.conversation_id
+                LEFT JOIN thread_revisions r ON r.id = t.thread_revision_id
                 WHERE t.id = ?
                 """,
                 (turn_id,),
@@ -3346,6 +3381,15 @@ class Repository:
             assert_turn_transition(TurnState(row["state"]), TurnState.STARTING)
             if row["thread_revision_id"] is None:
                 raise InvariantError("Turn must have a thread revision before provider start")
+            if (
+                row["conversation_state"] != "active"
+                or row["active_revision_id"] != row["thread_revision_id"]
+                or row["revision_conversation_id"] != row["conversation_id"]
+                or row["revision_state"] != "active"
+            ):
+                raise ConflictError(
+                    "Turn does not target the active revision for its Conversation"
+                )
             lease = connection.execute(
                 "SELECT * FROM runtime_leases WHERE id = ?",
                 (runtime_lease_id,),
@@ -3358,6 +3402,22 @@ class Repository:
                 or not _runtime_lease_matches_project(lease, str(row["project_id"]))
             ):
                 raise ConflictError("runtime lease is stale or belongs to another scope")
+            newer = connection.execute(
+                """
+                SELECT 1 FROM runtime_leases
+                WHERE scope_kind = ? AND scope_key = ?
+                  AND generation > ?
+                  AND state IN ('starting', 'ready', 'unhealthy')
+                LIMIT 1
+                """,
+                (
+                    lease["scope_kind"],
+                    lease["scope_key"],
+                    runtime_generation,
+                ),
+            ).fetchone()
+            if newer is not None:
+                raise ConflictError("runtime lease generation has been superseded")
             try:
                 changed = connection.execute(
                     """
@@ -4105,11 +4165,41 @@ class Repository:
         depends_on_outbox_id: str | None = None,
     ) -> str:
         now = utc_now_ms()
+        payload_json = canonical_json(dict(payload))
         with self.store.transaction() as connection:
             existing = connection.execute(
-                "SELECT id FROM discord_outbox WHERE dedupe_key = ?", (dedupe_key,)
+                """
+                SELECT id, event_sequence, destination_key, operation,
+                       depends_on_outbox_id, payload_json, coalesce_key,
+                       delivery_marker
+                FROM discord_outbox
+                WHERE dedupe_key = ?
+                """,
+                (dedupe_key,),
             ).fetchone()
             if existing:
+                expected = (
+                    event_sequence,
+                    destination_key,
+                    operation,
+                    depends_on_outbox_id,
+                    payload_json,
+                    coalesce_key,
+                    delivery_marker,
+                )
+                actual = (
+                    existing["event_sequence"],
+                    existing["destination_key"],
+                    existing["operation"],
+                    existing["depends_on_outbox_id"],
+                    existing["payload_json"],
+                    existing["coalesce_key"],
+                    existing["delivery_marker"],
+                )
+                if actual != expected:
+                    raise InvariantError(
+                        "outbox dedupe key was reused for a different operation"
+                    )
                 return str(existing["id"])
             outbox_id = new_id()
             connection.execute(
@@ -4126,7 +4216,7 @@ class Repository:
                     destination_key,
                     operation,
                     depends_on_outbox_id,
-                    canonical_json(dict(payload)),
+                    payload_json,
                     dedupe_key,
                     coalesce_key,
                     delivery_marker,
@@ -4160,6 +4250,7 @@ class Repository:
                 SET state = 'superseded', updated_at = ?
                 WHERE stale.state = 'reconciling'
                   AND stale.coalesce_key IS NOT NULL
+                  AND stale.operation <> 'send'
                   AND stale.coalesce_key NOT LIKE 'task-card:%'
                   AND EXISTS (
                       SELECT 1
@@ -4209,6 +4300,35 @@ class Repository:
             ).fetchone()
             assert updated is not None
             return _outbox(updated, claimed_from_state=str(row["state"]))
+
+    def renew_outbox_lease(
+        self,
+        outbox_id: str,
+        *,
+        lease_owner: str,
+        lease_attempt: int,
+        lease_ms: int = 30_000,
+    ) -> bool:
+        if lease_ms <= 0:
+            raise InvariantError("outbox lease duration must be positive")
+        now = utc_now_ms()
+        with self.store.transaction() as connection:
+            changed = connection.execute(
+                """
+                UPDATE discord_outbox
+                SET lease_expires_at = ?, updated_at = ?
+                WHERE id = ? AND state = 'sending'
+                  AND lease_owner = ? AND attempts = ?
+                """,
+                (
+                    now + lease_ms,
+                    now,
+                    outbox_id,
+                    lease_owner,
+                    lease_attempt,
+                ),
+            ).rowcount
+            return changed == 1
 
     def ack_outbox(
         self,
@@ -5404,7 +5524,7 @@ def consume_modal_intent_in_transaction(
         if row["consumed_interaction_id"] != interaction_id:
             raise ConflictError("modal intent was already consumed")
         return _modal_intent(row), False
-    if row["state"] == "expired" or now > int(row["expires_at"]):
+    if row["state"] == "expired" or now >= int(row["expires_at"]):
         connection.execute(
             """
             UPDATE modal_intents

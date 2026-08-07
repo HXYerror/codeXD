@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
 
 from codexd.storage.records import TurnRecord
 from codexd.storage.repository import Repository
+
+logger = logging.getLogger(__name__)
 
 TurnHandler = Callable[[TurnRecord], Awaitable[float | None]]
 MailboxErrorHandler = Callable[[str, Exception], Awaitable[None]]
@@ -25,6 +28,11 @@ class ConversationMailbox:
         self._task = asyncio.create_task(
             self._run(), name=f"codexd-mailbox-{self.conversation_id}"
         )
+        self._task.add_done_callback(self._observe_completion)
+
+    @property
+    def done(self) -> bool:
+        return self._task.done()
 
     def wake(self) -> None:
         self._wake.set()
@@ -51,7 +59,15 @@ class ConversationMailbox:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    await self.error_handler(self.conversation_id, exc)
+                    try:
+                        await self.error_handler(self.conversation_id, exc)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.exception(
+                            "Mailbox error reporting failed",
+                            extra={"conversation_id": self.conversation_id},
+                        )
                     retry_after = 1.0
                 if retry_after is not None:
                     await self._wake_after(retry_after)
@@ -61,6 +77,17 @@ class ConversationMailbox:
         await asyncio.sleep(delay)
         if not self._closed:
             self._wake.set()
+
+    def _observe_completion(self, task: asyncio.Task[None]) -> None:
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            logger.error(
+                "Conversation mailbox stopped unexpectedly",
+                exc_info=(type(error), error, error.__traceback__),
+                extra={"conversation_id": self.conversation_id},
+            )
 
 
 class MailboxRegistry:
@@ -104,7 +131,7 @@ class MailboxRegistry:
             if self._closed:
                 return None
             mailbox = self._mailboxes.get(conversation_id)
-            if mailbox is None:
+            if mailbox is None or mailbox.done:
                 mailbox = ConversationMailbox(
                     conversation_id=conversation_id,
                     repository=self._repository,

@@ -5,7 +5,6 @@ import hashlib
 import json
 import os
 import pickle
-import subprocess
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -95,29 +94,26 @@ class MediaWorker:
         return result
 
     async def _run(self, request: tuple[Any, ...]) -> object:
-        return await asyncio.to_thread(self._run_sync, request)
-
-    def _run_sync(self, request: tuple[Any, ...]) -> object:
-        process = subprocess.Popen(
-            self._command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+        process = await asyncio.create_subprocess_exec(
+            *self._command,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
             env=self._environment,
             close_fds=True,
         )
         try:
-            output, _ = process.communicate(
-                pickle.dumps(request, protocol=pickle.HIGHEST_PROTOCOL),
+            output, _ = await asyncio.wait_for(
+                process.communicate(
+                    pickle.dumps(request, protocol=pickle.HIGHEST_PROTOCOL),
+                ),
                 timeout=self.timeout_seconds,
             )
-        except subprocess.TimeoutExpired as exc:
-            process.terminate()
-            try:
-                process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=2)
+        except asyncio.CancelledError:
+            await _terminate_process(process)
+            raise
+        except TimeoutError as exc:
+            await _terminate_process(process)
             raise MediaWorkerError("media worker timed out") from exc
         if process.returncode != 0:
             raise MediaWorkerError(
@@ -137,6 +133,17 @@ class MediaWorker:
         if status != "ok":
             raise MediaWorkerError(str(payload))
         return payload
+
+
+async def _terminate_process(process: asyncio.subprocess.Process) -> None:
+    if process.returncode is not None:
+        return
+    process.terminate()
+    try:
+        await asyncio.wait_for(process.wait(), timeout=2)
+    except TimeoutError:
+        process.kill()
+        await asyncio.wait_for(process.wait(), timeout=2)
 
 
 def _subprocess_main() -> int:

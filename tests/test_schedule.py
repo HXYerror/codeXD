@@ -604,7 +604,7 @@ def test_modal_intent_expires_without_consuming(
     )
     monkeypatch.setattr(
         "codexd.storage.repository.utc_now_ms",
-        lambda: modal.expires_at + 1,
+        lambda: modal.expires_at,
     )
 
     with pytest.raises(ConflictError, match="expired"):

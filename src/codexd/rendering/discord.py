@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -139,9 +140,15 @@ class DiscordRenderPlanner:
                         )
                     )
             elif isinstance(block, CodeBlock):
-                fenced = f"```{block.language or ''}\n{block.code}\n```"
-                if len(fenced) <= DISCORD_MESSAGE_LIMIT:
-                    messages.append(fenced)
+                language = block.language or ""
+                code = block.code.removesuffix("\n")
+                code_chunks = (
+                    split_discord_code(code, language=language)
+                    if len(code) + len(language) + 8 <= DISCORD_MESSAGE_LIMIT
+                    else ()
+                )
+                if len(code_chunks) == 1:
+                    messages.append(code_chunks[0])
                 else:
                     messages.append("Oversized code block attached as `code.txt`.")
                     attachments.extend(
@@ -162,9 +169,9 @@ class DiscordRenderPlanner:
                     incident_codes.add("table_media_worker_failed")
                     base = f"table-{block.block_id}"
                     messages.append("Table rendering failed; Markdown source attached.")
-                    fenced = f"```\n{block.source_markdown}\n```"
-                    if len(fenced) <= DISCORD_MESSAGE_LIMIT:
-                        messages.append(fenced)
+                    table_fenced = f"```\n{block.source_markdown}\n```"
+                    if len(table_fenced) <= DISCORD_MESSAGE_LIMIT:
+                        messages.append(table_fenced)
                     attachments.extend(
                         _text_attachments(
                             block.source_markdown,
@@ -234,6 +241,43 @@ class DiscordRenderPlanner:
         if self._artifact_root is None:
             raise InvariantError("render artifact root is not configured")
         rendered = await self.render_markdown(source)
+        return await asyncio.to_thread(
+            self._persist_rendered_plan,
+            turn_id,
+            rendered,
+        )
+
+    async def create_plain_text_fallback_plan(
+        self,
+        *,
+        turn_id: str,
+        source: str,
+    ) -> DurableDiscordRenderPlan:
+        rendered = RenderedDiscordContent(
+            messages=(
+                "Rich rendering was unavailable; complete Markdown source attached.",
+            ),
+            attachments=_text_attachments(
+                source,
+                filename="response.md",
+                description="Complete final response after rich-rendering failure",
+                max_bytes=DISCORD_ATTACHMENT_LIMIT_BYTES,
+                kind=AttachmentKind.SOURCE,
+            ),
+        )
+        return await asyncio.to_thread(
+            self._persist_rendered_plan,
+            turn_id,
+            rendered,
+        )
+
+    def _persist_rendered_plan(
+        self,
+        turn_id: str,
+        rendered: RenderedDiscordContent,
+    ) -> DurableDiscordRenderPlan:
+        if self._artifact_root is None:
+            raise InvariantError("render artifact root is not configured")
         target = self._artifact_root / _safe_path_segment(turn_id)
         target.mkdir(mode=0o700, parents=True, exist_ok=True)
         if os.name != "nt":
@@ -613,11 +657,18 @@ def _text_attachments(
     kind: AttachmentKind = AttachmentKind.GENERIC,
     group_id: str | None = None,
 ) -> tuple[RenderedAttachment, ...]:
-    return _byte_attachments(
-        value.encode("utf-8"),
+    if max_bytes < 1:
+        raise ValueError("attachment byte limit must be positive")
+    content = value.encode("utf-8")
+    chunks = (
+        (content,)
+        if len(content) <= max_bytes
+        else _split_utf8_chunks(value, max_bytes)
+    )
+    return _attachments_from_chunks(
+        chunks,
         filename=filename,
         description=description,
-        max_bytes=max_bytes,
         kind=kind,
         group_id=group_id,
     )
@@ -636,19 +687,64 @@ def _byte_attachments(
         raise ValueError("attachment byte limit must be positive")
     if len(content) <= max_bytes:
         return (RenderedAttachment(filename, content, description, kind, group_id),)
-    count = (len(content) + max_bytes - 1) // max_bytes
+    return _attachments_from_chunks(
+        tuple(
+            content[index : index + max_bytes]
+            for index in range(0, len(content), max_bytes)
+        ),
+        filename=filename,
+        description=description,
+        kind=kind,
+        group_id=group_id,
+    )
+
+
+def _split_utf8_chunks(value: str, max_bytes: int) -> tuple[bytes, ...]:
+    if max_bytes < 1:
+        raise ValueError("attachment byte limit must be positive")
+    chunks: list[bytes] = []
+    current: list[str] = []
+    current_bytes = 0
+    for character in value:
+        encoded = character.encode("utf-8")
+        if len(encoded) > max_bytes:
+            raise ValueError("attachment byte limit cannot contain one UTF-8 character")
+        if current and current_bytes + len(encoded) > max_bytes:
+            chunks.append("".join(current).encode("utf-8"))
+            current = []
+            current_bytes = 0
+        current.append(character)
+        current_bytes += len(encoded)
+    if current:
+        chunks.append("".join(current).encode("utf-8"))
+    return tuple(chunks)
+
+
+def _attachments_from_chunks(
+    chunks: tuple[bytes, ...],
+    *,
+    filename: str,
+    description: str,
+    kind: AttachmentKind,
+    group_id: str | None,
+) -> tuple[RenderedAttachment, ...]:
+    if len(chunks) == 1:
+        return (
+            RenderedAttachment(filename, chunks[0], description, kind, group_id),
+        )
+    count = len(chunks)
     path = Path(filename)
     stem = path.stem or "attachment"
     suffix = path.suffix or ".bin"
     return tuple(
         RenderedAttachment(
             filename=f"{stem}.part{index + 1:03d}-of-{count:03d}{suffix}",
-            content=content[index * max_bytes : (index + 1) * max_bytes],
+            content=chunk,
             description=f"{description} (part {index + 1}/{count})",
             kind=kind,
             group_id=group_id,
         )
-        for index in range(count)
+        for index, chunk in enumerate(chunks)
     )
 
 

@@ -132,47 +132,58 @@ class DiscordImageIngestor:
 
     async def _download(self, initial_url: str, destination: Path) -> None:
         url = initial_url
-        timeout = aiohttp.ClientTimeout(total=60, connect=10, sock_read=20)
-        for _redirect in range(4):
-            _validate_cdn_url(url)
-            async with self._session.get(
-                url,
-                allow_redirects=False,
-                timeout=timeout,
-                headers={"Accept": "image/*,*/*;q=0.1"},
-            ) as response:
-                if response.status in {301, 302, 303, 307, 308}:
-                    location = response.headers.get("Location")
-                    if not location:
-                        raise AttachmentError(
-                            "Discord CDN returned an empty redirect",
-                            code="image_download_redirect",
-                        )
-                    url = urljoin(url, location)
-                    continue
-                if response.status != 200:
-                    raise AttachmentError(
-                        f"Discord CDN returned HTTP {response.status}",
-                        code="image_download_failed",
-                    )
-                size = 0
-                with destination.open("xb") as output:
-                    async for chunk in response.content.iter_chunked(64 * 1024):
-                        size += len(chunk)
-                        if size > self._max_bytes:
+        timeout = aiohttp.ClientTimeout(connect=10, sock_read=20)
+        try:
+            async with asyncio.timeout(30):
+                for _redirect in range(4):
+                    _validate_cdn_url(url)
+                    async with self._session.get(
+                        url,
+                        allow_redirects=False,
+                        timeout=timeout,
+                        headers={"Accept": "image/*,*/*;q=0.1"},
+                    ) as response:
+                        if response.status in {301, 302, 303, 307, 308}:
+                            location = response.headers.get("Location")
+                            if not location:
+                                raise AttachmentError(
+                                    "Discord CDN returned an empty redirect",
+                                    code="image_download_redirect",
+                                )
+                            url = urljoin(url, location)
+                            continue
+                        if response.status != 200:
                             raise AttachmentError(
-                                "downloaded image exceeds the byte limit",
-                                code="image_size_limit",
+                                f"Discord CDN returned HTTP {response.status}",
+                                code="image_download_failed",
                             )
-                        output.write(chunk)
-                if size == 0:
-                    raise AttachmentError(
-                        "downloaded image is empty", code="image_download_empty"
-                    )
-                if os.name != "nt":
-                    await asyncio.to_thread(destination.chmod, 0o600)
-                return
-        raise AttachmentError("too many Discord CDN redirects", code="image_download_redirect")
+                        size = 0
+                        with destination.open("xb") as output:
+                            async for chunk in response.content.iter_chunked(64 * 1024):
+                                size += len(chunk)
+                                if size > self._max_bytes:
+                                    raise AttachmentError(
+                                        "downloaded image exceeds the byte limit",
+                                        code="image_size_limit",
+                                    )
+                                output.write(chunk)
+                        if size == 0:
+                            raise AttachmentError(
+                                "downloaded image is empty",
+                                code="image_download_empty",
+                            )
+                        if os.name != "nt":
+                            await asyncio.to_thread(destination.chmod, 0o600)
+                        return
+                raise AttachmentError(
+                    "too many Discord CDN redirects",
+                    code="image_download_redirect",
+                )
+        except TimeoutError as exc:
+            raise AttachmentError(
+                "Discord image download exceeded 30 seconds",
+                code="image_download_timeout",
+            ) from exc
 
 
 def _validate_cdn_url(value: str) -> None:

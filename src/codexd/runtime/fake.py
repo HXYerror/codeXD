@@ -156,7 +156,7 @@ class FakeCodexRuntime:
         forked = ThreadIdentity(
             thread_id=identity.thread_id,
             requested_thread_id=None,
-            provider_session_id=identity.provider_session_id,
+            provider_session_id=self._threads[thread_id].provider_session_id,
             forked_from_thread_id=thread_id,
             parent_thread_id=None,
             provider_version="fake",

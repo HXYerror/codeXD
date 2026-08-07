@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
+import psutil
 import pytest
 from PIL import Image, ImageCms
 
@@ -263,6 +265,43 @@ async def test_durable_render_plan_reuses_verified_artifacts(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+async def test_near_limit_code_with_long_backtick_run_is_attached_completely() -> None:
+    planner = DiscordRenderPlanner(
+        media_worker=Mock(),
+        table_limits=TableLimits(),
+    )
+    code = ("x" * 900) + ("`" * 10) + ("y" * 982)
+    source = f"```````````text\n{code}\n```````````"
+
+    rendered = await planner.render_markdown(source)
+
+    assert rendered.messages == ("Oversized code block attached as `code.txt`.",)
+    assert rendered.attachments[0].content.decode("utf-8").rstrip("\n") == code
+
+
+@pytest.mark.asyncio
+async def test_long_render_fallback_preserves_complete_source_attachment(
+    tmp_path: Path,
+) -> None:
+    planner = DiscordRenderPlanner(
+        media_worker=Mock(),
+        table_limits=TableLimits(),
+        artifact_root=tmp_path / "render",
+    )
+    source = ("持续输出😀\n" * 10_000).strip()
+
+    plan = await planner.create_plain_text_fallback_plan(
+        turn_id="fallback-turn",
+        source=source,
+    )
+
+    assert len(plan.messages) == 1
+    assert b"".join(
+        attachment.path.read_bytes() for attachment in plan.attachments
+    ).decode("utf-8") == source
+
+
+@pytest.mark.asyncio
 async def test_final_text_chunking_does_not_truncate_content() -> None:
     planner = DiscordRenderPlanner(
         media_worker=Mock(),
@@ -303,6 +342,51 @@ def test_code_chunking_balances_every_fence() -> None:
 
 
 @pytest.mark.asyncio
+async def test_rendered_code_uses_a_fence_longer_than_its_content() -> None:
+    planner = DiscordRenderPlanner(
+        media_worker=Mock(),
+        table_limits=TableLimits(),
+    )
+
+    rendered = await planner.render_markdown(
+        "````python\nprint('``` inside')\n````"
+    )
+
+    assert rendered.messages == (
+        "````python\nprint('``` inside')\n````",
+    )
+
+
+@pytest.mark.asyncio
+async def test_media_worker_cancellation_terminates_child(tmp_path: Path) -> None:
+    pid_file = tmp_path / "worker.pid"
+    worker = MediaWorker(timeout_seconds=30)
+    worker._command = (
+        sys.executable,
+        "-c",
+        (
+            "import os,pathlib,time;"
+            f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid()));"
+            "time.sleep(30)"
+        ),
+    )
+    task = asyncio.create_task(worker._run(("unused",)))
+    for _ in range(100):
+        if pid_file.exists():
+            break
+        await asyncio.sleep(0.01)
+    assert pid_file.exists()
+    pid = int(pid_file.read_text())
+    assert psutil.pid_exists(pid)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert not psutil.pid_exists(pid)
+
+
+@pytest.mark.asyncio
 async def test_oversized_source_bypasses_markdown_parser_and_worker() -> None:
     worker = Mock()
     planner = DiscordRenderPlanner(
@@ -323,6 +407,26 @@ async def test_oversized_source_bypasses_markdown_parser_and_worker() -> None:
         attachment.content for attachment in rendered.attachments
     ) == b"x" * 33
     assert all(len(attachment.content) <= 32 for attachment in rendered.attachments)
+
+
+@pytest.mark.asyncio
+async def test_oversized_unicode_source_parts_remain_valid_utf8() -> None:
+    planner = DiscordRenderPlanner(
+        media_worker=Mock(),
+        table_limits=TableLimits(max_source_bytes=7),
+    )
+    source = "前😀后" * 4
+
+    rendered = await planner.render_markdown(source)
+
+    assert len(rendered.attachments) > 1
+    assert all(
+        attachment.content.decode("utf-8")
+        for attachment in rendered.attachments
+    )
+    assert b"".join(
+        attachment.content for attachment in rendered.attachments
+    ).decode("utf-8") == source
 
 
 @pytest.mark.asyncio
