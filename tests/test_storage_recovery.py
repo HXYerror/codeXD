@@ -875,7 +875,7 @@ def test_channel_binding_migration_preserves_legacy_conversation_identity(
             )
 
         monkeypatch.setattr(sqlite_module, "_load_migrations", lambda: migrations)
-        assert store.migrate() == 14
+        assert store.migrate() == 15
         assert store.foreign_key_check() == ()
         repository = Repository(store)
         project = repository.get_project("legacy-project")
@@ -970,7 +970,7 @@ def test_component_scope_migrations_expire_and_guard_legacy_pending_drafts(
             )
 
         monkeypatch.setattr(sqlite_module, "_load_migrations", lambda: migrations)
-        assert store.migrate() == 14
+        assert store.migrate() == 15
         row = store.query_one(
             """
             SELECT state, discord_guild_id, discord_channel_id
@@ -1094,7 +1094,7 @@ def test_turn_enqueue_sequence_migration_backfills_existing_turns(
                 )
 
         monkeypatch.setattr(sqlite_module, "_load_migrations", lambda: migrations)
-        assert store.migrate() == 14
+        assert store.migrate() == 15
         repository = Repository(store)
         third = repository.enqueue_turn(
             conversation_id="upgrade-conversation",
@@ -1201,7 +1201,7 @@ def test_schedule_fire_turn_fk_upgrade_preserves_pairs(
             )
 
         monkeypatch.setattr(sqlite_module, "_load_migrations", lambda: migrations)
-        assert store.migrate() == 14
+        assert store.migrate() == 15
         assert store.foreign_key_check() == ()
         fire_fks = store.query_all("PRAGMA foreign_key_list(schedule_fires)")
         assert any(

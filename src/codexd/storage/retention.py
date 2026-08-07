@@ -105,7 +105,8 @@ def run_retention(
             FROM attachments a
             LEFT JOIN turns t ON t.id = a.turn_id
             LEFT JOIN ingress_messages i ON i.id = a.ingress_id
-            WHERE a.kind = 'input_image' AND a.retention_until <= ?
+            WHERE a.kind IN ('input_image', 'input_file')
+              AND a.retention_until <= ?
               AND (
                 (a.turn_id IS NOT NULL AND t.state IN ({_placeholders(_TERMINAL_TURNS)}))
                 OR
@@ -649,7 +650,10 @@ def _sweep_orphan_artifacts(
 ) -> int:
     referenced: set[Path] = set()
     for row in store.query_all(
-        "SELECT relative_path FROM attachments WHERE kind = 'input_image'"
+        """
+        SELECT relative_path FROM attachments
+        WHERE kind IN ('input_image', 'input_file')
+        """
     ):
         referenced.add(
             _safe_relative_path(paths.data_dir, str(row["relative_path"]))
