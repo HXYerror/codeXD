@@ -144,7 +144,6 @@ async def test_sdk_0144_4_public_mention_constructor_and_exact_wire_contract() -
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(os.name != "posix", reason="secure file leasing requires POSIX")
 async def test_runtime_maps_mixed_attachments_by_ordinal_without_prompt_downgrade(
     tmp_path: Path,
 ) -> None:
@@ -188,7 +187,6 @@ async def test_runtime_maps_mixed_attachments_by_ordinal_without_prompt_downgrad
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(os.name != "posix", reason="secure file leasing requires POSIX")
 async def test_runtime_starts_file_only_turn_with_one_mention(tmp_path: Path) -> None:
     capture = _InputCaptureThread()
     runtime = _runtime_for_input_capture(tmp_path, capture)
