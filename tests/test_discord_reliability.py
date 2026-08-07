@@ -1025,6 +1025,299 @@ async def test_turn_progress_uses_one_editable_rich_embed() -> None:
 
 
 @pytest.mark.asyncio
+async def test_turn_progress_delete_uses_only_the_trusted_bot_message_id() -> None:
+    message = Mock(spec=discord.Message)
+    message.id = 601
+    message.author = Mock(id=999)
+    message.delete = AsyncMock()
+    thread = Mock(spec=discord.Thread)
+    thread.archived = False
+    thread.locked = False
+    thread.fetch_message = AsyncMock(return_value=message)
+    client = Mock(spec=discord.Client)
+    client.user = Mock(id=999)
+    client.get_channel.return_value = thread
+    repository = Mock()
+    repository.turn_progress_message.return_value = "601"
+    payload = {
+        "kind": "turn_progress_delete",
+        "turn_id": "turn-delete",
+    }
+
+    result = await DiscordOutboxTransport(
+        client=client,
+        repository=repository,
+        renderer=Mock(),
+        signer=Mock(),
+    ).deliver(
+        OutboxRecord(
+            id="progress-delete",
+            destination_key="thread:300",
+            operation="delete",
+            payload_json=canonical_json(payload),
+            delivery_marker="progress-delete",
+            state="pending",
+            attempts=0,
+            lease_owner="worker",
+        )
+    )
+
+    assert result == DeliveryResult()
+    repository.turn_progress_message.assert_called_once_with("turn-delete")
+    thread.fetch_message.assert_awaited_once_with(601)
+    message.delete.assert_awaited_once_with()
+    assert "message_id" not in payload
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("record_state", ("pending", "reconciling"))
+async def test_turn_progress_delete_not_found_is_idempotent_success(
+    record_state: str,
+) -> None:
+    thread = Mock(spec=discord.Thread)
+    thread.archived = False
+    thread.locked = False
+    thread.fetch_message = AsyncMock(
+        side_effect=discord.NotFound(
+            Mock(status=404, reason="deleted"),
+            "deleted",
+        )
+    )
+    client = Mock(spec=discord.Client)
+    client.user = Mock(id=999)
+    client.get_channel.return_value = thread
+    repository = Mock()
+    repository.turn_progress_message.return_value = "601"
+
+    result = await DiscordOutboxTransport(
+        client=client,
+        repository=repository,
+        renderer=Mock(),
+        signer=Mock(),
+    ).deliver(
+        OutboxRecord(
+            id=f"progress-delete-{record_state}",
+            destination_key="thread:300",
+            operation="delete",
+            payload_json=canonical_json(
+                {
+                    "kind": "turn_progress_delete",
+                    "turn_id": "turn-delete",
+                }
+            ),
+            delivery_marker="progress-delete",
+            state=record_state,
+            attempts=1,
+            lease_owner="worker",
+        )
+    )
+
+    assert result == DeliveryResult()
+    thread.fetch_message.assert_awaited_once_with(601)
+
+
+@pytest.mark.asyncio
+async def test_turn_progress_delete_racing_not_found_is_idempotent_success() -> None:
+    message = Mock(spec=discord.Message)
+    message.author = Mock(id=999)
+    message.delete = AsyncMock(
+        side_effect=discord.NotFound(
+            Mock(status=404, reason="deleted"),
+            "deleted",
+        )
+    )
+    thread = Mock(spec=discord.Thread)
+    thread.archived = False
+    thread.locked = False
+    thread.fetch_message = AsyncMock(return_value=message)
+    client = Mock(spec=discord.Client)
+    client.user = Mock(id=999)
+    client.get_channel.return_value = thread
+    repository = Mock()
+    repository.turn_progress_message.return_value = "601"
+
+    result = await DiscordOutboxTransport(
+        client=client,
+        repository=repository,
+        renderer=Mock(),
+        signer=Mock(),
+    ).deliver(
+        OutboxRecord(
+            id="progress-delete-race",
+            destination_key="thread:300",
+            operation="delete",
+            payload_json=canonical_json(
+                {
+                    "kind": "turn_progress_delete",
+                    "turn_id": "turn-delete",
+                }
+            ),
+            delivery_marker="progress-delete-race",
+            state="pending",
+            attempts=0,
+            lease_owner="worker",
+        )
+    )
+
+    assert result == DeliveryResult()
+    message.delete.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_turn_progress_delete_without_message_id_skips_discord() -> None:
+    client = Mock(spec=discord.Client)
+    repository = Mock()
+    repository.turn_progress_message.return_value = None
+
+    result = await DiscordOutboxTransport(
+        client=client,
+        repository=repository,
+        renderer=Mock(),
+        signer=Mock(),
+    ).deliver(
+        OutboxRecord(
+            id="progress-delete-empty",
+            destination_key="thread:300",
+            operation="delete",
+            payload_json=canonical_json(
+                {
+                    "kind": "turn_progress_delete",
+                    "turn_id": "turn-delete",
+                }
+            ),
+            delivery_marker="progress-delete-empty",
+            state="pending",
+            attempts=0,
+            lease_owner="worker",
+        )
+    )
+
+    assert result == DeliveryResult()
+    client.get_channel.assert_not_called()
+    client.fetch_channel.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "permanent"),
+    ((403, True), (429, False), (503, False)),
+)
+async def test_turn_progress_delete_classifies_discord_failures(
+    status: int,
+    permanent: bool,
+) -> None:
+    response = Mock(status=status, reason="delete failed")
+    error: discord.HTTPException
+    if status == 403:
+        error = discord.Forbidden(response, "delete forbidden")
+    else:
+        error = discord.HTTPException(response, "delete failed")
+    if status == 429:
+        error.retry_after = 3.5
+    thread = Mock(spec=discord.Thread)
+    thread.archived = False
+    thread.locked = False
+    thread.fetch_message = AsyncMock(side_effect=error)
+    client = Mock(spec=discord.Client)
+    client.user = Mock(id=999)
+    client.get_channel.return_value = thread
+    repository = Mock()
+    repository.turn_progress_message.return_value = "601"
+
+    with pytest.raises(DeliveryError) as raised:
+        await DiscordOutboxTransport(
+            client=client,
+            repository=repository,
+            renderer=Mock(),
+            signer=Mock(),
+        ).deliver(
+            OutboxRecord(
+                id=f"progress-delete-{status}",
+                destination_key="thread:300",
+                operation="delete",
+                payload_json=canonical_json(
+                    {
+                        "kind": "turn_progress_delete",
+                        "turn_id": "turn-delete",
+                    }
+                ),
+                delivery_marker="progress-delete-failure",
+                state="pending",
+                attempts=1,
+                lease_owner="worker",
+            )
+        )
+
+    assert raised.value.permanent is permanent
+    if status == 429:
+        assert raised.value.retry_after == 3.5
+
+
+@pytest.mark.asyncio
+async def test_turn_progress_delete_rejects_payload_message_id_and_non_bot_target() -> None:
+    client = Mock(spec=discord.Client)
+    client.user = Mock(id=999)
+    repository = Mock()
+    transport = DiscordOutboxTransport(
+        client=client,
+        repository=repository,
+        renderer=Mock(),
+        signer=Mock(),
+    )
+    with pytest.raises(DeliveryError) as arbitrary_id:
+        await transport.deliver(
+            OutboxRecord(
+                id="progress-delete-untrusted",
+                destination_key="thread:300",
+                operation="delete",
+                payload_json=canonical_json(
+                    {
+                        "kind": "turn_progress_delete",
+                        "turn_id": "turn-delete",
+                        "message_id": "777",
+                    }
+                ),
+                delivery_marker="progress-delete-untrusted",
+                state="pending",
+                attempts=0,
+                lease_owner="worker",
+            )
+        )
+    assert arbitrary_id.value.permanent is True
+    repository.turn_progress_message.assert_not_called()
+
+    message = Mock(spec=discord.Message)
+    message.author = Mock(id=123)
+    message.delete = AsyncMock()
+    thread = Mock(spec=discord.Thread)
+    thread.archived = False
+    thread.locked = False
+    thread.fetch_message = AsyncMock(return_value=message)
+    client.get_channel.return_value = thread
+    repository.turn_progress_message.return_value = "601"
+    with pytest.raises(DeliveryError) as author_mismatch:
+        await transport.deliver(
+            OutboxRecord(
+                id="progress-delete-wrong-author",
+                destination_key="thread:300",
+                operation="delete",
+                payload_json=canonical_json(
+                    {
+                        "kind": "turn_progress_delete",
+                        "turn_id": "turn-delete",
+                    }
+                ),
+                delivery_marker="progress-delete-wrong-author",
+                state="pending",
+                attempts=0,
+                lease_owner="worker",
+            )
+        )
+    assert author_mismatch.value.permanent is True
+    message.delete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_table_copy_component_returns_markdown_ephemerally(
     tmp_path: Path,
 ) -> None:
