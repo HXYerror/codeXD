@@ -2493,7 +2493,7 @@ final ack 只在 view 当前有远端 message 时插入一次 delete outbox；�
 message ID；transport 以 cleanup outbox ID 关联并校验 view、destination、已 sent 的
 final dependency 后才取得删除目标，避免把远端用户消息 ID 变成可注入的删除目标。
 
-升级到 migration 0015 时，已经 terminal 的 Turn view 标记为 `legacy_ineligible`，
+升级到 migration 0016 时，已经 terminal 的 Turn view 标记为 `legacy_ineligible`，
 避免迟到的旧版 final ack 删除 rollout 前的 progress；升级时仍非 terminal 的 Turn
 保持 `active`，之后正常进入 cleanup 生命周期。
 
