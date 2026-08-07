@@ -10,7 +10,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 import discord
 import pytest
@@ -1772,6 +1772,72 @@ async def test_thread_creation_outbox_reconciles_existing_remote_thread(
         storage_context.repository.get_ingress_message("302").state
         == "pending_preflight"
     )
+    channel.fetch_message.assert_not_awaited()
+    starter.create_thread.assert_not_awaited()
+    thread.edit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_thread_creation_outbox_fetches_uncached_existing_remote_thread(
+    storage_context: StorageContext,
+) -> None:
+    storage_context.repository.request_thread_creation(
+        discord_message_id="307",
+        content_hash="content",
+        attachment_manifest_hash="attachments",
+        first_request_text="reconcile uncached existing thread",
+        has_image_attachment=False,
+        project_id=storage_context.project.id,
+        discord_guild_id=100,
+        discord_channel_id=200,
+        owner_user_id=400,
+        boot_id="boot",
+    )
+    record = storage_context.repository.claim_outbox(worker_id="worker")
+    assert record is not None
+    channel = Mock(spec=discord.TextChannel)
+    channel.id = 200
+    starter = Mock(spec=discord.Message)
+    starter.create_thread = AsyncMock()
+    channel.fetch_message = AsyncMock(return_value=starter)
+    thread = Mock(spec=discord.Thread)
+    thread.id = 307
+    thread.archived = False
+    thread.locked = False
+    thread.edit = AsyncMock()
+    client = Mock(spec=discord.Client)
+    client.get_channel.side_effect = (
+        lambda channel_id: channel if channel_id == 200 else None
+    )
+    client.fetch_channel = AsyncMock(return_value=thread)
+    transport = DiscordOutboxTransport(
+        client=client,
+        repository=storage_context.repository,
+        renderer=Mock(),
+        signer=Mock(),
+    )
+    finalize = storage_context.repository.finalize_thread_creation
+
+    with patch.object(
+        storage_context.repository,
+        "finalize_thread_creation",
+        wraps=finalize,
+    ) as finalize_spy:
+        result = await transport.deliver(record)
+
+    assert result.discord_message_id == "307"
+    assert result.initial_ingress_message_id == "307"
+    finalize_spy.assert_called_once_with(
+        discord_message_id="307",
+        discord_thread_id=307,
+        owner_user_id=400,
+    )
+    assert storage_context.repository.conversation_for_thread(307) is not None
+    assert (
+        storage_context.repository.get_ingress_message("307").state
+        == "pending_preflight"
+    )
+    client.fetch_channel.assert_awaited_once_with(307)
     channel.fetch_message.assert_not_awaited()
     starter.create_thread.assert_not_awaited()
     thread.edit.assert_not_awaited()

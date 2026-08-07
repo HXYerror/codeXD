@@ -1982,6 +1982,37 @@ def test_thread_creation_title_is_redacted_bounded_and_only_persists_safe_name(
     }
 
 
+def test_thread_creation_title_redacts_credential_completed_by_truncation(
+    storage_context: StorageContext,
+) -> None:
+    boundary_credential = "ghp_" + "a" * 36
+    prefix = "x" * (68 - len(boundary_credential)) + " "
+    raw_request = prefix + boundary_credential + "zzzz"
+    assert len(prefix + boundary_credential) == 69
+    assert len(raw_request) > 72
+
+    storage_context.repository.request_thread_creation(
+        discord_message_id="307",
+        content_hash="content",
+        attachment_manifest_hash="attachments",
+        first_request_text=raw_request,
+        has_image_attachment=False,
+        project_id=storage_context.project.id,
+        discord_guild_id=100,
+        discord_channel_id=200,
+        owner_user_id=400,
+        boot_id="boot",
+    )
+
+    outbox = storage_context.repository.claim_outbox(worker_id="worker")
+    assert outbox is not None
+    payload = json.loads(outbox.payload_json)
+    assert boundary_credential not in payload["name"]
+    assert "ghp_" not in payload["name"]
+    assert "<redacted>" in payload["name"]
+    assert raw_request not in outbox.payload_json
+
+
 def test_permanent_thread_creation_failure_rejects_ingress(
     storage_context: StorageContext,
 ) -> None:

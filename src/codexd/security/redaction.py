@@ -14,6 +14,7 @@ _SECRET_NAME = re.compile(
     r"private[_-]?key|credential|authorization|signature)",
     re.IGNORECASE,
 )
+_ASSIGNMENT_OPERATOR = r"(?::=|\+=|-=|\*=|/=|%=|\?=|\.=|=|:)"
 _AUTH_HEADER = re.compile(
     r"(?i)\b(?P<header>authorization|proxy-authorization)\s*:\s*"
     r"(?P<scheme>[A-Za-z][A-Za-z0-9_-]*)\s+(?P<value>\S+)"
@@ -33,7 +34,7 @@ _SECRET_ASSIGNMENT = re.compile(
     r"(?i)(?P<prefix>[\"']?"
     r"(?=[A-Za-z0-9_.-]*(?:token|secret|password|passwd|api[_-]?key|"
     r"access[_-]?key|private[_-]?key|credential|authorization|signature))"
-    r"[A-Za-z_][A-Za-z0-9_.-]*[\"']?\s*[:=]\s*)"
+    rf"[A-Za-z_][A-Za-z0-9_.-]*[\"']?\s*{_ASSIGNMENT_OPERATOR}\s*)"
     r"(?P<value>\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;&]+)"
 )
 _SECRET_FLAG = re.compile(
@@ -42,10 +43,10 @@ _SECRET_FLAG = re.compile(
     r"(?P<value>\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;&]+)"
 )
 _SESSION_COOKIE_ASSIGNMENT = re.compile(
-    r"(?i)(?P<prefix>[\"']?"
-    r"(?:session(?:[._-]?(?:id|key|token|cookie))?|"
+    r"(?i)(?P<prefix>(?<![A-Za-z0-9_.-])[\"']?"
+    r"(?:PHPSESSID|connect\.sid|session(?:[._-]?(?:id|key|token|cookie))?|"
     r"(?:auth[._-]?)?cookies?(?:[._-]?(?:id|key|token|value|session))?)"
-    r"[\"']?\s*[:=]\s*)"
+    rf"[\"']?\s*{_ASSIGNMENT_OPERATOR}\s*)"
     r"(?P<value>\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;&]+)"
 )
 _TOKEN_PATTERNS = (
@@ -56,23 +57,23 @@ _TOKEN_PATTERNS = (
     ),
     re.compile(r"\bmfa\.[A-Za-z0-9_-]{20,}\b"),
     re.compile(
-        r"(?<![A-Za-z0-9_])ghp_[A-Za-z0-9]{36}(?![A-Za-z0-9_])"
+        r"(?<![A-Za-z0-9_])ghp_[A-Za-z0-9]{36,}(?![A-Za-z0-9_])"
     ),
     re.compile(
         r"(?<![A-Za-z0-9_])github_pat_[A-Za-z0-9]{22}_"
-        r"[A-Za-z0-9]{59}(?![A-Za-z0-9_])"
+        r"[A-Za-z0-9]{59,}(?![A-Za-z0-9_])"
     ),
     re.compile(
-        r"(?<![A-Za-z0-9-])xox[baprs]-[A-Za-z0-9-]{10,198}"
-        r"[A-Za-z0-9](?![A-Za-z0-9-])"
+        r"(?<![A-Za-z0-9-])(?:xox[baprs]|xapp|xoxe(?:\.xox[bp])?)-"
+        r"[A-Za-z0-9-]{10,}[A-Za-z0-9](?![A-Za-z0-9-])"
     ),
-    re.compile(r"(?<![A-Za-z0-9])(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Za-z0-9])"),
+    re.compile(r"(?<![A-Za-z0-9])(?:AKIA|ASIA)[A-Z0-9]{16,}(?![A-Za-z0-9])"),
     re.compile(
-        r"(?<![A-Za-z0-9_-])AIza[A-Za-z0-9_-]{35}(?![A-Za-z0-9_-])"
+        r"(?<![A-Za-z0-9_-])AIza[A-Za-z0-9_-]{35,}(?![A-Za-z0-9_-])"
     ),
     re.compile(
         r"(?<![A-Za-z0-9_])(?:sk|rk)_(?:live|test)_"
-        r"[A-Za-z0-9]{16,200}(?![A-Za-z0-9_])"
+        r"[A-Za-z0-9]{16,}(?![A-Za-z0-9_])"
     ),
 )
 _URL = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
@@ -82,6 +83,19 @@ _HOME_PATHS = (
     re.compile(r"(?i)\b[A-Z]:\\Users\\[^\\\s]+"),
 )
 _CONTROL_CHARACTERS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+_DEFAULT_IGNORABLE_RANGES = (
+    (0x034F, 0x034F),
+    (0x115F, 0x1160),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
+    (0x2065, 0x2065),
+    (0x2800, 0x2800),
+    (0x3164, 0x3164),
+    (0xFE00, 0xFE0F),
+    (0xFFA0, 0xFFA0),
+    (0xFFF0, 0xFFF8),
+    (0xE0000, 0xE0FFF),
+)
 _DISCORD_ENTITY_MENTION = re.compile(r"<(?:@!?\d+|@&\d+|#\d+)>")
 _DISCORD_BROADCAST_MENTION = re.compile(r"@(?:everyone|here)\b", re.IGNORECASE)
 _NON_TEXT_SUMMARY = "[non-text input]"
@@ -142,9 +156,7 @@ def redacted_summary(
     summary = " ".join(redact_text(value, project_root=project_root).split())
     if not summary:
         return _NON_TEXT_SUMMARY
-    if len(summary) <= max_chars:
-        return summary
-    return f"{summary[: max_chars - 3].rstrip()}..."
+    return _truncate_summary(summary, max_chars)
 
 
 def safe_thread_title_summary(
@@ -160,13 +172,16 @@ def safe_thread_title_summary(
     safe_summary = " ".join(_strip_discord_mentions(redacted).split())
     if not _has_visible_character(safe_summary):
         return "新任务"
-    truncated = redacted_summary(
-        safe_summary,
-        project_root=project_root,
-        max_chars=_THREAD_TITLE_SUMMARY_MAX_CHARS,
+    truncated = _truncate_summary(safe_summary, _THREAD_TITLE_SUMMARY_MAX_CHARS)
+    redacted_again = redact_text(truncated, project_root=project_root)
+    bounded_again = _truncate_summary(
+        " ".join(redacted_again.split()),
+        _THREAD_TITLE_SUMMARY_MAX_CHARS,
     )
     final_summary = " ".join(
-        _strip_discord_mentions(_strip_unsafe_unicode_controls(truncated)).split()
+        _strip_discord_mentions(
+            _strip_unsafe_unicode_controls(bounded_again)
+        ).split()
     )
     return final_summary if _has_visible_character(final_summary) else "新任务"
 
@@ -182,7 +197,8 @@ def redact_value(value: Any, *, project_root: Path | None = None) -> Any:
         return {
             key: (
                 "<redacted>"
-                if isinstance(key, str) and _SECRET_NAME.search(key)
+                if isinstance(key, str)
+                and _SECRET_NAME.search(_strip_unsafe_unicode_controls(key))
                 else redact_value(item, project_root=project_root)
             )
             for key, item in value.items()
@@ -192,10 +208,10 @@ def redact_value(value: Any, *, project_root: Path | None = None) -> Any:
 
 def redact_diff(value: str, *, project_root: Path) -> str:
     root_variants = {
-        str(project_root).rstrip("/\\"),
-        project_root.as_posix().rstrip("/"),
+        _strip_unsafe_unicode_controls(str(project_root).rstrip("/\\")),
+        _strip_unsafe_unicode_controls(project_root.as_posix().rstrip("/")),
     }
-    redacted = value
+    redacted = _strip_unsafe_unicode_controls(value)
     for root in sorted(root_variants, key=len, reverse=True):
         if not root:
             continue
@@ -219,40 +235,56 @@ def _strip_discord_mentions(value: str) -> str:
     return _DISCORD_BROADCAST_MENTION.sub(" ", without_entities)
 
 
+def _truncate_summary(value: str, max_chars: int) -> str:
+    if len(value) <= max_chars:
+        return value
+    return f"{value[: max_chars - 3].rstrip()}..."
+
+
 def _strip_unsafe_unicode_controls(value: str) -> str:
-    without_controls = _CONTROL_CHARACTERS.sub("", value)
-    without_formats = "".join(
+    candidates = "".join(
         character
-        for character in without_controls
-        if unicodedata.category(character) != "Cf" or character == "\u200d"
+        for character in _CONTROL_CHARACTERS.sub("", value)
+        if character == "\u200d"
+        or _variation_selector(character)
+        or not _default_ignorable(character)
     )
     return "".join(
         character
-        for index, character in enumerate(without_formats)
-        if character != "\u200d" or _valid_emoji_joiner(without_formats, index)
+        for index, character in enumerate(candidates)
+        if (
+            not _variation_selector(character)
+            or (index > 0 and _emoji_base(candidates[index - 1]))
+        )
+        and (
+            character != "\u200d" or _valid_emoji_joiner(candidates, index)
+        )
     )
 
 
 def _valid_emoji_joiner(value: str, index: int) -> bool:
-    before = _adjacent_emoji_base(value, index, -1)
-    after = _adjacent_emoji_base(value, index, 1)
-    return before is not None and after is not None
-
-
-def _adjacent_emoji_base(value: str, index: int, direction: int) -> str | None:
-    position = index + direction
-    while 0 <= position < len(value) and (
-        _variation_selector(value[position]) or _emoji_modifier(value[position])
+    left = index - 1
+    while left >= 0 and (
+        _variation_selector(value[left]) or _emoji_modifier(value[left])
     ):
-        position += direction
-    if 0 <= position < len(value) and _emoji_base(value[position]):
-        return value[position]
-    return None
+        left -= 1
+    return (
+        left >= 0
+        and _emoji_base(value[left])
+        and index + 1 < len(value)
+        and _emoji_base(value[index + 1])
+    )
 
 
 def _emoji_base(value: str) -> bool:
+    return unicodedata.category(value) == "So" or value in "#*0123456789"
+
+
+def _default_ignorable(value: str) -> bool:
     codepoint = ord(value)
-    return 0x2600 <= codepoint <= 0x27BF or 0x1F000 <= codepoint <= 0x1FAFF
+    return unicodedata.category(value) == "Cf" or any(
+        start <= codepoint <= end for start, end in _DEFAULT_IGNORABLE_RANGES
+    )
 
 
 def _variation_selector(value: str) -> bool:
@@ -264,7 +296,10 @@ def _emoji_modifier(value: str) -> bool:
 
 
 def _has_visible_character(value: str) -> bool:
-    return any(unicodedata.category(character)[0] in {"L", "N", "P", "S"} for character in value)
+    return any(
+        unicodedata.category(character)[0] in {"L", "N", "P", "S"}
+        for character in value
+    )
 
 
 def _redact_basic_auth(match: re.Match[str]) -> str:

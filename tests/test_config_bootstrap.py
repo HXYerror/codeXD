@@ -361,10 +361,55 @@ def test_thread_title_summary_removes_unsafe_unicode_formats() -> None:
     )
 
 
-def test_thread_title_summary_preserves_emoji_zwj_sequences() -> None:
-    value = "repair the 👩‍💻 workflow"
+def test_thread_title_summary_strips_default_ignorables_before_matching(
+    tmp_path: Path,
+) -> None:
+    project_root = tmp_path / "private-project"
+    raw_root = str(project_root)
+    midpoint = len(raw_root) // 2
+    value = (
+        "https://example.invalid/?access_to\u034fken=url-secret "
+        "Authori\u3164zation: Bearer auth-secret "
+        f"{raw_root[:midpoint]}\u115f{raw_root[midpoint:]}"
+    )
+
+    redacted = redact_text(value, project_root=project_root)
+
+    assert "url-secret" not in redacted
+    assert "auth-secret" not in redacted
+    assert raw_root not in redacted
+    assert "<project>" in redacted
+
+
+def test_thread_title_summary_default_ignorables_do_not_create_or_pad_title() -> None:
+    invisible = "\u034f\u115f\u1160\u3164\uffa0\u2800\u2066\ufe0f\U000e0100"
+
+    assert safe_thread_title_summary(invisible, has_image_attachment=True) == "新任务"
+    assert safe_thread_title_summary(invisible * 12 + "x" * 72) == "x" * 72
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        "repair the 👩‍💻 workflow",
+        "repair the 👩🏽‍💻 workflow",
+        "keep ☀️‍☁️ visible",
+        "keep 🐈‍⬛ visible",
+    ),
+)
+def test_thread_title_summary_preserves_structural_emoji_sequences(
+    value: str,
+) -> None:
 
     assert safe_thread_title_summary(value) == value
+
+
+def test_thread_title_summary_requires_immediate_emoji_base_after_zwj() -> None:
+    summary = safe_thread_title_summary("☀\u200d\ufe0f☁")
+
+    assert summary == "☀☁"
+    assert "\u200d" not in summary
+    assert safe_thread_title_summary("A\ufe0f") == "A"
 
 
 def test_thread_title_summary_removes_dangling_zwj_after_truncation() -> None:
@@ -436,12 +481,41 @@ def test_thread_title_summary_redacts_control_interleaved_secret_name() -> None:
 
 
 @pytest.mark.parametrize(
+    "invisible",
+    (
+        "\u034f",
+        "\u115f",
+        "\u1160",
+        "\u2800",
+        "\u3164",
+        "\uffa0",
+        "\U000e007f",
+    ),
+)
+def test_thread_title_summary_redacts_default_ignorable_interleaved_secret_name(
+    invisible: str,
+) -> None:
+    secret = "default-ignorable-secret"
+
+    summary = safe_thread_title_summary(
+        f"OPENAI_API_KE{invisible}Y={secret} fix authentication"
+    )
+
+    assert secret not in summary
+    assert "<redacted>" in summary
+
+
+@pytest.mark.parametrize(
     "credential",
     (
         "ghp_" + "a" * 36,
         "github_pat_" + "a" * 22 + "_" + "b" * 59,
         "xoxb-" + "1234567890-" + "a" * 24,
+        "xapp-" + "1-" + "a" * 24,
+        "xoxe-" + "1-" + "a" * 24,
+        "xoxe.xoxp-" + "1-" + "a" * 24,
         "AKIA" + "A" * 16,
+        "ASIA" + "A" * 16,
         "AIza" + "a" * 35,
         "sk_live_" + "a" * 24,
         "rk_live_" + "a" * 24,
@@ -456,6 +530,12 @@ def test_thread_title_summary_redacts_recognizable_credentials(
     assert "<redacted>" in summary
 
 
+def test_thread_title_summary_preserves_short_github_token_shape() -> None:
+    short_shape = "ghp_" + "a" * 35
+
+    assert safe_thread_title_summary(f"review {short_shape}") == f"review {short_shape}"
+
+
 @pytest.mark.parametrize(
     ("value", "secret"),
     (
@@ -466,6 +546,8 @@ def test_thread_title_summary_redacts_recognizable_credentials(
         ),
         ("session_id=session-assignment-secret", "session-assignment-secret"),
         ("cookie=cookie-assignment-secret", "cookie-assignment-secret"),
+        ("PHPSESSID=php-session-secret", "php-session-secret"),
+        ("connect.sid=express-session-secret", "express-session-secret"),
     ),
 )
 def test_thread_title_summary_redacts_cookie_and_session_values(
@@ -476,6 +558,21 @@ def test_thread_title_summary_redacts_cookie_and_session_values(
 
     assert secret not in summary
     assert "<redacted>" in summary
+
+
+@pytest.mark.parametrize(
+    "operator",
+    (":=", "+=", "-=", "*=", "/=", "%=", "?=", ".="),
+)
+def test_thread_title_summary_redacts_compound_secret_assignments(
+    operator: str,
+) -> None:
+    secret = "compound-assignment-secret"
+
+    summary = safe_thread_title_summary(f"OPENAI_API_KEY{operator}{secret}")
+
+    assert secret not in summary
+    assert f"OPENAI_API_KEY{operator}<redacted>" == summary
 
 
 @pytest.mark.parametrize(
