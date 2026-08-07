@@ -21,7 +21,7 @@ from codexd.application.session_coordinator import ResolvedProject, SessionCoord
 from codexd.config import AppConfig, DiscordConfig, SecurityConfig, load_config
 from codexd.domain.conversations import SandboxProfile, ThreadConfig, ThreadIdentity
 from codexd.domain.ids import canonical_json, sha256_text
-from codexd.domain.turns import InterruptOrigin, TurnImage, TurnInput, TurnSource
+from codexd.domain.turns import InterruptOrigin, TurnImage, TurnInput, TurnSource, TurnState
 from codexd.errors import InvariantError
 from codexd.paths import AppPaths
 from codexd.rendering.discord import (
@@ -729,9 +729,11 @@ async def test_outbox_worker_waits_for_full_final_retry_before_progress_cleanup(
 
 
 @pytest.mark.asyncio
-async def test_recovery_reconciles_progress_fallback_send_before_terminal_cleanup(
+@pytest.mark.parametrize("progress_state", ("retry", "reconciling"))
+async def test_progress_fallback_send_reconciles_before_terminal_cleanup(
     storage_context: StorageContext,
     tmp_path: Path,
+    progress_state: str,
 ) -> None:
     repository = storage_context.repository
     repository.activate_thread_revision(
@@ -862,10 +864,31 @@ async def test_recovery_reconciles_progress_fallback_send_before_terminal_cleanu
         running.delivery_marker,
     )
 
-    recovered_counts = repository.recover_startup(
-        current_boot_id="fallback-progress-recovery-boot"
+    repository.retry_outbox(
+        running.id,
+        lease_owner=running.lease_owner,
+        lease_attempt=running.attempts,
+        error_code="fallback_send_ack_lost",
+        next_attempt_at=0,
     )
-    assert recovered_counts["reconciling_outbox"] == 1
+    if progress_state == "reconciling":
+        with storage_context.store.transaction() as connection:
+            connection.execute(
+                "UPDATE discord_outbox SET state = 'reconciling' WHERE id = ?",
+                (running.id,),
+            )
+    repository.terminal_turn(
+        turn.id,
+        target=TurnState.INTERRUPTED,
+        terminal_code="fallback_progress_ack_lost",
+    )
+    preserved = storage_context.store.query_one(
+        "SELECT state FROM discord_outbox WHERE id = ?",
+        (running.id,),
+    )
+    assert preserved is not None
+    assert preserved["state"] == progress_state
+
     worker = OutboxWorker(
         repository=repository,
         transport=transport,

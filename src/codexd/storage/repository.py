@@ -4505,11 +4505,18 @@ class Repository:
             if changed != 1:
                 raise ConflictError("outbox delivery lease was lost")
 
+            progress_cleanup_turn_id = _terminal_progress_cleanup_turn_id(
+                connection,
+                outbox=outbox,
+            )
             try:
                 payload = json.loads(str(outbox["payload_json"]))
             except json.JSONDecodeError:
                 payload = {}
-            turn_id = payload.get("turn_id") if isinstance(payload, dict) else None
+            payload_turn_id = (
+                payload.get("turn_id") if isinstance(payload, dict) else None
+            )
+            turn_id = progress_cleanup_turn_id or payload_turn_id
             scope = None
             if isinstance(turn_id, str):
                 scope = connection.execute(
@@ -4524,7 +4531,11 @@ class Repository:
                     """,
                     (turn_id,),
                 ).fetchone()
-            if scope is None and str(outbox["destination_key"]).startswith("thread:"):
+            if (
+                scope is None
+                and progress_cleanup_turn_id is None
+                and str(outbox["destination_key"]).startswith("thread:")
+            ):
                 thread_id = str(outbox["destination_key"]).partition(":")[2]
                 scope = connection.execute(
                     """
@@ -4551,22 +4562,21 @@ class Repository:
                 if scope is not None and scope["schedule_id"] is not None
                 else None
             )
-            if isinstance(payload, dict) and payload.get("kind") == (
-                "turn_progress_delete"
-            ):
-                if (
-                    isinstance(turn_id, str)
-                    and outbox["dedupe_key"]
-                    == f"turn:{turn_id}:progress:delete"
-                ):
-                    connection.execute(
-                        """
-                        UPDATE turn_progress_views
-                        SET cleanup_state = 'delete_failed', updated_at = ?
-                        WHERE turn_id = ? AND cleanup_state = 'delete_pending'
-                        """,
-                        (now, turn_id),
-                    )
+            if progress_cleanup_turn_id is not None:
+                connection.execute(
+                    """
+                    UPDATE turn_progress_views
+                    SET cleanup_state = 'delete_failed', updated_at = ?
+                    WHERE turn_id = ?
+                      AND destination_key = ?
+                      AND cleanup_state = 'delete_pending'
+                    """,
+                    (
+                        now,
+                        progress_cleanup_turn_id,
+                        outbox["destination_key"],
+                    ),
+                )
                 _upsert_incident(
                     connection,
                     severity="error",
@@ -5979,6 +5989,39 @@ def _apply_progress_cleanup_after_ack(
             payload=payload,
             now=now,
         )
+
+
+def _terminal_progress_cleanup_turn_id(
+    connection: sqlite3.Connection,
+    *,
+    outbox: sqlite3.Row,
+) -> str | None:
+    if outbox["operation"] != "delete":
+        return None
+    match = re.fullmatch(
+        r"turn:([^:]+):progress:delete",
+        str(outbox["dedupe_key"]),
+    )
+    if match is None or outbox["depends_on_outbox_id"] is None:
+        return None
+    turn_id = match.group(1)
+    dependency = connection.execute(
+        """
+        SELECT operation, state, destination_key, dedupe_key
+        FROM discord_outbox
+        WHERE id = ?
+        """,
+        (outbox["depends_on_outbox_id"],),
+    ).fetchone()
+    if (
+        dependency is None
+        or dependency["operation"] != "send"
+        or dependency["state"] != "sent"
+        or dependency["destination_key"] != outbox["destination_key"]
+        or dependency["dedupe_key"] != f"turn:{turn_id}:final"
+    ):
+        return None
+    return turn_id
 
 
 def _enqueue_terminal_progress_cleanup(

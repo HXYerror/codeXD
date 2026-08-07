@@ -244,6 +244,7 @@ def insert_progress_update(
         connection,
         coalesce_key=coalesce_key,
         now=now,
+        states=("pending",),
     )
     outbox_id = new_id()
     connection.execute(

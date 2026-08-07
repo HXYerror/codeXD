@@ -131,6 +131,74 @@ def _terminal_final_with_remote_progress(
         )
 
 
+def _terminal_schedule_final_with_remote_progress(
+    storage_context: StorageContext,
+    suffix: str,
+) -> tuple[TurnRecord, OutboxRecord, str]:
+    repository = storage_context.repository
+    _activate_schedule_target(storage_context, suffix)
+    schedules = ScheduleRepository(storage_context.store)
+    schedule = schedules.create(
+        conversation_id=storage_context.conversation.id,
+        name=suffix,
+        kind=ScheduleKind.CRON,
+        expression="0 * * * *",
+        timezone="UTC",
+        misfire_policy=MisfirePolicy.LATEST,
+        prompt_text=suffix,
+        next_due_at=1,
+        created_by_user_id=400,
+    )
+    materialized = schedules.materialize(
+        schedule_id=schedule.id,
+        occurrence_key=f"{suffix}-occurrence",
+        trigger_kind="timer",
+        scheduled_for=1,
+        scheduled_local="1970-01-01T00:00:00+00:00",
+        next_due_at=3_600_001,
+        expected_version=1,
+    )
+    assert materialized.turn_id is not None
+    turn = repository.get_turn(materialized.turn_id)
+    lease = repository.create_runtime_lease(
+        scope_kind="project",
+        scope_key=storage_context.project.id,
+        project_id=storage_context.project.id,
+        environment_hash=f"{suffix}-environment",
+    )
+    repository.mark_runtime_ready(
+        lease.id,
+        sdk_version="sdk",
+        runtime_version="runtime",
+        capability_hash="capabilities",
+    )
+    repository.claim_turn(
+        turn.id,
+        runtime_lease_id=lease.id,
+        runtime_generation=lease.generation,
+    )
+    repository.mark_turn_running(turn.id, f"{suffix}-provider-turn")
+    repository.terminal_turn(
+        turn.id,
+        target=TurnState.COMPLETED,
+        terminal_code=f"{suffix}-terminal",
+    )
+    while True:
+        claimed = repository.claim_outbox(worker_id=f"{suffix}-worker")
+        assert claimed is not None
+        payload = json.loads(claimed.payload_json)
+        if payload.get("kind") == "turn_final":
+            return turn, claimed, schedule.id
+        assert payload.get("kind") == "turn_progress"
+        repository.ack_outbox(
+            claimed.id,
+            lease_owner=claimed.lease_owner,
+            lease_attempt=claimed.attempts,
+            discord_message_id=f"{suffix}-progress-message",
+            turn_progress_id=turn.id,
+        )
+
+
 def test_migration_integrity(storage_context: StorageContext) -> None:
     assert storage_context.store.integrity_check() == "ok"
     assert storage_context.store.foreign_key_check() == ()
@@ -2599,6 +2667,81 @@ def test_permanent_progress_cleanup_failure_preserves_terminal_result(
             (f"turn:{turn.id}:final",),
         )
     ) == 1
+
+
+def test_tampered_progress_cleanup_kind_isolated_from_terminal_delivery(
+    storage_context: StorageContext,
+) -> None:
+    repository = storage_context.repository
+    turn, final, schedule_id = _terminal_schedule_final_with_remote_progress(
+        storage_context,
+        "cleanup-tampered-kind",
+    )
+    repository.ack_outbox(
+        final.id,
+        lease_owner=final.lease_owner,
+        lease_attempt=final.attempts,
+    )
+    cleanup = repository.claim_outbox(worker_id="cleanup-tampered-worker")
+    assert cleanup is not None and cleanup.operation == "delete"
+    final_before = storage_context.store.query_one(
+        "SELECT state, payload_json FROM discord_outbox WHERE id = ?",
+        (final.id,),
+    )
+    assert final_before is not None
+    with storage_context.store.transaction() as connection:
+        connection.execute(
+            "UPDATE discord_outbox SET payload_json = ? WHERE id = ?",
+            (
+                canonical_json({"kind": "turn_final", "turn_id": turn.id}),
+                cleanup.id,
+            ),
+        )
+
+    repository.fail_outbox_permanently(
+        cleanup.id,
+        lease_owner=cleanup.lease_owner,
+        lease_attempt=cleanup.attempts,
+        error_code="turn_progress_delete_target_invalid",
+    )
+
+    assert repository.get_turn(turn.id).state is TurnState.COMPLETED
+    assert repository.get_conversation(turn.conversation_id).state.value == "active"
+    assert ScheduleRepository(storage_context.store).get(schedule_id).state is (
+        ScheduleState.ACTIVE
+    )
+    final_after = storage_context.store.query_one(
+        "SELECT state, payload_json FROM discord_outbox WHERE id = ?",
+        (final.id,),
+    )
+    assert final_after is not None
+    assert dict(final_after) == dict(final_before)
+    failed_view = storage_context.store.query_one(
+        "SELECT cleanup_state, discord_message_id FROM turn_progress_views WHERE turn_id = ?",
+        (turn.id,),
+    )
+    assert failed_view is not None
+    assert failed_view["cleanup_state"] == "delete_failed"
+    assert failed_view["discord_message_id"] is not None
+    incidents = storage_context.store.query_all(
+        "SELECT code, turn_id FROM incidents WHERE conversation_id = ?",
+        (turn.conversation_id,),
+    )
+    assert [dict(incident) for incident in incidents] == [
+        {
+            "code": "discord_progress_delete_permanent",
+            "turn_id": turn.id,
+        }
+    ]
+    assert storage_context.store.query_one(
+        "SELECT 1 FROM audit_log WHERE conversation_id = ? "
+        "AND action = 'conversation.blocked'",
+        (turn.conversation_id,),
+    ) is None
+    assert storage_context.store.query_one(
+        "SELECT 1 FROM discord_outbox WHERE dedupe_key = ?",
+        (f"conversation:{turn.conversation_id}:delivery-blocked",),
+    ) is None
 
 
 def test_terminal_progress_reconciles_running_send_before_terminal_revision(
