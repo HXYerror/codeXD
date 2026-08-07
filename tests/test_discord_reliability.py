@@ -521,6 +521,80 @@ def test_expanded_subagent_card_shows_work_without_activity_noise() -> None:
 
 
 @pytest.mark.asyncio
+async def test_prompt_reaction_converges_to_terminal_state_idempotently() -> None:
+    waiting = Mock(emoji="⏳", me=True)
+    user_check = Mock(emoji="✅", me=False)
+    message = Mock(spec=discord.Message)
+    message.id = 501
+    message.reactions = [waiting, user_check]
+    message.remove_reaction = AsyncMock()
+    message.add_reaction = AsyncMock()
+    thread = Mock(spec=discord.Thread)
+    thread.archived = False
+    thread.locked = False
+    thread.fetch_message = AsyncMock(return_value=message)
+    client = Mock(spec=discord.Client)
+    client.user = Mock(id=999)
+    client.get_channel.return_value = thread
+    payload = canonical_json(
+        {
+            "kind": "prompt_reaction",
+            "turn_id": "turn",
+            "message_id": "501",
+            "state": "completed",
+        }
+    )
+
+    result = await DiscordOutboxTransport(
+        client=client,
+        repository=Mock(),
+        renderer=Mock(),
+        signer=ComponentSigner(b"reaction-test".ljust(32, b"-")),
+    ).deliver(
+        OutboxRecord(
+            id="prompt-reaction",
+            destination_key="thread:300",
+            operation="edit",
+            payload_json=payload,
+            delivery_marker="prompt-reaction",
+            state="pending",
+            attempts=0,
+            lease_owner="worker",
+        )
+    )
+
+    assert result.discord_message_id == "501"
+    message.remove_reaction.assert_awaited_once_with("⏳", client.user)
+    message.add_reaction.assert_awaited_once_with("✅")
+
+    terminal_message = Mock(spec=discord.Message)
+    terminal_message.id = 501
+    terminal_message.reactions = [Mock(emoji="✅", me=True)]
+    terminal_message.remove_reaction = AsyncMock()
+    terminal_message.add_reaction = AsyncMock()
+    thread.fetch_message.return_value = terminal_message
+    await DiscordOutboxTransport(
+        client=client,
+        repository=Mock(),
+        renderer=Mock(),
+        signer=ComponentSigner(b"reaction-test".ljust(32, b"-")),
+    ).deliver(
+        OutboxRecord(
+            id="prompt-reaction-retry",
+            destination_key="thread:300",
+            operation="edit",
+            payload_json=payload,
+            delivery_marker="prompt-reaction",
+            state="reconciling",
+            attempts=1,
+            lease_owner="worker",
+        )
+    )
+    terminal_message.remove_reaction.assert_not_awaited()
+    terminal_message.add_reaction.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_deleted_task_card_is_replaced_without_pending_history_scan() -> None:
     key = b"task-card-delete-key".ljust(32, b"-")
     signer = ComponentSigner(key)

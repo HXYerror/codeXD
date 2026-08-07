@@ -1461,6 +1461,82 @@ def test_ingress_completion_is_atomic_with_turn_enqueue(
     assert ingress is not None
     assert ingress["state"] == "ready"
     assert ingress["turn_id"] == turn.id
+    reaction = storage_context.store.query_one(
+        """
+        SELECT destination_key, operation, state, payload_json
+        FROM discord_outbox
+        WHERE coalesce_key = ?
+        """,
+        (f"turn:{turn.id}:prompt-reaction",),
+    )
+    assert reaction is not None
+    assert reaction["destination_key"] == (
+        f"thread:{storage_context.conversation.discord_thread_id}"
+    )
+    assert reaction["operation"] == "edit"
+    assert reaction["state"] == "pending"
+    assert json.loads(str(reaction["payload_json"])) == {
+        "kind": "prompt_reaction",
+        "message_id": "atomic-message",
+        "state": "waiting",
+        "turn_id": turn.id,
+    }
+
+    repository.terminal_turn(
+        turn.id,
+        target=TurnState.CANCELLED,
+        terminal_code="test_cancelled",
+    )
+    terminal_reactions = storage_context.store.query_all(
+        """
+        SELECT state, payload_json
+        FROM discord_outbox
+        WHERE coalesce_key = ?
+        ORDER BY enqueue_sequence
+        """,
+        (f"turn:{turn.id}:prompt-reaction",),
+    )
+    assert [
+        (row["state"], json.loads(str(row["payload_json"]))["state"])
+        for row in terminal_reactions
+    ] == [("superseded", "waiting"), ("pending", "failed")]
+
+
+def test_starter_prompt_reaction_targets_parent_channel(
+    storage_context: StorageContext,
+) -> None:
+    message_id = str(storage_context.conversation.discord_thread_id)
+    claimed, _turn_id = storage_context.repository.claim_ingress_message(
+        discord_message_id=message_id,
+        content_hash="content",
+        attachment_manifest_hash="attachments",
+        project_id=storage_context.project.id,
+        conversation_id=storage_context.conversation.id,
+        discord_guild_id=storage_context.conversation.discord_guild_id,
+        discord_channel_id=storage_context.conversation.discord_parent_channel_id,
+        boot_id="boot",
+    )
+    assert claimed
+    turn = storage_context.repository.enqueue_turn(
+        conversation_id=storage_context.conversation.id,
+        source=TurnSource.DISCORD,
+        turn_input=TurnInput(text="starter"),
+        input_message_id=message_id,
+        ingress_message_id=message_id,
+    )
+
+    reaction = storage_context.store.query_one(
+        """
+        SELECT destination_key
+        FROM discord_outbox
+        WHERE coalesce_key = ?
+        """,
+        (f"turn:{turn.id}:prompt-reaction",),
+    )
+    assert reaction is not None
+    assert reaction["destination_key"] == (
+        f"channel:{storage_context.conversation.discord_parent_channel_id}"
+    )
 
 
 def test_ingress_enqueue_rolls_back_when_snapshot_persistence_fails(

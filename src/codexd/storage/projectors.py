@@ -14,6 +14,7 @@ from codexd.domain.turns import InterruptOrigin, TurnState, assert_turn_transiti
 from codexd.errors import NotFoundError, SecurityError, StorageError
 from codexd.storage.progress import (
     insert_progress_update,
+    insert_prompt_reaction_update,
     supersede_coalesced_outbox,
 )
 from codexd.storage.sqlite import SQLiteStore
@@ -1256,6 +1257,16 @@ class ProjectingEventSink:
             sequence,
             target,
             now,
+        )
+        insert_prompt_reaction_update(
+            connection,
+            turn_id=str(scope["id"]),
+            input_message_id=scope["input_message_id"],
+            discord_thread_id=scope["discord_thread_id"],
+            discord_parent_channel_id=scope["discord_parent_channel_id"],
+            state="completed" if target is TurnState.COMPLETED else "failed",
+            now=now,
+            event_sequence=sequence,
         )
         progress_outbox_id = self._project_progress(
             connection,

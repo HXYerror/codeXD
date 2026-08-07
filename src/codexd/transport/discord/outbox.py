@@ -38,6 +38,11 @@ from codexd.transport.discord.presentation import (
 )
 
 logger = logging.getLogger(__name__)
+_PROMPT_REACTIONS = {
+    "waiting": "⏳",
+    "completed": "✅",
+    "failed": "❌",
+}
 
 
 @dataclass(frozen=True)
@@ -269,6 +274,8 @@ class DiscordOutboxTransport:
             raise DeliveryError("payload_invalid", permanent=True)
         channel = await self._destination(record.destination_key)
         try:
+            if payload.get("kind") == "prompt_reaction":
+                return await self._deliver_prompt_reaction(channel, payload)
             if payload.get("kind") == "create_thread":
                 return await self._deliver_create_thread(channel, payload)
             if payload.get("kind") == "thread_rename":
@@ -378,6 +385,32 @@ class DiscordOutboxTransport:
             discord_message_id=str(thread.id),
             initial_ingress_message_id=str(starter_id),
         )
+
+    async def _deliver_prompt_reaction(
+        self,
+        channel: discord.TextChannel | discord.Thread,
+        payload: dict[str, object],
+    ) -> DeliveryResult:
+        message_id = _snowflake(payload.get("message_id"), "message_id")
+        state = payload.get("state")
+        if not isinstance(state, str) or state not in _PROMPT_REACTIONS:
+            raise DeliveryError("prompt_reaction_payload_invalid", permanent=True)
+        bot_user = self._client.user
+        if bot_user is None:
+            raise DeliveryError("discord_bot_identity_unavailable", permanent=False)
+        message = await channel.fetch_message(message_id)
+        own_reactions = {
+            str(reaction.emoji)
+            for reaction in message.reactions
+            if reaction.me
+        }
+        desired = _PROMPT_REACTIONS[state]
+        for emoji in _PROMPT_REACTIONS.values():
+            if emoji != desired and emoji in own_reactions:
+                await message.remove_reaction(emoji, bot_user)
+        if desired not in own_reactions:
+            await message.add_reaction(desired)
+        return DeliveryResult(str(message.id))
 
     async def _existing_thread(self, thread_id: int) -> discord.Thread | None:
         cached = self._client.get_channel(thread_id)

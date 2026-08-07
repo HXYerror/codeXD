@@ -44,6 +44,7 @@ from codexd.security.redaction import redacted_summary
 from codexd.storage.progress import (
     insert_initial_progress,
     insert_progress_update,
+    insert_prompt_reaction_update,
     supersede_coalesced_outbox,
 )
 from codexd.storage.records import (
@@ -2713,6 +2714,18 @@ class Repository:
                     now,
                 ),
             )
+            if ingress_message_id is not None:
+                insert_prompt_reaction_update(
+                    connection,
+                    turn_id=turn_id,
+                    input_message_id=input_message_id,
+                    discord_thread_id=conversation["discord_thread_id"],
+                    discord_parent_channel_id=conversation[
+                        "discord_parent_channel_id"
+                    ],
+                    state="waiting",
+                    now=now,
+                )
             progress_outbox_id = insert_initial_progress(
                 connection,
                 turn_id=turn_id,
@@ -3975,6 +3988,16 @@ class Repository:
         ).fetchone()
         assert event is not None
         sequence = int(event["sequence"])
+        insert_prompt_reaction_update(
+            connection,
+            turn_id=turn_id,
+            input_message_id=scope["input_message_id"],
+            discord_thread_id=scope["discord_thread_id"],
+            discord_parent_channel_id=scope["discord_parent_channel_id"],
+            state="completed" if target is TurnState.COMPLETED else "failed",
+            now=now,
+            event_sequence=sequence,
+        )
         note = f"Turn {target.value}: `{terminal_code}`."
         projection = connection.execute(
             "SELECT plain_text FROM message_projections WHERE turn_id = ?",

@@ -3638,6 +3638,22 @@ link preview；codexD 自己构造的显式 Embed 使用独立 message，因此�
 约束。所有显式 Embed 字段先做 mention suppression 和长度约束。delivery marker
 继续留在 message content 中供 crash reconciliation 使用，不依赖 Embed 展示状态。
 
+### 13.5.2 用户请求 reaction 状态
+
+沿用 claudeD 当前实际行为时，emoji 是用户请求消息上的被动状态，不是可点击 Action：
+
+- 只有通过 ACL、routing、attachment preflight 并 durable enqueue 的 Discord 用户消息
+  才进入 reaction lifecycle；Bot 输出、progress、TaskCard、Schedule 和 slash command
+  不逐条添加 reaction；
+- durable accepted/queued 显示 Bot 自己的 `⏳`；
+- Turn `completed` 收敛为 `✅`；
+- `failed/cancelled/interrupted` 收敛为 `❌`；
+- 不注册 reaction listener，不把用户点击 reaction 解释为命令；
+- 更新只移除 Bot 自己的 `⏳/✅/❌`，不清理用户添加的同 emoji；
+- reaction 更新使用同一 durable outbox 的独立 coalesce key；远端状态检查后只执行缺失的
+  add/remove，因此重试与 crash reconciliation 幂等；
+- reaction REST 失败只重试/dead-letter 并记录 incident，不改变 Codex Turn 的真实终态。
+
 ### 13.6 Markdown 与 Discord 限制
 
 切分优先级：
@@ -3735,24 +3751,24 @@ command label 或未知 event 猜测子 Agent。
 默认 collapsed：
 
 ```text
-▶ Agent · spawnAgent · in progress · 1m 12s
-Receivers: 1
+⚙️ Codex subagent · agent-1
+State: running
 [展开]
 ```
 
 expanded：
 
 ```text
-▼ Agent · spawnAgent · in progress · 1m 12s
-From: main → agent-1
-agent-1: running · Running targeted tests
-Model / effort: ... (if reported)
+⚙️ Codex subagent · agent-1
+started · reviewer · Review storage recovery behavior
+Agents
+• agent-1 · running · reviewer · Review storage recovery behavior
 [收起]
 ```
 
 示例中的 `agent-1` 是首次观察时分配的本地稳定 ordinal；尾部状态文字只能来自
-public `CollabAgentState.message` 的 bounded/redacted 结果，缺失或不安全时省略，
-绝不当作 SDK 提供了 task title。
+public `CollabAgentState.message`，或 identity-checked child Thread metadata 的
+bounded/redacted 结果；缺失或不安全时省略，绝不把完整 prompt 当作 task title。
 
 规则：
 
@@ -3760,8 +3776,12 @@ public `CollabAgentState.message` 的 bounded/redacted 结果，缺失或不安�
 - `collabAgentToolCall` 可包含多个 `receiverThreadIds` 与 `agentsStates`；卡片
   汇总 operation，expanded view 从 `task_projection_agents` 展示各 agent；
 - `subAgentActivity.kind=started|interacted|interrupted` 优先更新能用正式
-  agent thread ID 关联的 card；若 provider 没有发送父 `collabAgentToolCall`，则按
-  正式 thread ID 聚合到该 Turn 唯一的 `Codex subagents` card，不以名称/文本猜关联；
+  agent thread ID 关联的 card；若 provider 没有发送父 `collabAgentToolCall`，则每个
+  正式 subagent thread ID 创建一张稳定的 `Codex subagent · agent-N` card，不以
+  名称/文本猜关联；
+- 首次看到 activity 时可以通过 public `thread/read(include_turns=false)` 读取同 session
+  的 child Thread metadata；只有 identity 校验后的 `agentRole` 和 bounded/redacted
+  `preview` 进入卡片安全摘要，原始 child thread ID、完整 prompt 和 thread path 不持久化；
 - collab tool 精确识别
   `spawnAgent|sendInput|resumeAgent|wait|closeAgent`；`wait` 是内部协作轮询，
   不创建独立 TaskCard，避免连续相同卡片占满消息流；agent terminal state 使用 SDK
@@ -3778,10 +3798,12 @@ public `CollabAgentState.message` 的 bounded/redacted 结果，缺失或不安�
   revision；重复 interaction 幂等；
 - update 使用 `coalesce_key=task-card:{task_projection_id}`，progress 可节流，
   terminal revision 立即发送且不能被旧 progress supersede；
-- activity-only aggregate 的新增 agent 和状态都原位 edit 同一 message；Turn terminal
-  时把仍未终态的 task/agent 一次性收敛为 completed/errored/interrupted；
-- expanded detail 只显示公开、脱敏、bounded summary，不显示 raw child prompt、
-  hidden reasoning、完整 provider thread ID 或无限 tool transcript；
+- activity-only 的同一 Agent 后续状态原位 edit 自己的 message；不同 Agent 各自一张
+  可折叠卡片；Turn terminal 时把仍未终态的 task/agent 一次性收敛为
+  completed/errored/interrupted；
+- expanded detail 只显示公开、脱敏、bounded summary；允许 identity-checked public
+  Thread preview 的单行脱敏摘要，但不显示完整/raw child prompt、hidden reasoning、
+  完整 provider thread ID 或无限 tool transcript；
 - parent/child relation 只有 provider 正式字段存在时才展示；
 - renderer/daemon 重启从 `task_projections + task_card_views` 重建同一状态；
 - 原 Discord message 被删时发送 replacement card 并原子更新 message ID，
@@ -5021,6 +5043,9 @@ Command intent：
 | Discord gateway disconnect during 30-minute Turn | Turn 继续，重连补发 |
 | Discord REST 500 | outbox retry，不重跑 |
 | Discord send 成功、ack transaction 前 kill | reconciliation 或可识别的 at-least-once duplicate |
+| prompt `⏳` add 成功、ack 前 kill | retry 检查 Bot 自己的 reaction，保持单个 `⏳` |
+| terminal reaction 更新中途 kill | retry 收敛为唯一 `✅` 或 `❌`，不删除用户 reaction |
+| reaction permission denied | reaction outbox dead-letter + incident；Turn 继续并保留真实终态 |
 | Discord thread create 成功、mapping commit 前 kill | 用 starter message reconcile 唯一 thread；不重复 Conversation |
 | main Discord thread auto-archived during quiet Turn | unarchive dependency sent 后再投递 final |
 | codexD kill -9 during Turn | restart 后 Turn interrupted，thread retained |
@@ -5180,8 +5205,9 @@ Windows：
 - 只有正式 `collabAgentToolCall` / `subAgentActivity` Item 创建或更新 TaskCard；
 - `spawnAgent/sendInput/resumeAgent/closeAgent` operation mapping；重复 `wait` 不创建卡片；
 - 一个 collab Item 的多个 receiver/agent-state 各自持久化并聚合显示；
-- activity-only 的多个正式 subagent thread-ID 聚合进同一 Turn card，重复 activity
-  只 edit 原卡；
+- activity-only 的每个正式 subagent thread-ID 各自创建一张卡，重复 activity 只 edit
+  该 Agent 原卡；
+- 展开卡片显示 identity-checked child Thread 的 bounded/redacted role + preview；
 - Turn terminal 收敛未终态 task/agent，不留下永久 running card；
 - assistant 文本、command label、unknown Item 不触发 task 推断；
 - 初始 card collapsed，展开/收起只 edit 同一 Discord message；

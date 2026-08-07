@@ -6,6 +6,8 @@ from collections.abc import Sequence
 
 from codexd.domain.ids import canonical_json, new_id
 
+_PROMPT_REACTION_STATES = frozenset({"waiting", "completed", "failed"})
+
 
 def supersede_coalesced_outbox(
     connection: sqlite3.Connection,
@@ -73,6 +75,82 @@ def insert_initial_progress(
             f"turn:{turn_id}:progress:1",
             f"turn:{turn_id}:progress",
             f"turn-{turn_id[:8]}-progress-1",
+            now,
+            now,
+            now,
+        ),
+    )
+    return outbox_id
+
+
+def insert_prompt_reaction_update(
+    connection: sqlite3.Connection,
+    *,
+    turn_id: str,
+    input_message_id: str | int | None,
+    discord_thread_id: str | int,
+    discord_parent_channel_id: str | int,
+    state: str,
+    now: int,
+    event_sequence: int | None = None,
+) -> str | None:
+    if input_message_id is None:
+        return None
+    if state not in _PROMPT_REACTION_STATES:
+        raise ValueError("invalid prompt reaction state")
+    ingress = connection.execute(
+        """
+        SELECT 1
+        FROM ingress_messages
+        WHERE discord_message_id = ?
+        """,
+        (str(input_message_id),),
+    ).fetchone()
+    if ingress is None:
+        return None
+    dedupe_key = f"turn:{turn_id}:prompt-reaction:{state}"
+    existing = connection.execute(
+        "SELECT id FROM discord_outbox WHERE dedupe_key = ?",
+        (dedupe_key,),
+    ).fetchone()
+    if existing is not None:
+        return str(existing["id"])
+    coalesce_key = f"turn:{turn_id}:prompt-reaction"
+    supersede_coalesced_outbox(
+        connection,
+        coalesce_key=coalesce_key,
+        now=now,
+    )
+    input_in_parent = str(input_message_id) == str(discord_thread_id)
+    destination_key = (
+        f"channel:{discord_parent_channel_id}"
+        if input_in_parent
+        else f"thread:{discord_thread_id}"
+    )
+    outbox_id = new_id()
+    connection.execute(
+        """
+        INSERT INTO discord_outbox(
+            id, event_sequence, destination_key, operation, payload_json,
+            dedupe_key, coalesce_key, delivery_marker, state, attempts,
+            next_attempt_at, created_at, updated_at
+        ) VALUES (?, ?, ?, 'edit', ?, ?, ?, ?, 'pending', 0, ?, ?, ?)
+        """,
+        (
+            outbox_id,
+            event_sequence,
+            destination_key,
+            canonical_json(
+                {
+                    "kind": "prompt_reaction",
+                    "turn_id": turn_id,
+                    "message_id": str(input_message_id),
+                    "state": state,
+                }
+            ),
+            dedupe_key,
+            coalesce_key,
+            f"prompt-reaction-{turn_id[:8]}-{state}",
             now,
             now,
             now,
