@@ -9,7 +9,7 @@ import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from PIL import Image, ImageOps, UnidentifiedImageError
 
@@ -35,6 +35,18 @@ class NormalizedImage:
     size_bytes: int
     width: int
     height: int
+
+
+@dataclass(frozen=True)
+class AttachmentMediaResult:
+    kind: Literal["image", "opaque"]
+    normalized_image: NormalizedImage | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind not in {"image", "opaque"} or (
+            (self.kind == "image") != (self.normalized_image is not None)
+        ):
+            raise ValueError("attachment media result is inconsistent")
 
 
 class MediaWorkerError(RuntimeError):
@@ -91,6 +103,27 @@ class MediaWorker:
         )
         if not isinstance(result, NormalizedImage):
             raise MediaWorkerError("media worker returned an invalid image result")
+        return result
+
+    async def classify_attachment(
+        self,
+        *,
+        source: Path,
+        output: Path,
+        max_image_bytes: int,
+        max_pixels: int,
+    ) -> AttachmentMediaResult:
+        result = await self._run(
+            (
+                "attachment",
+                str(source),
+                str(output),
+                max_image_bytes,
+                max_pixels,
+            )
+        )
+        if not isinstance(result, AttachmentMediaResult):
+            raise MediaWorkerError("media worker returned an invalid attachment result")
         return result
 
     async def _run(self, request: tuple[Any, ...]) -> object:
@@ -180,6 +213,19 @@ def _execute_request(request: tuple[Any, ...]) -> object:
             max_bytes=int(request[3]),
             max_pixels=int(request[4]),
         )
+    if request[0] == "attachment":
+        if len(request) != 5:
+            raise ValueError("invalid attachment classification request")
+        _apply_limits(memory_mib=256, cpu_seconds=10)
+        normalized = _normalize_image_candidate(
+            Path(request[1]),
+            Path(request[2]),
+            max_bytes=int(request[3]),
+            max_pixels=int(request[4]),
+        )
+        if normalized is None:
+            return AttachmentMediaResult(kind="opaque")
+        return AttachmentMediaResult(kind="image", normalized_image=normalized)
     if request[0] == "environment":
         return dict(os.environ)
     raise ValueError("unknown media worker request")
@@ -305,15 +351,34 @@ def _normalize_image(
     max_bytes: int,
     max_pixels: int,
 ) -> NormalizedImage:
+    normalized = _normalize_image_candidate(
+        source,
+        output,
+        max_bytes=max_bytes,
+        max_pixels=max_pixels,
+    )
+    if normalized is None:
+        raise ValueError("image decode failed")
+    return normalized
+
+
+def _normalize_image_candidate(
+    source: Path,
+    output: Path,
+    *,
+    max_bytes: int,
+    max_pixels: int,
+) -> NormalizedImage | None:
     if source.is_symlink() or not source.is_file():
         raise ValueError("image source must be a regular non-symlink file")
     source_size = source.stat().st_size
-    if source_size <= 0 or source_size > max_bytes:
-        raise ValueError("image source exceeds byte limit")
-    source_hash = _sha256(source)
+    if source_size <= 0:
+        raise ValueError("image source is empty")
     Image.MAX_IMAGE_PIXELS = max(1, max_pixels // 2)
     try:
         with Image.open(source) as image:
+            if source_size > max_bytes:
+                raise ValueError("image source exceeds byte limit")
             if image.width * image.height > max_pixels:
                 raise ValueError("image exceeds pixel limit")
             if getattr(image, "is_animated", False):
@@ -331,7 +396,11 @@ def _normalize_image(
             with Image.new(normalized.mode, normalized.size) as clean:
                 clean.paste(normalized)
                 clean.save(output, format="PNG", optimize=True)
-    except (UnidentifiedImageError, Image.DecompressionBombError) as exc:
+    except UnidentifiedImageError as exc:
+        if not _looks_like_image(source):
+            return None
+        raise ValueError("image decode failed") from exc
+    except Image.DecompressionBombError as exc:
         raise ValueError("image decode failed") from exc
     size = output.stat().st_size
     if size > max_bytes:
@@ -347,11 +416,51 @@ def _normalize_image(
     return NormalizedImage(
         output_path=output,
         media_type="image/png",
-        source_sha256=source_hash,
+        source_sha256=_sha256(source),
         normalized_sha256=_sha256(output),
         size_bytes=size,
         width=width,
         height=height,
+    )
+
+
+def _looks_like_image(path: Path) -> bool:
+    with path.open("rb") as stream:
+        prefix = stream.read(4096)
+    if prefix.startswith(
+        (
+            b"\x89PNG\r\n\x1a\n",
+            b"\xff\xd8\xff",
+            b"GIF87a",
+            b"GIF89a",
+            b"BM",
+            b"II*\x00",
+            b"MM\x00*",
+            b"\x00\x00\x01\x00",
+            b"\x00\x00\x02\x00",
+            b"\x00\x00\x00\x0cjP  \r\n\x87\n",
+            b"\xffO\xffQ",
+        )
+    ):
+        return True
+    if len(prefix) >= 12 and prefix[:4] == b"RIFF" and prefix[8:12] == b"WEBP":
+        return True
+    if len(prefix) >= 12 and prefix[4:8] == b"ftyp":
+        brands = {prefix[8:12], prefix[16:20]}
+        if brands & {
+            b"avif",
+            b"avis",
+            b"heic",
+            b"heix",
+            b"hevc",
+            b"hevx",
+            b"mif1",
+            b"msf1",
+        }:
+            return True
+    lowered = prefix.lstrip().lower()
+    return lowered.startswith(b"<svg") or (
+        lowered.startswith(b"<?xml") and b"<svg" in lowered
     )
 
 
