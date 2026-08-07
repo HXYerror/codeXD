@@ -2583,6 +2583,38 @@ async def test_command_sync_failure_degrades_and_retries(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+async def test_command_sync_timeout_degrades_without_blocking_login(
+    tmp_path: Path,
+) -> None:
+    statuses: list[str] = []
+    repository = Mock()
+    bot = _test_bot(
+        tmp_path,
+        repository=repository,
+        discord_status=statuses.append,
+    )
+    blocked = asyncio.Event()
+
+    async def sync_scopes(_guild: discord.Object) -> None:
+        await blocked.wait()
+
+    bot._sync_command_scopes = AsyncMock(side_effect=sync_scopes)
+    bot._command_sync_initial_timeout_seconds = 0.001
+
+    await asyncio.wait_for(
+        bot._sync_commands_or_degrade(discord.Object(id=100)),
+        timeout=0.1,
+    )
+
+    retry = bot._command_sync_task
+    assert retry is not None
+    assert statuses == ["degraded"]
+    repository.record_incident.assert_called()
+    bot._command_sync_stop.set()
+    await retry
+
+
+@pytest.mark.asyncio
 async def test_stale_global_command_returns_actionable_error(tmp_path: Path) -> None:
     bot = _test_bot(tmp_path)
     interaction = Mock(spec=discord.Interaction)

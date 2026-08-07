@@ -187,6 +187,7 @@ class CodexDBot(discord.Client):
         self._startup_recovery_task: asyncio.Task[None] | None = None
         self._command_sync_stop = asyncio.Event()
         self._command_sync_degraded = False
+        self._command_sync_initial_timeout_seconds = 10.0
         self._command_sync_retry_seconds = 5.0
         self._startup_recovery_retry_seconds = 5.0
         self._ready_preflight_degraded = False
@@ -427,10 +428,17 @@ class CodexDBot(discord.Client):
 
     async def _sync_commands_or_degrade(self, guild: discord.Object) -> None:
         try:
-            await self._sync_command_scopes(guild)
+            await asyncio.wait_for(
+                self._sync_command_scopes(guild),
+                timeout=self._command_sync_initial_timeout_seconds,
+            )
         except asyncio.CancelledError:
             raise
-        except (discord.HTTPException, app_commands.CommandSyncFailure) as exc:
+        except (
+            TimeoutError,
+            discord.HTTPException,
+            app_commands.CommandSyncFailure,
+        ) as exc:
             await self._record_command_sync_failure(exc)
             if self._command_sync_task is None:
                 self._command_sync_task = asyncio.create_task(
@@ -1852,6 +1860,9 @@ class CodexDBot(discord.Client):
             guild=guild,
         )
 
+    @app_commands.describe(
+        path="Absolute path, ~/path, or path relative to the service user's home"
+    )
     async def _project_bind(
         self, interaction: discord.Interaction[Any], path: str, name: str = "project"
     ) -> None:

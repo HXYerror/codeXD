@@ -44,7 +44,11 @@ class SessionCoordinator:
         channel_id: int,
         interaction_id: str | None = None,
     ) -> ProjectRecord:
-        root = resolve_project_path(path, self._security.allowed_roots)
+        root = resolve_project_path(
+            path,
+            self._security.allowed_roots,
+            relative_to=self._home_path,
+        )
         return await asyncio.to_thread(
             self._repository.bind_project,
             name=name,

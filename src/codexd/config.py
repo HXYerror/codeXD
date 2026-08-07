@@ -51,6 +51,7 @@ class ScheduleConfig:
 
 @dataclass(frozen=True)
 class SecurityConfig:
+    # Retained for config/API compatibility; project paths are unrestricted.
     allowed_roots: tuple[Path, ...] = ()
     default_sandbox_profile: str = "full_access"
 
@@ -136,32 +137,40 @@ def load_config(
     )
 
 
-def resolve_project_path(value: str, allowed_roots: tuple[Path, ...]) -> Path:
+def resolve_project_path(
+    value: str,
+    allowed_roots: tuple[Path, ...] = (),
+    *,
+    relative_to: Path | None = None,
+) -> Path:
     if not value or "\x00" in value:
         raise SecurityError("project path is empty or contains NUL")
+    # Retain the argument for configuration compatibility. Project binding runs
+    # with full host access, so configured roots no longer restrict valid paths.
+    del allowed_roots
     if os.name == "nt":
         windows_value = value.replace("/", "\\")
         if windows_value.startswith(("\\\\", "\\\\?\\", "\\\\.\\")):
             raise SecurityError("UNC and Windows device paths are not allowed")
-    candidate = Path(value)
+    candidate = Path(value).expanduser()
+    if os.name == "nt" and candidate.drive and not candidate.is_absolute():
+        raise SecurityError("drive-relative project paths are not allowed")
     if not candidate.is_absolute():
-        raise SecurityError("project path must be absolute")
-    try:
-        resolved = candidate.resolve(strict=True)
-    except OSError as exc:
-        raise SecurityError(f"project path cannot be resolved: {exc}") from exc
+        candidate = (relative_to or Path.home()) / candidate
+    resolved = _resolve_existing_project_path(candidate)
     if not resolved.is_dir():
         raise SecurityError("project path must be a directory")
-    if resolved in _protected_system_directories():
-        raise SecurityError("project path is a protected system directory")
     access_mode = os.R_OK | (os.X_OK if os.name != "nt" else 0)
     if not os.access(resolved, access_mode):
         raise SecurityError("project path is not readable by the service user")
-    if not allowed_roots:
-        raise SecurityError("security.allowed_roots must contain at least one root")
-    if not any(_is_relative_to(resolved, root) for root in allowed_roots):
-        raise SecurityError("project path is outside security.allowed_roots")
     return resolved
+
+
+def _resolve_existing_project_path(candidate: Path) -> Path:
+    try:
+        return candidate.resolve(strict=True)
+    except OSError as exc:
+        raise SecurityError(f"project path cannot be resolved: {exc}") from exc
 
 
 def _discord_config(raw: dict[str, Any], env: Mapping[str, str]) -> DiscordConfig:
@@ -291,16 +300,6 @@ def _security_config(raw: dict[str, Any]) -> SecurityConfig:
     roots_raw = raw.get("allowed_roots", [])
     if not isinstance(roots_raw, list) or not all(isinstance(item, str) for item in roots_raw):
         raise ConfigurationError("security.allowed_roots must be an array of strings")
-    roots: list[Path] = []
-    for value in roots_raw:
-        path = Path(value).expanduser()
-        try:
-            path = path.resolve(strict=True)
-        except OSError as exc:
-            raise ConfigurationError(f"allowed root cannot be resolved: {value}") from exc
-        if not path.is_dir():
-            raise ConfigurationError(f"allowed root is not a directory: {value}")
-        roots.append(path)
     profile = _string(
         raw.get("default_sandbox_profile", "full_access"),
         "security.default_sandbox_profile",
@@ -309,7 +308,7 @@ def _security_config(raw: dict[str, Any]) -> SecurityConfig:
         raise ConfigurationError(
             "security.default_sandbox_profile is fixed to 'full_access'"
         )
-    return SecurityConfig(allowed_roots=tuple(roots), default_sandbox_profile=profile)
+    return SecurityConfig(default_sandbox_profile=profile)
 
 
 def _rendering_config(raw: dict[str, Any]) -> RenderingConfig:
@@ -410,35 +409,3 @@ def _executable_path(value: object, name: str) -> Path:
     if os.name != "nt" and not os.access(resolved, os.X_OK):
         raise ConfigurationError(f"{name} must be executable")
     return resolved
-
-
-def _is_relative_to(path: Path, root: Path) -> bool:
-    try:
-        path.relative_to(root)
-    except ValueError:
-        return False
-    return True
-
-
-def _protected_system_directories() -> frozenset[Path]:
-    if os.name == "nt":
-        candidates = (
-            os.environ.get("SYSTEMROOT"),
-            os.environ.get("PROGRAMFILES"),
-            os.environ.get("PROGRAMFILES(X86)"),
-            os.environ.get("PROGRAMDATA"),
-        )
-        return frozenset(Path(value).resolve() for value in candidates if value)
-    return frozenset(
-        Path(value).resolve()
-        for value in (
-            "/",
-            "/bin",
-            "/sbin",
-            "/usr",
-            "/etc",
-            "/var",
-            "/System",
-            "/Library",
-        )
-    )

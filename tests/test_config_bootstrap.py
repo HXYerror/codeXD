@@ -158,7 +158,9 @@ def test_discord_owner_must_be_explicit_and_allowed(tmp_path: Path) -> None:
         load_config(invalid_owner, environment={"HOME": str(tmp_path)})
 
 
-def test_project_path_must_be_inside_an_allowed_root(tmp_path: Path) -> None:
+def test_project_path_accepts_directories_outside_configured_roots(
+    tmp_path: Path,
+) -> None:
     allowed = tmp_path / "allowed"
     inside = allowed / "repo"
     outside = tmp_path / "outside"
@@ -166,14 +168,29 @@ def test_project_path_must_be_inside_an_allowed_root(tmp_path: Path) -> None:
     outside.mkdir()
 
     assert resolve_project_path(str(inside), (allowed.resolve(),)) == inside.resolve()
-    with pytest.raises(SecurityError, match="outside"):
-        resolve_project_path(str(outside), (allowed.resolve(),))
+    assert resolve_project_path(str(outside), (allowed.resolve(),)) == outside.resolve()
+    assert resolve_project_path(str(outside)) == outside.resolve()
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX protected-directory assertion")
-def test_project_path_rejects_protected_system_directory() -> None:
-    with pytest.raises(SecurityError, match="protected system"):
-        resolve_project_path("/", (Path("/"),))
+def test_relative_project_path_resolves_from_explicit_home(tmp_path: Path) -> None:
+    project = tmp_path / "dev" / "repo"
+    project.mkdir(parents=True)
+
+    assert resolve_project_path("dev/repo", relative_to=tmp_path) == project.resolve()
+
+
+def test_relative_project_path_may_resolve_outside_home(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    outside = tmp_path / "outside"
+    home.mkdir()
+    outside.mkdir()
+
+    assert resolve_project_path("../outside", relative_to=home) == outside.resolve()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX root assertion")
+def test_project_path_accepts_system_root() -> None:
+    assert resolve_project_path("/") == Path("/")
 
 
 def test_bootstrap_removes_secrets_before_sdk_import() -> None:

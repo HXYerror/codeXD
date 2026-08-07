@@ -469,8 +469,8 @@ codexD 是单用户本机服务，但不能把“单用户”理解为“无边�
   `$HOME` Project，`/project bind <path>` 仅为执行命令的当前 channel 设置 override；
 - 不存在独立的 guild bind 或 thread bind；allowed user 在 configured-guild text
   channel mention bot 时自动创建主会话 thread 和 Conversation；
-- 显式 binding 的 project root 必须位于配置的 `allowed_roots`；operator canonical
-  `$HOME` 是单独的内置 trusted root，不要求重复写入 allowlist；
+- 显式 binding 可指向 service user 能读取的任意现存目录；相对路径稳定地以
+  operator canonical `$HOME` 为基准，不依赖 daemon working directory；
 - 所有 Conversation 固定使用 `full_access`；Discord 账号被盗等价于获得
   service user 的完整 Codex 执行能力；
 - 不注册 `/permissions`，也不允许通过 Discord/config 改成另一 Sandbox profile；
@@ -2881,7 +2881,7 @@ codexD 有三种命令，不应混在一起：
 
 输入：
 
-- `path`：本机绝对路径；
+- `path`：本机绝对路径，或相对于 operator canonical `$HOME` 的路径；
 - `name`：可选显示名；
 - 当前 Discord channel。
 
@@ -2899,11 +2899,10 @@ codexD 有三种命令，不应混在一起：
    Threads；
 4. channel 尚未显式绑定；已绑定时返回当前 override 信息，不静默替换；
 5. path 不含 NUL；
-6. path resolve 成现存目录；
-7. symlink resolve 后位于 `allowed_roots`；
-8. Windows 做 case-insensitive collision check；
-9. 目录可由 service user 读取；
-10. full access 是默认且不限制到该 path；binding 只决定 cwd 和
+6. 相对 path 以 operator canonical `$HOME` 为基准，随后 path resolve 成现存目录；
+7. Windows 做 case-insensitive collision check；
+8. 目录可由 service user 读取；
+9. full access 是默认且不限制到该 path；binding 只决定 cwd 和
    Conversation/project 映射，不是 OS sandbox 边界。
 
 成功只建立 binding，不启动 Codex turn。Runtime Slot 可 lazy start，也可由
@@ -4173,7 +4172,6 @@ default_timezone = "UTC"
 default_misfire_policy = "latest"
 
 [security]
-allowed_roots = ["/Users/me/src"]
 default_sandbox_profile = "full_access"
 
 [rendering]
@@ -4266,15 +4264,14 @@ ID allowlist，不依赖昵称、显示名或 role name。
 Path validation：
 
 1. 拒绝空值、NUL、非法 Windows device path；
-2. expand user 只在本机 CLI 做，Discord 输入不隐式 expand；
-3. absolute；
+2. expand user；
+3. 相对路径以 operator canonical `$HOME` 为基准；
 4. `resolve(strict=True)`；
 5. 目录；
-6. resolved path 位于某个 `allowed_root`；
-7. project root 自身不是受保护系统目录；
-8. Windows 比较使用 normalized/casefold path；
-9. UNC/network drive 默认拒绝；
-10. 保存 canonical path 与 display path。
+6. service user 可读取；
+7. Windows 比较使用 normalized/casefold path；
+8. UNC/network drive 默认拒绝；
+9. 保存 canonical path 与 display path。
 
 每次 Runtime Slot 启动重新验证，而不是只在 bind 时验证。若 canonical root
 不可用或不再满足 policy，runtime 保持 unavailable 并记录稳定 incident；不能修改
@@ -4283,14 +4280,13 @@ Project root，也不能把既有 Conversation 静默迁移到另一 cwd。
 路由规则：
 
 - 未绑定 configured-guild text channel 必须 fallback 到 operator canonical `$HOME`；
-- `$HOME` 是固定 trusted default，并在 daemon/runtime allowed roots 中显式加入；
-- 显式 `/project bind` 仍必须通过 `allowed_roots` path policy；
+- `$HOME` 是固定 trusted default；
+- 显式 `/project bind` 可指向 service user 能读取的任意现存目录；
 - bind/unbind 只影响未来 Conversation；
 
 明确禁止：
 
 - fallback 到 daemon working directory；
-- 用户用 `..` 绕过 root；
 - attachment filename 决定本地路径；
 - codexD-owned status/control/error metadata 在非 ephemeral Discord 消息显示完整路径；
 - Codex event 中越界 path 直接渲染。
@@ -5471,7 +5467,7 @@ Windows：
 16. PNG 不是表格唯一信息载体。
 17. 未知 provider event 不静默丢弃。
 18. hidden reasoning 不持久化/展示。
-19. 显式 binding 的 project root resolve 后必须位于 configured allowed root。
+19. 显式 binding 的 project root resolve 后必须是 service user 可读取的现存目录。
 20. operator canonical `$HOME` 是内置 trusted root；未绑定频道必须路由到唯一 HOME
     Project，不能创建隐式 ChannelBinding。
 21. Project canonical root 和 Conversation 的 Project/Discord origin 创建后不可变；

@@ -41,9 +41,9 @@ class ScheduleRepository:
         allowed_roots: tuple[Path, ...] = (),
     ) -> None:
         self.store = store
-        self._allowed_roots = tuple(
-            root.resolve(strict=True) for root in allowed_roots
-        )
+        # Retain the argument for API compatibility; schedule targets use the
+        # same unrestricted full-access path policy as project binding.
+        del allowed_roots
 
     def _project_root_error(self, root_path: str) -> str | None:
         try:
@@ -52,10 +52,6 @@ class ScheduleRepository:
             return "project_root_unavailable"
         if not resolved.is_dir():
             return "project_root_unavailable"
-        if self._allowed_roots and not any(
-            resolved.is_relative_to(root) for root in self._allowed_roots
-        ):
-            return "project_root_outside_policy"
         return None
 
     def _require_project_root(self, root_path: str) -> None:

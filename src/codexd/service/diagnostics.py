@@ -244,7 +244,7 @@ def _redacted_config(config: AppConfig) -> str:
             "",
             "[security]",
             f'new_conversation_profile = "{config.security.default_sandbox_profile}"',
-            f"allowed_root_count = {len(config.security.allowed_roots)}",
+            'project_path_scope = "unrestricted"',
             "",
             "[retention]",
             f"events_days = {config.retention.events_days}",

@@ -1436,7 +1436,8 @@ owner；</li>
 channel；</li>
 <li>不存在独立的 guild bind 或 thread bind；allowed user 在 project
 channel mention bot 时自动创建主会话 thread 和 Conversation；</li>
-<li>project root 必须位于配置的 <code>allowed_roots</code>；</li>
+<li>project root 可指向 service user 能读取的任意现存目录；相对路径以
+operator canonical <code>$HOME</code> 为基准；</li>
 <li>新 Conversation 默认使用 <code>full_access</code>；Discord
 账号被盗等价于获得 service user 的完整 Codex 执行能力；</li>
 <li><code>/permissions</code> 只允许 owner user 修改后续 Turn 的
@@ -5429,7 +5430,8 @@ auto_review</td>
 <h4 id="project-bind"><code>/project bind</code></h4>
 <p>输入：</p>
 <ul>
-<li><code>path</code>：本机绝对路径；</li>
+<li><code>path</code>：本机绝对路径，或相对于 operator canonical
+<code>$HOME</code> 的路径；</li>
 <li><code>name</code>：可选显示名；</li>
 <li>当前 Discord channel。</li>
 </ul>
@@ -5447,8 +5449,8 @@ Links、 Attach Files、Create Public Threads、Send Messages in Threads 与
 Manage Threads；</li>
 <li>channel 尚未绑定；已绑定时返回当前 Project 信息，不静默替换；</li>
 <li>path 不含 NUL；</li>
-<li>path resolve 成现存目录；</li>
-<li>symlink resolve 后位于 <code>allowed_roots</code>；</li>
+<li>相对 path 以 operator canonical <code>$HOME</code>
+为基准，随后 path resolve 成现存目录；</li>
 <li>Windows 做 case-insensitive collision check；</li>
 <li>目录可由 service user 读取；</li>
 <li>full access 是默认且不限制到该 path；binding 只决定 cwd 和
@@ -6952,7 +6954,6 @@ SDK child 前必须按 §7.6 重建 allowlist env。</p>
 <span id="cb48-17"><a href="#cb48-17" aria-hidden="true" tabindex="-1"></a><span class="dt">default_misfire_policy</span> <span class="op">=</span> <span class="st">&quot;latest&quot;</span></span>
 <span id="cb48-18"><a href="#cb48-18" aria-hidden="true" tabindex="-1"></a></span>
 <span id="cb48-19"><a href="#cb48-19" aria-hidden="true" tabindex="-1"></a><span class="kw">[security]</span></span>
-<span id="cb48-20"><a href="#cb48-20" aria-hidden="true" tabindex="-1"></a><span class="dt">allowed_roots</span> <span class="op">=</span> <span class="op">[</span><span class="st">&quot;/Users/me/src&quot;</span><span class="op">]</span></span>
 <span id="cb48-21"><a href="#cb48-21" aria-hidden="true" tabindex="-1"></a><span class="dt">default_sandbox_profile</span> <span class="op">=</span> <span class="st">&quot;full_access&quot;</span></span>
 <span id="cb48-22"><a href="#cb48-22" aria-hidden="true" tabindex="-1"></a></span>
 <span id="cb48-23"><a href="#cb48-23" aria-hidden="true" tabindex="-1"></a><span class="kw">[rendering]</span></span>
@@ -8723,7 +8724,7 @@ delivery 仍是 at-least-once。</li>
 <li>PNG 不是表格唯一信息载体。</li>
 <li>未知 provider event 不静默丢弃。</li>
 <li>hidden reasoning 不持久化/展示。</li>
-<li>project root resolve 后必须位于 allowed root。</li>
+<li>project root resolve 后必须是 service user 可读取的现存目录。</li>
 <li>新 Conversation 默认 full access，且 UI 必须醒目标示。</li>
 <li>secret 不进入 manager config、log、incident、diagnostics。</li>
 <li>optional capability 缺失不能用 CLI/private RPC fallback。</li>

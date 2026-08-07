@@ -1483,7 +1483,7 @@ async def test_schedule_state_machine_rejects_illegal_and_terminal_mutations(
 
 
 @pytest.mark.asyncio
-async def test_schedule_root_policy_is_enforced_for_create_fire_and_resume(
+async def test_schedule_root_availability_is_enforced_for_create_fire_and_resume(
     storage_context: StorageContext,
     tmp_path: Path,
 ) -> None:
@@ -1548,24 +1548,24 @@ async def test_schedule_root_policy_is_enforced_for_create_fire_and_resume(
     assert repository.get(schedule.id).state is ScheduleState.BLOCKED
     storage_context.root.mkdir()
 
-    disallowed_root = tmp_path / "disallowed-policy"
-    disallowed_root.mkdir()
-    restricted = ScheduleRepository(
+    unrelated_root = tmp_path / "unrelated-policy"
+    unrelated_root.mkdir()
+    unrestricted = ScheduleRepository(
         storage_context.store,
-        allowed_roots=(disallowed_root,),
+        allowed_roots=(unrelated_root,),
     )
-    with pytest.raises(ConflictError, match="project_root_outside_policy"):
-        restricted.create(
-            conversation_id=storage_context.conversation.id,
-            name="outside-policy",
-            kind=ScheduleKind.CRON,
-            expression="* * * * *",
-            timezone="UTC",
-            misfire_policy=MisfirePolicy.LATEST,
-            prompt_text="must reject",
-            next_due_at=60_000,
-            created_by_user_id=400,
-        )
+    outside_policy = unrestricted.create(
+        conversation_id=storage_context.conversation.id,
+        name="outside-policy",
+        kind=ScheduleKind.CRON,
+        expression="* * * * *",
+        timezone="UTC",
+        misfire_policy=MisfirePolicy.LATEST,
+        prompt_text="must succeed",
+        next_due_at=60_000,
+        created_by_user_id=400,
+    )
+    assert outside_policy.state is ScheduleState.ACTIVE
 
 
 @pytest.mark.asyncio
