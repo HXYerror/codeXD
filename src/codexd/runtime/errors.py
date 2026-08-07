@@ -37,6 +37,10 @@ class UnsupportedCapability(AdapterError):
     code = "unsupported_capability"
 
 
+class FileInputUnsupported(UnsupportedCapability):
+    code = "file_input_unsupported"
+
+
 class InvalidThread(AdapterError):
     code = "invalid_thread"
 
@@ -71,3 +75,22 @@ class InterruptFailed(AdapterError):
 
 class AdapterInvariantError(AdapterError):
     code = "adapter_invariant_error"
+
+
+def file_input_unsupported(
+    *,
+    generation: int,
+    thread_id: str | None = None,
+    turn_id: str | None = None,
+) -> FileInputUnsupported:
+    return FileInputUnsupported(
+        AdapterFailure(
+            code=FileInputUnsupported.code,
+            provider_exception="MentionInputUnavailable",
+            message="Codex runtime does not support ordinary file input",
+            retryable=False,
+            runtime_generation=generation,
+            thread_id=thread_id,
+            turn_id=turn_id,
+        )
+    )
