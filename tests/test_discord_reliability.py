@@ -20,7 +20,7 @@ from discord import app_commands
 from codexd.application.session_coordinator import ResolvedProject, SessionCoordinator
 from codexd.config import AppConfig, DiscordConfig, SecurityConfig, load_config
 from codexd.domain.ids import canonical_json, sha256_text
-from codexd.domain.turns import TurnImage, TurnInput, TurnSource
+from codexd.domain.turns import InterruptOrigin, TurnImage, TurnInput, TurnSource
 from codexd.errors import InvariantError
 from codexd.paths import AppPaths
 from codexd.rendering.discord import (
@@ -543,6 +543,186 @@ async def test_final_outbox_delivers_all_attachment_batches(tmp_path: Path) -> N
     for call in thread.send.await_args_list[1:4]:
         for file in call.kwargs.get("files", []):
             file.close()
+
+
+@pytest.mark.asyncio
+async def test_outbox_worker_waits_for_full_final_retry_before_progress_cleanup(
+    storage_context: StorageContext,
+    tmp_path: Path,
+) -> None:
+    repository = storage_context.repository
+    turn = repository.enqueue_turn(
+        conversation_id=storage_context.conversation.id,
+        source=TurnSource.DISCORD,
+        turn_input=TurnInput(text="deliver every final part before cleanup"),
+        input_message_id="final-retry-cleanup",
+    )
+    repository.request_cancel(turn.id, origin=InterruptOrigin.USER)
+    final_row = storage_context.store.query_one(
+        "SELECT id FROM discord_outbox WHERE dedupe_key = ?",
+        (f"turn:{turn.id}:final",),
+    )
+    assert final_row is not None
+    final_id = str(final_row["id"])
+
+    while storage_context.store.query_one(
+        """
+        SELECT 1 FROM discord_outbox
+        WHERE id <> ?
+          AND state IN ('pending', 'retry', 'reconciling', 'sending')
+        LIMIT 1
+        """,
+        (final_id,),
+    ) is not None:
+        setup_record = repository.claim_outbox(worker_id="final-retry-setup")
+        assert setup_record is not None
+        assert setup_record.id != final_id
+        setup_payload = json.loads(setup_record.payload_json)
+        is_progress = setup_payload.get("kind") == "turn_progress"
+        repository.ack_outbox(
+            setup_record.id,
+            lease_owner=setup_record.lease_owner,
+            lease_attempt=setup_record.attempts,
+            discord_message_id="901" if is_progress else None,
+            turn_progress_id=turn.id if is_progress else None,
+        )
+
+    attachment_content = b"attachment"
+    attachment_path = tmp_path / "final-attachment.txt"
+    attachment_path.write_bytes(attachment_content)
+    plan = DurableDiscordRenderPlan(
+        ("Final part one", "Final part two"),
+        (
+            DurableRenderedAttachment(
+                filename=attachment_path.name,
+                path=attachment_path,
+                description="Final attachment",
+                sha256=hashlib.sha256(attachment_content).hexdigest(),
+                size_bytes=len(attachment_content),
+            ),
+        ),
+    )
+    renderer = Mock(
+        artifact_root=tmp_path,
+        retention_days=30,
+        create_durable_plan=AsyncMock(return_value=plan),
+    )
+    renderer.load_durable_plan.return_value = plan
+
+    bot_user = Mock(id=999)
+    delivered_messages: list[Mock] = []
+    response = Mock(status=503, reason="unavailable")
+    footer_failure = discord.HTTPException(response, "unavailable")
+    footer_failure.retry_after = 0.0
+    send_attempt = 0
+
+    async def send(content: str, **_kwargs: Any) -> Mock:
+        nonlocal send_attempt
+        send_attempt += 1
+        if send_attempt == 4:
+            raise footer_failure
+        message = Mock(spec=discord.Message)
+        message.id = 1000 + send_attempt
+        message.author = bot_user
+        message.content = content
+        message.attachments = []
+        delivered_messages.append(message)
+        return message
+
+    async def history(*, limit: int):
+        assert limit == 500
+        for message in delivered_messages:
+            yield message
+
+    progress_message = Mock(spec=discord.Message)
+    progress_message.id = 901
+    progress_message.author = bot_user
+    progress_message.delete = AsyncMock()
+    thread = Mock(spec=discord.Thread)
+    thread.id = 300
+    thread.archived = False
+    thread.locked = False
+    thread.send = AsyncMock(side_effect=send)
+    thread.history = history
+    thread.fetch_message = AsyncMock(return_value=progress_message)
+    client = Mock(spec=discord.Client)
+    client.user = bot_user
+    client.get_channel.return_value = thread
+    worker = OutboxWorker(
+        repository=repository,
+        transport=DiscordOutboxTransport(
+            client=client,
+            repository=repository,
+            renderer=renderer,
+            signer=Mock(),
+        ),
+        worker_id="final-retry-worker",
+    )
+
+    assert await worker.drain_once()
+
+    failed_final = storage_context.store.query_one(
+        "SELECT state, attempts, last_error_code FROM discord_outbox WHERE id = ?",
+        (final_id,),
+    )
+    assert failed_final is not None
+    assert dict(failed_final) == {
+        "state": "retry",
+        "attempts": 1,
+        "last_error_code": "discord_http_503",
+    }
+    assert thread.send.await_count == 4
+    assert "files" in thread.send.await_args_list[2].kwargs
+    assert thread.send.await_args_list[3].args[0].startswith("-# ")
+    assert storage_context.store.query_one(
+        "SELECT 1 FROM discord_outbox WHERE dedupe_key = ?",
+        (f"turn:{turn.id}:progress:delete",),
+    ) is None
+    assert storage_context.store.query_one(
+        "SELECT cleanup_state FROM turn_progress_views WHERE turn_id = ?",
+        (turn.id,),
+    )["cleanup_state"] == "active"
+
+    assert await worker.drain_once()
+
+    cleanup_rows = storage_context.store.query_all(
+        """
+        SELECT id, operation, state FROM discord_outbox
+        WHERE dedupe_key = ?
+        """,
+        (f"turn:{turn.id}:progress:delete",),
+    )
+    assert len(cleanup_rows) == 1
+    assert cleanup_rows[0]["operation"] == "delete"
+    assert cleanup_rows[0]["state"] == "pending"
+    sent_final = storage_context.store.query_one(
+        "SELECT state, attempts FROM discord_outbox WHERE id = ?",
+        (final_id,),
+    )
+    assert sent_final is not None
+    assert dict(sent_final) == {"state": "sent", "attempts": 2}
+    assert thread.send.await_count == 5
+    assert renderer.create_durable_plan.await_count == 1
+
+    assert await worker.drain_once()
+
+    progress_message.delete.assert_awaited_once()
+    deleted_view = storage_context.store.query_one(
+        """
+        SELECT discord_message_id, cleanup_state, deleted_at
+        FROM turn_progress_views WHERE turn_id = ?
+        """,
+        (turn.id,),
+    )
+    assert deleted_view is not None
+    assert deleted_view["discord_message_id"] is None
+    assert deleted_view["cleanup_state"] == "deleted"
+    assert deleted_view["deleted_at"] is not None
+    assert storage_context.store.query_one(
+        "SELECT state FROM discord_outbox WHERE id = ?",
+        (cleanup_rows[0]["id"],),
+    )["state"] == "sent"
+    assert not await worker.drain_once()
 
 
 @pytest.mark.asyncio

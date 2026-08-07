@@ -2440,7 +2440,7 @@ UNIQUE(turn_id, provider_event_id) WHERE provider_event_id IS NOT NULL
 | `content_revision` | queued/running/cancelling/terminal 的单调 revision |
 | `state` | queued/running/cancelling/terminal |
 | `remote_message_seen_at` | nullable；首次成功回填远端 message ID 的时间，清理后保留 |
-| `cleanup_state` | active/delete_pending/delete_failed/deleted；非 active 禁止新 revision |
+| `cleanup_state` | active/legacy_ineligible/delete_pending/delete_failed/deleted；非 active 禁止新 revision |
 | `deleted_at` | nullable；delete ack 或从未创建远端消息的 final ack 收敛时间 |
 | `created_at`, `updated_at` | UTC ms |
 
@@ -2448,6 +2448,10 @@ UNIQUE(turn_id, provider_event_id) WHERE provider_event_id IS NOT NULL
 ack 只在 view 已有/曾有远端 message 时插入一次 delete outbox；从未创建时在同一
 transaction 直接标记 `deleted`，不扫描历史 Turn。delete payload 不持久化 message
 ID，避免把远端用户消息 ID 变成可注入的删除目标。
+
+升级到 migration 0015 时，已经 terminal 的 Turn view 标记为 `legacy_ineligible`，
+避免迟到的旧版 final ack 删除 rollout 前的 progress；升级时仍非 terminal 的 Turn
+保持 `active`，之后正常进入 cleanup 生命周期。
 
 #### `discord_outbox`
 

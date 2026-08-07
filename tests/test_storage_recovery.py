@@ -934,7 +934,7 @@ def test_channel_binding_migration_preserves_legacy_conversation_identity(
         assert turn.conversation_id == conversation.id
 
 
-def test_terminal_progress_cleanup_migration_preserves_remote_identity(
+def test_terminal_progress_cleanup_migration_preserves_rollout_boundary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -967,40 +967,149 @@ def test_terminal_progress_cleanup_migration_preserves_remote_identity(
             discord_parent_channel_id=200,
             owner_user_id=400,
         )
-        turn = repository.enqueue_turn(
+        active_turn = repository.enqueue_turn(
             conversation_id=conversation.id,
             source=TurnSource.DISCORD,
-            turn_input=TurnInput(text="legacy progress"),
-            input_message_id="legacy-progress-message",
+            turn_input=TurnInput(text="active legacy progress"),
+            input_message_id="active-legacy-progress-message",
+        )
+        terminal_turn = repository.enqueue_turn(
+            conversation_id=conversation.id,
+            source=TurnSource.DISCORD,
+            turn_input=TurnInput(text="terminal legacy progress"),
+            input_message_id="terminal-legacy-progress-message",
         )
         with store.transaction() as connection:
             connection.execute(
                 """
                 UPDATE turn_progress_views
-                SET discord_message_id = 'legacy-remote-progress', updated_at = 42
-                WHERE turn_id = ?
+                SET discord_message_id = CASE turn_id
+                        WHEN ? THEN 'active-legacy-remote-progress'
+                        ELSE 'terminal-legacy-remote-progress'
+                    END,
+                    state = CASE turn_id
+                        WHEN ? THEN state
+                        ELSE 'terminal'
+                    END,
+                    updated_at = 42
+                WHERE turn_id IN (?, ?)
                 """,
-                (turn.id,),
+                (
+                    active_turn.id,
+                    active_turn.id,
+                    active_turn.id,
+                    terminal_turn.id,
+                ),
             )
+            connection.execute(
+                """
+                UPDATE turns
+                SET state = 'completed', terminal_code = 'legacy_completed',
+                    ended_at = 42, queued_input_text = NULL,
+                    queued_skill_inputs_json = NULL
+                WHERE id = ?
+                """,
+                (terminal_turn.id,),
+            )
+            connection.execute(
+                """
+                UPDATE discord_outbox
+                SET state = 'sent', updated_at = 42
+                WHERE dedupe_key IN (?, ?)
+                """,
+                (
+                    f"turn:{active_turn.id}:progress:1",
+                    f"turn:{terminal_turn.id}:progress:1",
+                ),
+            )
+        legacy_final_id = repository.enqueue_outbox(
+            destination_key="thread:300",
+            operation="send",
+            payload={
+                "kind": "turn_final",
+                "turn_id": terminal_turn.id,
+                "plain_text": "Legacy final response",
+            },
+            dedupe_key=f"turn:{terminal_turn.id}:final",
+            delivery_marker=f"turn-{terminal_turn.id[:8]}-final",
+        )
 
         monkeypatch.setattr(sqlite_module, "_load_migrations", lambda: migrations)
         assert store.migrate() == 15
-        row = store.query_one(
+        active_row = store.query_one(
             """
             SELECT discord_message_id, remote_message_seen_at,
                    cleanup_state, deleted_at
             FROM turn_progress_views
             WHERE turn_id = ?
             """,
-            (turn.id,),
+            (active_turn.id,),
         )
-        assert row is not None
-        assert dict(row) == {
-            "discord_message_id": "legacy-remote-progress",
+        assert active_row is not None
+        assert dict(active_row) == {
+            "discord_message_id": "active-legacy-remote-progress",
             "remote_message_seen_at": 42,
             "cleanup_state": "active",
             "deleted_at": None,
         }
+        terminal_row = store.query_one(
+            """
+            SELECT discord_message_id, remote_message_seen_at,
+                   cleanup_state, deleted_at
+            FROM turn_progress_views
+            WHERE turn_id = ?
+            """,
+            (terminal_turn.id,),
+        )
+        assert terminal_row is not None
+        assert dict(terminal_row) == {
+            "discord_message_id": "terminal-legacy-remote-progress",
+            "remote_message_seen_at": 42,
+            "cleanup_state": "legacy_ineligible",
+            "deleted_at": None,
+        }
+
+        legacy_final = repository.claim_outbox(worker_id="legacy-final-worker")
+        assert legacy_final is not None
+        assert legacy_final.id == legacy_final_id
+        repository.ack_outbox(
+            legacy_final.id,
+            lease_owner=legacy_final.lease_owner,
+            lease_attempt=legacy_final.attempts,
+        )
+        assert store.query_one(
+            "SELECT 1 FROM discord_outbox WHERE dedupe_key = ?",
+            (f"turn:{terminal_turn.id}:progress:delete",),
+        ) is None
+
+        repository.request_cancel(active_turn.id, origin=InterruptOrigin.USER)
+        while True:
+            record = repository.claim_outbox(worker_id="active-final-worker")
+            assert record is not None
+            payload = json.loads(record.payload_json)
+            repository.ack_outbox(
+                record.id,
+                lease_owner=record.lease_owner,
+                lease_attempt=record.attempts,
+                discord_message_id=(
+                    "active-legacy-remote-progress"
+                    if payload.get("kind") == "turn_progress"
+                    else None
+                ),
+                turn_progress_id=(
+                    active_turn.id
+                    if payload.get("kind") == "turn_progress"
+                    else None
+                ),
+            )
+            if payload.get("kind") == "turn_final":
+                break
+        cleanup = store.query_one(
+            "SELECT state FROM discord_outbox WHERE dedupe_key = ?",
+            (f"turn:{active_turn.id}:progress:delete",),
+        )
+        assert cleanup is not None
+        assert cleanup["state"] == "pending"
 
 
 def test_component_scope_migrations_expire_and_guard_legacy_pending_drafts(
