@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -24,6 +23,7 @@ from codexd.config import (
 from codexd.domain.ids import utc_now_ms
 from codexd.domain.turns import TurnFile, TurnImage
 from codexd.paths import AppPaths
+from codexd.security import private_files
 from codexd.transport.discord.attachments import (
     AttachmentError,
     DiscordAttachmentIngestor,
@@ -108,12 +108,11 @@ def _message(
 
 
 def _private_input_directory(data_root: Path) -> Path:
+    attachments = data_root / "attachments"
     inputs = data_root / "attachments" / "input"
-    inputs.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if os.name != "nt":
-        data_root.chmod(0o700)
-        inputs.parent.chmod(0o700)
-        inputs.chmod(0o700)
+    private_files.ensure_private_directory(data_root)
+    private_files.ensure_private_directory(attachments)
+    private_files.ensure_private_directory(inputs)
     return inputs
 
 
@@ -128,8 +127,7 @@ def _turn_file(
     payload = content or f"opaque-{attachment_id}".encode()
     path = _private_input_directory(data_root) / f"{attachment_id}.bin"
     path.write_bytes(payload)
-    if os.name != "nt":
-        path.chmod(0o600)
+    private_files.secure_private_file(path)
     return TurnFile(
         attachment_id=attachment_id,
         ordinal=ordinal,
@@ -151,8 +149,7 @@ def _turn_image(
     payload = f"normalized-{attachment_id}".encode()
     path = _private_input_directory(data_root) / f"{attachment_id}.png"
     path.write_bytes(payload)
-    if os.name != "nt":
-        path.chmod(0o600)
+    private_files.secure_private_file(path)
     digest = hashlib.sha256(payload).hexdigest()
     return TurnImage(
         attachment_id=attachment_id,
