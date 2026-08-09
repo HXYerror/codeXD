@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import os
 import re
 import stat
@@ -139,6 +140,7 @@ _MAX_DISPLAY_NAME_CHARS = 128
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 _MAX_REDIRECTS = 4
 _DOWNLOAD_TOTAL_SECONDS = 30
+logger = logging.getLogger(__name__)
 
 
 class AttachmentError(CodexDError):
@@ -264,11 +266,6 @@ class DiscordAttachmentIngestor:
         ordinal: int,
     ) -> TurnImage | TurnFile:
         reported_size = _reported_size(attachment)
-        if reported_size > self._download_max_bytes:
-            raise AttachmentError(
-                "attachment exceeds the configured byte limit",
-                code="attachment_size_limit",
-            )
 
         attachment_id = str(uuid.uuid4())
         display_name = _sanitize_display_name(attachment.filename)
@@ -286,9 +283,14 @@ class DiscordAttachmentIngestor:
             downloaded = await self._download(attachment.url, source)
             self._record_download(downloaded.size_bytes)
             if downloaded.size_bytes != reported_size:
-                raise AttachmentError(
-                    "attachment download did not match Discord metadata",
-                    code="attachment_integrity_failed",
+                logger.info(
+                    "Discord attachment metadata size differed from downloaded bytes",
+                    extra={
+                        "stable_code": "attachment_metadata_size_mismatch",
+                        "reported_size_bytes": reported_size,
+                        "actual_size_bytes": downloaded.size_bytes,
+                        "discord_attachment_id_hash": _attachment_id_hash(attachment),
+                    },
                 )
 
             try:
@@ -547,6 +549,17 @@ def _reported_size(attachment: discord.Attachment) -> int:
             code="attachment_integrity_failed",
         )
     return size
+
+
+def _attachment_id_hash(attachment: discord.Attachment) -> str:
+    attachment_id = getattr(attachment, "id", None)
+    if (
+        isinstance(attachment_id, bool)
+        or not isinstance(attachment_id, int)
+        or attachment_id <= 0
+    ):
+        return "unavailable"
+    return hashlib.sha256(str(attachment_id).encode("ascii")).hexdigest()[:16]
 
 
 def _content_length(value: str | None) -> int | None:

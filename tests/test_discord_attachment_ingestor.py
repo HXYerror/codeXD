@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import logging
 import os
 import re
 import uuid
@@ -92,6 +93,7 @@ def _attachment(
     return cast(
         discord.Attachment,
         SimpleNamespace(
+            id=123_456_789,
             filename=filename,
             content_type=content_type,
             size=len(content) if size is None else size,
@@ -539,14 +541,73 @@ async def test_empty_and_partial_downloads_are_integrity_failures(
 
 
 @pytest.mark.asyncio
-async def test_metadata_size_mismatch_is_integrity_failure(tmp_path: Path) -> None:
+@pytest.mark.parametrize("reported_size", (1, 4, 10_000_000))
+async def test_ordinary_file_accepts_metadata_size_mismatch(
+    tmp_path: Path,
+    reported_size: int,
+) -> None:
     content = b"abc"
     ingestor = _ingestor(tmp_path, _FakeSession(_FakeResponse(chunks=(content,))))
 
-    with pytest.raises(AttachmentError) as failure:
-        await ingestor.ingest([_attachment(content, size=4)])
+    result = await ingestor.ingest([_attachment(content, size=reported_size)])
 
-    assert failure.value.code == "attachment_integrity_failed"
+    assert result.files[0].size_bytes == len(content)
+    assert result.files[0].sha256 == hashlib.sha256(content).hexdigest()
+    assert result.files[0].canonical_path.read_bytes() == content
+    ingestor.cleanup(result)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reported_size", (6_820, 140_502))
+async def test_transcoded_image_metadata_mismatch_uses_actual_content_and_safe_log(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    reported_size: int,
+) -> None:
+    content = _png_bytes()
+    url = "https://cdn.discordapp.com/attachments/private/signature/image.png"
+    ingestor = _ingestor(
+        tmp_path,
+        _FakeSession(
+            _FakeResponse(
+                chunks=(content,),
+                headers={"Content-Length": str(len(content))},
+            )
+        ),
+    )
+
+    with caplog.at_level(logging.INFO, logger="codexd.transport.discord.attachments"):
+        result = await ingestor.ingest(
+            [
+                _attachment(
+                    content,
+                    filename="private-image.png",
+                    content_type="image/webp",
+                    size=reported_size,
+                    url=url,
+                )
+            ]
+        )
+
+    assert len(result.images) == 1
+    assert result.images[0].source_sha256 == hashlib.sha256(content).hexdigest()
+    records = [
+        record
+        for record in caplog.records
+        if getattr(record, "stable_code", None)
+        == "attachment_metadata_size_mismatch"
+    ]
+    assert len(records) == 1
+    record = records[0]
+    assert record.reported_size_bytes == reported_size
+    assert record.actual_size_bytes == len(content)
+    assert record.discord_attachment_id_hash == hashlib.sha256(
+        b"123456789"
+    ).hexdigest()[:16]
+    forbidden = (url, "private-image.png", str(tmp_path), content.hex())
+    assert not any(value in caplog.text for value in forbidden)
+
+    ingestor.cleanup(result)
 
 
 @pytest.mark.asyncio

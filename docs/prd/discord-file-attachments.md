@@ -20,7 +20,9 @@ Done
 1. 支持频道 mention 和既有 Conversation 中的文本、图片、普通文件及其混合输入；
    file-only 消息合法，所有输入只创建一个 Turn。
 2. 只从批准的 Discord CDN HTTPS host 下载；每次 redirect 重新校验 host，并执行
-   connect/read/总超时、单文件及单消息 streaming byte cap。
+   connect/read/总超时、单文件及单消息 streaming byte cap。Discord reported size
+   仅参与 ingress 变更检测和可选提示；实际 stream 字节数是 byte budget 的权威值，
+   两者不相等不能单独构成完整性失败。
 3. 每个附件只下载一次到随机 quarantine 路径。MediaWorker 按实际内容识别图片：
    可完整 decode 的图片沿用规范化流程；明确非图片按 opaque file 保存；声明为图片
    但损坏、decoder crash 或 timeout 必须继续报 `image_decode_failed`。
@@ -56,8 +58,8 @@ Done
   `image_decode_failed`，而是作为 opaque file 传给 Codex。
 - 文本+多文件、文本+图片+文件和 file-only 均保序且只产生一个 Turn。
 - 有效图片不受 MIME/扩展名欺骗并继续走图片模型检查；损坏且声明为图片的内容拒绝。
-- 路径穿越、绝对路径、控制字符、mention、metadata size 欺骗、超限 stream、
-  off-policy redirect、空/部分下载均 fail closed 并清理。
+- 路径穿越、绝对路径、控制字符、mention、超限 stream、off-policy redirect、
+  空/部分下载均 fail closed 并清理；reported size 与实际完整响应不一致时按实际流处理。
 - 文件缺失、被替换、hash 改变或任一父级被换成 symlink 时 provider 不启动。
 - duplicate/recovery 不产生第二个 Turn 或孤儿文件；retention 不删除 active 引用。
 - 不把绝对路径、URL、文件内容写入公开状态、普通日志或诊断包。
