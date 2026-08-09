@@ -4173,12 +4173,14 @@ provider 调用前拒绝并提示 `/model set`；绝不静默丢图或自动切�
 ### 15.2 图片输入
 
 1. 检查 Discord attachment metadata，只接受 Discord library 提供的 attachment
-   object，不解析 assistant/user 文本中的 URL；
-2. 按 Discord 附件数量/大小上限和本地 decoder memory budget 预检；下载 URL
-   必须是 HTTPS、official Discord CDN host、无 userinfo，redirect 后仍满足同一
-   policy；
-3. 以 connect/read timeout、streaming byte cap 下载到随机命名的 data-dir
-   quarantine，不信任 `Content-Length`；
+   object，不解析 assistant/user 文本中的 URL；reported size/MIME/filename 均是
+   不可信提示，reported size 参与 ingress manifest，但不能证明 CDN representation；
+2. 按附件数量和本地 decoder memory budget 预检；下载 URL 必须是 HTTPS、official
+   Discord CDN host、无 userinfo，redirect 后仍满足同一 policy；
+3. 以 connect/read timeout、实际 streaming byte cap 下载到随机命名的 data-dir
+   quarantine；只接受完整 HTTP 200，拒绝 206/`Content-Range`/空 body，存在
+   `Content-Length` 时必须等于 stream 实际字节数。Discord reported size 与实际
+   完整响应不一致时继续处理，并只记录不含 filename/URL/path/content 的结构化计数；
 4. 检查 magic bytes 与完整 decode，不信任扩展名/MIME；
 5. 不按扩展名或 MIME 限定格式；接受隔离 decoder 能完整解码的 raster image，
    动画图片取首帧，无法解码的内容和可执行内容拒绝；
@@ -4230,8 +4232,9 @@ enqueue 和每次 provider start 前都执行同一 fail-closed 校验：
 capability/catalog await 完成后、构造 SDK `MentionInput` 前执行最后一次校验，并在
 POSIX 上持有 shared descriptor lock 到 provider terminal 或 confirmed runtime
 termination；非 terminal stream 异常、取消或意外结束不会释放。retention 删除前使用
-non-blocking exclusive lock。Windows 在等价 handle contract 实现并验证前不报告
-`mention.input=true`。
+non-blocking exclusive lock。Windows 使用受保护的 service-user owner-only DACL、
+no-reparse handle 和 provider-lifetime no-write/delete-sharing lease；任一原生安全
+能力初始化或验证失败时不报告 `mention.input=true`。
 
 该边界明确把 same-service-UID 进程视为 trusted：descriptor lease 防御其他
 principal、retention cleanup 与遵守 lease 协议的协作 mutation；它不声称能防御已经
