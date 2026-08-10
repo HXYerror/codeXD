@@ -11,9 +11,10 @@ Done
 
 ## Overview
 
-Turn 的 progress message 只服务 queued/running/cancelling 期间。完整 final 内容、附件和
+Turn 的 progress message 只服务 queued/running/cancelling 期间。完整 visible assistant
+transcript（completed commentary、final answer 和兼容 phase-less message）、附件和
 terminal footer 成功投递并 ack 后，以 durable outbox 删除整条 progress message，
-避免在 Discord Thread 中永久保留重复的大块终态 Embed。
+避免在 Discord Thread 中永久保留重复的大块终态 Embed，同时不丢失运行时已展示内容。
 
 ## Requirements
 
@@ -23,6 +24,8 @@ terminal footer 成功投递并 ack 后，以 durable outbox 删除整条 progre
    revision；迟到事件不能重新创建 running revision。
 4. 只有 `turn_final` 的全部内容、附件和 footer 成功且 outbox ack 为 `sent` 后，
    才在同一 SQLite transaction 幂等创建 progress delete outbox。
+   `turn_final` 的文本源必须从持久 AST 重建完整 visible transcript，不能回收或截取
+   1,800 字的 progress preview；canonical final answer 仍独立遵循 SDK phase 规则。
 5. final retry 时 progress 保留；final dead_letter/superseded 时绝不解锁 cleanup。
 6. delete payload 只标识 `kind=turn_progress_delete` 和 Turn/view；远端 message ID
    必须从 `turn_progress_views` 读取，不接受任意用户 message ID。
@@ -39,7 +42,8 @@ terminal footer 成功投递并 ack 后，以 durable outbox 删除整条 progre
 
 ## Acceptance Criteria
 
-- 所有 terminal state 在 final 成功后删除 progress message，final 与 footer 保留。
+- 所有 terminal state 在 final 成功后删除 progress message，完整 visible transcript、
+  canonical final（若有）、terminal fallback 与 footer 按各自语义保留。
 - progress 含流式 plain text 或 final 含多消息/表格/附件时，删除严格发生在最后一次
   final ack 之后。
 - transient retry 保留 progress，permanent final failure 不排队 delete。

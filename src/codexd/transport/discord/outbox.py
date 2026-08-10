@@ -633,23 +633,31 @@ class DiscordOutboxTransport:
         record_state: str,
     ) -> DeliveryResult:
         turn_id = payload.get("turn_id")
-        plain_text = payload.get("plain_text")
-        if not isinstance(turn_id, str) or not isinstance(plain_text, str):
+        visible_text = payload.get("visible_text", payload.get("plain_text"))
+        final_answer_text = payload.get("final_answer_text")
+        if (
+            not isinstance(turn_id, str)
+            or not isinstance(visible_text, str)
+            or (
+                final_answer_text is not None
+                and not isinstance(final_answer_text, str)
+            )
+        ):
             raise DeliveryError("turn_final_payload_invalid", permanent=True)
-        source_sha256 = sha256_text(plain_text)
+        source_sha256 = sha256_text(visible_text)
         stored = await asyncio.to_thread(self._repository.render_plan, turn_id)
         rendered: DurableDiscordRenderPlan
         if stored is None:
             try:
                 generated = await self._renderer.create_durable_plan(
                     turn_id=turn_id,
-                    source=plain_text,
+                    source=visible_text,
                 )
                 plan_payload = generated.to_payload(self._renderer.artifact_root)
             except (CodexDError, OSError, ValueError):
                 rendered = await self._render_fallback_plan(
                     turn_id=turn_id,
-                    plain_text=plain_text,
+                    plain_text=visible_text,
                     stable_code="render_plan_creation_failed",
                 )
             else:
@@ -670,7 +678,7 @@ class DiscordOutboxTransport:
             except (CodexDError, OSError, ValueError):
                 rendered = await self._render_fallback_plan(
                     turn_id=turn_id,
-                    plain_text=plain_text,
+                    plain_text=visible_text,
                     stable_code="render_plan_invalid",
                 )
         messages = list(rendered.messages)

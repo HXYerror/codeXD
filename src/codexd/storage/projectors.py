@@ -18,6 +18,10 @@ from codexd.storage.progress import (
     supersede_coalesced_outbox,
 )
 from codexd.storage.sqlite import SQLiteStore
+from codexd.storage.transcript import (
+    terminal_assistant_transcript,
+    visible_assistant_text,
+)
 from codexd.storage.usage import (
     USAGE_SCOPE,
     latest_usage_payload,
@@ -600,9 +604,7 @@ class ProjectingEventSink:
             block["phase"] = completed_phase
             block["completed"] = True
         revision = int(row["content_revision"]) + 1 if row else 1
-        plain = "\n\n".join(
-            str(candidate.get("text", "")) for candidate in blocks if candidate.get("text")
-        )
+        plain = visible_assistant_text(ast, completed_only=False)
         if row:
             connection.execute(
                 """
@@ -624,11 +626,7 @@ class ProjectingEventSink:
                 (new_id(), scope["id"], revision, canonical_json(ast), plain, sequence),
             )
         if family == "text":
-            assistant_plain = "\n\n".join(
-                str(candidate.get("text", ""))
-                for candidate in blocks
-                if candidate.get("kind") == "text" and candidate.get("text")
-            )
+            assistant_plain = plain
             if assistant_plain:
                 self._project_progress(
                     connection,
@@ -1241,7 +1239,12 @@ class ProjectingEventSink:
         ).fetchone()
         if projection:
             ast = json.loads(projection["content_ast_json"])
-            final_text = _select_final_text(ast)
+            transcript = terminal_assistant_transcript(
+                ast,
+                fallback=_terminal_fallback(target),
+            )
+            visible_text = transcript.visible_text
+            final_answer_text = transcript.canonical_final_answer
             revision = int(projection["content_revision"]) + 1
             connection.execute(
                 """
@@ -1250,22 +1253,16 @@ class ProjectingEventSink:
                     last_event_sequence = ?
                 WHERE turn_id = ?
                 """,
-                (revision, final_text, sequence, scope["id"]),
+                (revision, visible_text, sequence, scope["id"]),
             )
         else:
-            final_text = _terminal_fallback(target)
-            ast = {
-                "schema_version": 1,
-                "blocks": [
-                    {
-                        "kind": "text",
-                        "item_id": "terminal-fallback",
-                        "text": final_text,
-                        "phase": "final_answer",
-                        "completed": True,
-                    }
-                ],
-            }
+            ast = {"schema_version": 1, "blocks": []}
+            transcript = terminal_assistant_transcript(
+                ast,
+                fallback=_terminal_fallback(target),
+            )
+            visible_text = transcript.visible_text
+            final_answer_text = transcript.canonical_final_answer
             connection.execute(
                 """
                 INSERT INTO message_projections(
@@ -1273,7 +1270,7 @@ class ProjectingEventSink:
                     plain_text, is_final, last_event_sequence
                 ) VALUES (?, ?, 1, ?, ?, 1, ?)
                 """,
-                (new_id(), scope["id"], canonical_json(ast), final_text, sequence),
+                (new_id(), scope["id"], canonical_json(ast), visible_text, sequence),
             )
         self._finalize_open_tasks(
             connection,
@@ -1333,8 +1330,8 @@ class ProjectingEventSink:
                 "input_channel_id": input_channel_id,
                 "discord_guild_id": scope["discord_guild_id"],
                 "usage": usage,
-                "content_ast": ast,
-                "plain_text": final_text,
+                "visible_text": visible_text,
+                "final_answer_text": final_answer_text,
             },
             dedupe_key=f"turn:{scope['id']}:final",
             marker=f"turn-{str(scope['id'])[:8]}-final",
@@ -1655,22 +1652,6 @@ def terminal_state_for_event(
     if event.kind == "turn.terminal_unparseable":
         return TurnState.INTERRUPTED, "provider_terminal_unparseable"
     return None
-
-
-def _select_final_text(ast: dict[str, Any]) -> str:
-    text_blocks = [
-        block
-        for block in ast.get("blocks", [])
-        if block.get("kind") == "text" and block.get("completed") and block.get("text")
-    ]
-    final = [block for block in text_blocks if block.get("phase") == "final_answer"]
-    compatible = [block for block in text_blocks if block.get("phase") is None]
-    selected = final[-1] if final else (compatible[-1] if compatible else None)
-    return (
-        str(selected["text"])
-        if selected
-        else "Codex completed without a final response."
-    )
 
 
 def _terminal_fallback(state: TurnState) -> str:
