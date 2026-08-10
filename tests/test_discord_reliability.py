@@ -450,6 +450,71 @@ async def test_final_outbox_delivers_all_attachment_batches(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+async def test_final_outbox_renders_visible_transcript_not_only_canonical_final(
+    tmp_path: Path,
+) -> None:
+    visible_text = "Commentary one\n\nCommentary two\n\nCanonical final"
+    plan = DurableDiscordRenderPlan((visible_text,), ())
+    renderer = Mock(
+        artifact_root=tmp_path,
+        retention_days=30,
+        create_durable_plan=AsyncMock(return_value=plan),
+    )
+    renderer.load_durable_plan.return_value = plan
+    repository = Mock()
+    repository.render_plan.return_value = None
+    repository.persist_render_plan.return_value = RenderPlanRecord(
+        turn_id="turn-visible",
+        source_sha256=sha256_text(visible_text),
+        plan_json=canonical_json(plan.to_payload(tmp_path)),
+        retention_until=1,
+    )
+    thread = Mock(spec=discord.Thread)
+    thread.id = 300
+    thread.archived = False
+    thread.locked = False
+    thread.send = AsyncMock(side_effect=[Mock(id=1), Mock(id=2)])
+    client = Mock(spec=discord.Client)
+    client.get_channel.return_value = thread
+    transport = DiscordOutboxTransport(
+        client=client,
+        repository=repository,
+        renderer=renderer,
+        signer=Mock(),
+    )
+
+    await transport.deliver(
+        OutboxRecord(
+            id="visible-final",
+            destination_key="thread:300",
+            operation="send",
+            payload_json=canonical_json(
+                {
+                    "kind": "turn_final",
+                    "visible_text": visible_text,
+                    "final_answer_text": "Canonical final",
+                    "turn_id": "turn-visible",
+                    "state": "completed",
+                }
+            ),
+            delivery_marker="visible-final",
+            state="pending",
+            attempts=0,
+            lease_owner="test",
+        )
+    )
+
+    renderer.create_durable_plan.assert_awaited_once_with(
+        turn_id="turn-visible",
+        source=visible_text,
+    )
+    assert repository.persist_render_plan.call_args.kwargs["source_sha256"] == (
+        sha256_text(visible_text)
+    )
+    assert thread.send.await_args_list[0].args[0].startswith(visible_text)
+
+
+@pytest.mark.asyncio
 async def test_outbox_worker_waits_for_full_final_retry_before_progress_cleanup(
     storage_context: StorageContext,
     tmp_path: Path,

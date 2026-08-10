@@ -260,7 +260,7 @@ claudeD 曾经出现过的 task/tool 类型：
 |---|---|
 | `userMessage` | 输入审计关联，不重复回显 |
 | `hookPrompt` | 只记 type/fragment count/hash；不把 hook 文本发到 Discord |
-| `agentMessage` | 按 `phase=commentary/final_answer` 组装进度与最终回答 |
+| `agentMessage` | 按 `phase=commentary/final_answer` 组装进度、visible transcript 与 canonical final answer |
 | `plan` | `PlanBlock`；不等同于 plan mode |
 | `reasoning` | 只允许 `summary`；`content` 在 normalization 前丢弃 |
 | `commandExecution` | `ToolBlock` |
@@ -1673,8 +1673,9 @@ Outbox 与 Turn 独立：
 - Discord 发送失败不修改 Turn terminal state；
 - 同一 progress message 的 edit 可以合并；
 - final message 不得被 progress edit 覆盖；
-- terminal progress revision 必须先于 final；只有完整 final（含多段内容、附件与
-  footer）成功并 ack `sent` 后，才创建独立的 progress delete outbox；
+- terminal progress revision 必须先于 final；只有完整 visible assistant transcript
+  （含 completed commentary/final/legacy message）、附件与 footer 成功并 ack `sent`
+  后，才创建独立的 progress delete outbox；
 - progress delete 使用 `turn:<turn_id>:progress:delete` 唯一 dedupe key，不参与
   progress coalescing；final retry/dead letter/superseded 都不能解锁 delete；
 - 每个 destination key 保序；
@@ -1767,7 +1768,7 @@ sequenceDiagram
     end
     EP->>DB: terminal event + final projection/outbox
     OB-->>DC: terminal progress edit
-    OB-->>DC: full final content + attachments + footer
+    OB-->>DC: visible transcript + attachments + footer
     OB->>DB: ack final + enqueue progress delete atomically
     OB-->>DC: delete exact progress message
     OB->>DB: ack delete + clear message ID / mark deleted
@@ -1784,7 +1785,7 @@ Discord gateway disconnect：
 - outbox 保留 pending；
 - Discord adapter 自己按 library policy 重连；
 - 重连后按 destination 顺序完成 in-flight progress reconciliation、terminal edit、
-  full final ack，再执行精确 progress delete；
+  visible transcript final ack，再执行精确 progress delete；
 - gateway watchdog 只能重建 Discord client，不能重启整个 daemon。
 
 ### 8.15 Runtime crash
@@ -1865,7 +1866,7 @@ Domain event kind 使用稳定命名，不直接复用 SDK class name：
 | `thread.resumed` | requested/actual ID | mismatch check |
 | `turn.started` | provider turn ID | 幂等确认 handle ID/running；mismatch incident |
 | `assistant.text.delta` | item ID, text | 合并到文本 block |
-| `assistant.text.completed` | item ID, `phase` | `final_answer` 优先作为最终回答；`commentary` 只作进度；若 provider 为同一流使用不同 delta/completed item ID，则只按末尾未完成同 phase 文本前缀安全合并 |
+| `assistant.text.completed` | item ID, `phase` | `final_answer` 参与 canonical final 选择；`commentary` 同时用于进度与 terminal visible transcript；若 provider 为同一流使用不同 delta/completed item ID，则只按末尾未完成同 phase 文本前缀安全合并 |
 | `reasoning.summary` | safe visible summary only | 可选状态，不展示隐藏推理 |
 | `command.started` | command label, cwd | tool card |
 | `command.output.delta` | stream, text | 节流更新 |
@@ -1893,11 +1894,21 @@ Domain event kind 使用稳定命名，不直接复用 SDK class name：
 
 实际 SDK 事件名可随版本变化；只有 adapter fixture 需要知道映射。
 
-最终回答选择与 SDK collector 保持一致但不调用 collector：从 completed
-`agentMessage` 倒序选择最后一个 `phase=final_answer`；若没有，则兼容最后一个
-`phase=None`；`phase=commentary` 永不作为 final answer。成功 Turn 没有这两类
-message 时显示 `completed_without_final_response` notice，而不是把最后一条进度
-冒充回复。
+terminal projection 明确区分两个文本语义：
+
+- canonical final answer 与 SDK collector 保持一致但不调用 collector：从 completed
+  `agentMessage` 倒序选择最后一个 `phase=final_answer`；若没有，则兼容最后一个
+  `phase=None`；`phase=commentary` 永不冒充 canonical final；
+- visible assistant transcript 从持久 `content_ast_json` 按事件顺序保留所有非空、
+  completed 的 `commentary`、`final_answer` 与 legacy `phase=None` 文本，block 间使用
+  稳定空行，并把选中的 canonical final block 精确放在末尾一次。incomplete、未知
+  phase、plan、reasoning、tool/raw payload 均不进入 terminal transcript。
+
+没有 canonical final 时，completed Turn 在 commentary 后追加
+`completed_without_final_response` fallback；failed/cancelled/interrupted 追加相应
+terminal fallback。`turn_final.visible_text` 驱动 durable render plan，
+`final_answer_text` 单独保存 canonical 语义；transport 仍兼容升级前只含
+`plain_text` 的 pending outbox。progress 的 1,800 字 preview 从不作为 terminal 来源。
 
 当前 `TurnHandle.stream()` 可按 turn ID 路由的 typed notification family
 包括：
@@ -2409,7 +2420,7 @@ UNIQUE(turn_id, provider_event_id) WHERE provider_event_id IS NOT NULL
 | `turn_id` | FK |
 | `content_revision` | projector revision |
 | `content_ast_json` | versioned ContentBlock AST |
-| `plain_text` | search/fallback |
+| `plain_text` | 当前 visible assistant text；terminal 后为完整 completed visible transcript + 必要 fallback，用于 search/`/turn show`/diagnostics/render fallback |
 | `is_final` | bool |
 | `last_event_sequence` | idempotent projection cursor |
 
@@ -5634,7 +5645,9 @@ Windows：
     一个 Turn。
 27. Schedule 只 materialize 普通 Turn，不直接调用 SDK，也不自动重放
     provider-started Turn。
-28. `AgentMessage.phase=final_answer` 是 final text 首选；commentary 只能作为进度。
+28. `AgentMessage.phase=final_answer` 是 canonical final 首选；completed commentary
+    必须保留在 terminal visible transcript，但不得冒充 canonical final。progress
+    preview 删除或截断不能造成持久 transcript 丢失。
 29. Optional Item/notification 未被观察到不等于 capability unsupported。
 30. `/session compact` 只确认 start；provider barrier 在 thread idle 前阻止下一
     Turn，但 idle 不被冒充成不可绑定 internal Turn 的完成状态。

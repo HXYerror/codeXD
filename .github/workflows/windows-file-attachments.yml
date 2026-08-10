@@ -32,3 +32,12 @@ jobs:
           tests/test_file_attachment_foundation.py
           tests/test_runtime_turns.py
           tests/test_sdk_contract.py
+      - name: Run visible transcript regressions
+        run: >-
+          python -m pytest -q
+          tests/test_storage_recovery.py::test_terminal_projection_persists_full_visible_assistant_transcript
+          tests/test_storage_recovery.py::test_terminal_transcript_filters_partial_and_keeps_canonical_final_last
+          tests/test_storage_recovery.py::test_terminal_transcript_appends_fallback_without_promoting_commentary
+          tests/test_storage_recovery.py::test_legacy_phase_less_final_is_kept_once_and_moved_last
+          tests/test_storage_recovery.py::test_local_terminal_preserves_completed_commentary_and_excludes_partial
+          tests/test_discord_reliability.py::test_final_outbox_renders_visible_transcript_not_only_canonical_final

@@ -2407,7 +2407,7 @@ class CodexDBot(discord.Client):
                 f"{conversation.discord_thread_id}/{message_id}"
             )
         if output:
-            lines.extend(("", "**Final assistant projection**", output[:900]))
+            lines.extend(("", "**Visible assistant transcript**", output[:900]))
         await interaction.followup.send(
             "\n".join(lines),
             ephemeral=True,

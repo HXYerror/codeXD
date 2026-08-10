@@ -558,6 +558,297 @@ def test_independent_completed_assistant_items_keep_repeated_text(
     )
 
 
+def test_terminal_projection_persists_full_visible_assistant_transcript(
+    storage_context: StorageContext,
+) -> None:
+    turn, lease = _running_turn(storage_context, "visible-transcript")
+    sink = ProjectingEventSink(storage_context.store, correlation_key=b"v" * 32)
+    commentary = tuple(
+        f"### Update {index}\n\n" + (chr(65 + index) * 160)
+        for index in range(16)
+    )
+    final_answer = "### Final\n\nThe requested change is complete. " + ("done " * 32)
+    for index, text in enumerate(commentary):
+        sink.record(
+            turn_id=turn.id,
+            runtime_generation=lease.generation,
+            event=NormalizedEvent(
+                "assistant.message.completed",
+                {
+                    "item_id": f"commentary-{index}",
+                    "phase": "commentary",
+                    "text": text,
+                },
+                provider_event_id=f"commentary-{index}-completed",
+            ),
+        )
+    sink.record(
+        turn_id=turn.id,
+        runtime_generation=lease.generation,
+        event=NormalizedEvent(
+            "assistant.message.completed",
+            {
+                "item_id": "canonical-final",
+                "phase": "final_answer",
+                "text": final_answer,
+            },
+            provider_event_id="canonical-final-completed",
+        ),
+    )
+    sink.record(
+        turn_id=turn.id,
+        runtime_generation=lease.generation,
+        event=NormalizedEvent(
+            "turn.completed",
+            {"provider_turn_id": "visible-transcript-provider", "status": "completed"},
+            provider_event_id="visible-transcript-completed",
+        ),
+    )
+
+    expected = "\n\n".join((*commentary, final_answer))
+    assert len(expected) > 2_386
+    projection = storage_context.store.query_one(
+        "SELECT content_ast_json, plain_text, is_final FROM message_projections "
+        "WHERE turn_id = ?",
+        (turn.id,),
+    )
+    assert projection is not None
+    assert projection["plain_text"] == expected
+    assert projection["is_final"] == 1
+    ast = json.loads(str(projection["content_ast_json"]))
+    assert len(ast["blocks"]) == 17
+    assert storage_context.repository.turn_output(turn.id) == expected
+    assert storage_context.repository.turn_final_answer(turn.id) == final_answer
+
+    final = storage_context.store.query_one(
+        "SELECT payload_json FROM discord_outbox WHERE dedupe_key = ?",
+        (f"turn:{turn.id}:final",),
+    )
+    assert final is not None
+    payload = json.loads(str(final["payload_json"]))
+    assert payload["visible_text"] == expected
+    assert payload["final_answer_text"] == final_answer
+    assert "plain_text" not in payload
+
+
+def test_terminal_transcript_filters_partial_and_keeps_canonical_final_last(
+    storage_context: StorageContext,
+) -> None:
+    turn, lease = _running_turn(storage_context, "transcript-order")
+    sink = ProjectingEventSink(storage_context.store, correlation_key=b"o" * 32)
+    completed = (
+        ("commentary-first", "commentary", "First commentary"),
+        ("final-old", "final_answer", "Earlier final block"),
+        ("legacy", None, "Legacy visible message"),
+        ("final-canonical", "final_answer", "Canonical final block"),
+        ("commentary-late", "commentary", "Late commentary"),
+        ("unknown", "reasoning", "HIDDEN REASONING"),
+    )
+    for item_id, phase, text in completed:
+        sink.record(
+            turn_id=turn.id,
+            runtime_generation=lease.generation,
+            event=NormalizedEvent(
+                "assistant.message.completed",
+                {"item_id": item_id, "phase": phase, "text": text},
+                provider_event_id=f"{item_id}-completed",
+            ),
+        )
+    sink.record(
+        turn_id=turn.id,
+        runtime_generation=lease.generation,
+        event=NormalizedEvent(
+            "assistant.message.delta",
+            {"item_id": "partial", "text": "INCOMPLETE CONTENT"},
+            provider_event_id="partial-delta",
+        ),
+    )
+    sink.record(
+        turn_id=turn.id,
+        runtime_generation=lease.generation,
+        event=NormalizedEvent(
+            "turn.failed",
+            {"provider_turn_id": "transcript-order-provider"},
+            provider_event_id="transcript-order-failed",
+        ),
+    )
+
+    expected = "\n\n".join(
+        (
+            "First commentary",
+            "Earlier final block",
+            "Legacy visible message",
+            "Late commentary",
+            "Canonical final block",
+        )
+    )
+    assert storage_context.repository.turn_output(turn.id) == expected
+    assert (
+        storage_context.repository.turn_final_answer(turn.id)
+        == "Canonical final block"
+    )
+    assert "HIDDEN REASONING" not in expected
+    assert "INCOMPLETE CONTENT" not in expected
+    assert "Turn failed." not in expected
+    final = storage_context.store.query_one(
+        "SELECT payload_json FROM discord_outbox WHERE dedupe_key = ?",
+        (f"turn:{turn.id}:final",),
+    )
+    assert final is not None
+    payload_json = str(final["payload_json"])
+    assert "HIDDEN REASONING" not in payload_json
+    assert "INCOMPLETE CONTENT" not in payload_json
+    assert "content_ast" not in payload_json
+
+
+@pytest.mark.parametrize(
+    ("event_kind", "request_cancel", "expected_fallback"),
+    (
+        ("turn.completed", False, "Codex completed without a final response."),
+        ("turn.failed", False, "Turn failed."),
+        ("turn.interrupted", False, "Turn interrupted; it was not replayed."),
+        ("turn.interrupted", True, "Turn cancelled."),
+    ),
+)
+def test_terminal_transcript_appends_fallback_without_promoting_commentary(
+    storage_context: StorageContext,
+    event_kind: str,
+    request_cancel: bool,
+    expected_fallback: str,
+) -> None:
+    suffix = event_kind.replace(".", "-") + ("-cancel" if request_cancel else "")
+    turn, lease = _running_turn(storage_context, f"fallback-{suffix}")
+    sink = ProjectingEventSink(storage_context.store, correlation_key=b"f" * 32)
+    sink.record(
+        turn_id=turn.id,
+        runtime_generation=lease.generation,
+        event=NormalizedEvent(
+            "assistant.message.completed",
+            {
+                "item_id": "only-commentary",
+                "phase": "commentary",
+                "text": "Visible work summary",
+            },
+            provider_event_id=f"{suffix}-commentary",
+        ),
+    )
+    if request_cancel:
+        storage_context.repository.request_cancel(turn.id, origin=InterruptOrigin.USER)
+    sink.record(
+        turn_id=turn.id,
+        runtime_generation=lease.generation,
+        event=NormalizedEvent(
+            "assistant.message.delta",
+            {"item_id": "unfinished", "text": "unfinished"},
+            provider_event_id=f"{suffix}-unfinished",
+        ),
+    )
+    sink.record(
+        turn_id=turn.id,
+        runtime_generation=lease.generation,
+        event=NormalizedEvent(
+            event_kind,
+            {"provider_turn_id": f"fallback-{suffix}-provider"},
+            provider_event_id=f"{suffix}-terminal",
+        ),
+    )
+
+    assert storage_context.repository.turn_output(turn.id) == (
+        f"Visible work summary\n\n{expected_fallback}"
+    )
+    assert storage_context.repository.turn_final_answer(turn.id) is None
+
+
+def test_legacy_phase_less_final_is_kept_once_and_moved_last(
+    storage_context: StorageContext,
+) -> None:
+    turn, lease = _running_turn(storage_context, "legacy-visible-transcript")
+    sink = ProjectingEventSink(storage_context.store, correlation_key=b"g" * 32)
+    for item_id, phase, text in (
+        ("legacy-old", None, "Older legacy message"),
+        ("legacy-selected", None, "Selected legacy final"),
+        ("commentary-after", "commentary", "Commentary after legacy"),
+    ):
+        sink.record(
+            turn_id=turn.id,
+            runtime_generation=lease.generation,
+            event=NormalizedEvent(
+                "assistant.message.completed",
+                {"item_id": item_id, "phase": phase, "text": text},
+                provider_event_id=f"{item_id}-completed",
+            ),
+        )
+    sink.record(
+        turn_id=turn.id,
+        runtime_generation=lease.generation,
+        event=NormalizedEvent(
+            "turn.completed",
+            {"provider_turn_id": "legacy-visible-provider", "status": "completed"},
+            provider_event_id="legacy-visible-completed",
+        ),
+    )
+
+    expected = (
+        "Older legacy message\n\nCommentary after legacy\n\nSelected legacy final"
+    )
+    assert storage_context.repository.turn_output(turn.id) == expected
+    assert (
+        storage_context.repository.turn_final_answer(turn.id)
+        == "Selected legacy final"
+    )
+    assert expected.count("Selected legacy final") == 1
+
+
+def test_local_terminal_preserves_completed_commentary_and_excludes_partial(
+    storage_context: StorageContext,
+) -> None:
+    turn, lease = _running_turn(storage_context, "local-visible-transcript")
+    sink = ProjectingEventSink(storage_context.store, correlation_key=b"l" * 32)
+    sink.record(
+        turn_id=turn.id,
+        runtime_generation=lease.generation,
+        event=NormalizedEvent(
+            "assistant.message.completed",
+            {
+                "item_id": "local-commentary",
+                "phase": "commentary",
+                "text": "Durable commentary before runtime loss",
+            },
+            provider_event_id="local-commentary-completed",
+        ),
+    )
+    sink.record(
+        turn_id=turn.id,
+        runtime_generation=lease.generation,
+        event=NormalizedEvent(
+            "assistant.message.delta",
+            {"item_id": "local-partial", "text": "partial after commentary"},
+            provider_event_id="local-partial-delta",
+        ),
+    )
+
+    assert storage_context.repository.mark_runtime_unhealthy(
+        lease.id,
+        failure_code="runtime_crashed",
+    ) == (turn.id,)
+
+    expected = (
+        "Durable commentary before runtime loss\n\n"
+        "Turn interrupted: `runtime_lost`."
+    )
+    assert storage_context.repository.turn_output(turn.id) == expected
+    assert storage_context.repository.turn_final_answer(turn.id) is None
+    final = storage_context.store.query_one(
+        "SELECT payload_json FROM discord_outbox WHERE dedupe_key = ?",
+        (f"turn:{turn.id}:final",),
+    )
+    assert final is not None
+    payload = json.loads(str(final["payload_json"]))
+    assert payload["visible_text"] == expected
+    assert payload["final_answer_text"] is None
+    assert "partial after commentary" not in payload["visible_text"]
+
+
 def test_streaming_projection_survives_every_delta_boundary_and_restart(
     storage_context: StorageContext,
 ) -> None:

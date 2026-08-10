@@ -67,6 +67,10 @@ from codexd.storage.records import (
     TurnRecord,
 )
 from codexd.storage.sqlite import SQLiteStore
+from codexd.storage.transcript import (
+    canonical_final_answer,
+    terminal_assistant_transcript,
+)
 from codexd.storage.usage import latest_usage_payload
 
 
@@ -1333,6 +1337,21 @@ class Repository:
             (turn_id,),
         )
         return str(row["plain_text"]) if row is not None else None
+
+    def turn_final_answer(self, turn_id: str) -> str | None:
+        row = self.store.query_one(
+            "SELECT content_ast_json FROM message_projections WHERE turn_id = ?",
+            (turn_id,),
+        )
+        if row is None:
+            return None
+        try:
+            ast = json.loads(str(row["content_ast_json"]))
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise StorageError("message projection AST is invalid") from exc
+        if not isinstance(ast, dict):
+            raise StorageError("message projection AST must be an object")
+        return canonical_final_answer(ast)
 
     def render_plan(self, turn_id: str) -> RenderPlanRecord | None:
         row = self.store.query_one(
@@ -4163,18 +4182,22 @@ class Repository:
         )
         note = f"Turn {target.value}: `{terminal_code}`."
         projection = connection.execute(
-            "SELECT plain_text FROM message_projections WHERE turn_id = ?",
+            "SELECT content_ast_json FROM message_projections WHERE turn_id = ?",
             (turn_id,),
         ).fetchone()
-        plain_text = (
-            f"{projection['plain_text']}\n\n{note}"
-            if projection is not None and projection["plain_text"]
-            else note
-        )
-        ast = {
-            "version": 1,
-            "blocks": [{"type": "text", "text": plain_text}],
-        }
+        if projection is None:
+            ast: dict[str, Any] = {"schema_version": 1, "blocks": []}
+        else:
+            try:
+                loaded_ast = json.loads(str(projection["content_ast_json"]))
+            except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                raise StorageError("message projection AST is invalid") from exc
+            if not isinstance(loaded_ast, dict):
+                raise StorageError("message projection AST must be an object")
+            ast = loaded_ast
+        transcript = terminal_assistant_transcript(ast, fallback=note)
+        visible_text = transcript.visible_text
+        final_answer_text = transcript.canonical_final_answer
         if projection is None:
             connection.execute(
                 """
@@ -4183,7 +4206,7 @@ class Repository:
                     plain_text, is_final, last_event_sequence
                 ) VALUES (?, ?, 1, ?, ?, 1, ?)
                 """,
-                (new_id(), turn_id, canonical_json(ast), plain_text, sequence),
+                (new_id(), turn_id, canonical_json(ast), visible_text, sequence),
             )
         else:
             connection.execute(
@@ -4194,14 +4217,14 @@ class Repository:
                     last_event_sequence = ?
                 WHERE turn_id = ? AND is_final = 0
                 """,
-                (canonical_json(ast), plain_text, sequence, turn_id),
+                (canonical_json(ast), visible_text, sequence, turn_id),
             )
             final_projection = connection.execute(
                 "SELECT plain_text FROM message_projections WHERE turn_id = ?",
                 (turn_id,),
             ).fetchone()
             assert final_projection is not None
-            plain_text = str(final_projection["plain_text"])
+            visible_text = str(final_projection["plain_text"])
         progress_outbox_id = None
         if not progress_already_projected:
             progress_outbox_id = insert_progress_update(
@@ -4266,8 +4289,8 @@ class Repository:
                             turn_id=turn_id,
                             max_sequence=sequence,
                         ),
-                        "content_ast": ast,
-                        "plain_text": plain_text,
+                        "visible_text": visible_text,
+                        "final_answer_text": final_answer_text,
                     }
                 ),
                 f"turn:{turn_id}:final",
