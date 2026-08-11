@@ -4,6 +4,8 @@ from collections.abc import Mapping, Sequence
 
 import discord
 
+from codexd.application.session_lifecycle import SessionStatusView
+
 COLOR_CODEX = 0x7C3AED
 COLOR_RUNNING = 0xF59E0B
 COLOR_SUCCESS = 0x10B981
@@ -38,6 +40,121 @@ def progress_embed(content: str) -> discord.Embed:
         color=color,
     )
     embed.set_footer(text="codexD · live Turn status")
+    return embed
+
+
+def session_status_embed(view: SessionStatusView) -> discord.Embed:
+    conversation = view.conversation
+    runtime_state = view.activity.runtime_state
+    if (
+        conversation.state.value == "blocked"
+        or conversation.provider_barrier_kind is not None
+        or runtime_state in {"starting", "unhealthy", "failed"}
+    ):
+        title, color = "⚠️ Session needs attention", COLOR_RUNNING
+    elif conversation.state.value == "archived":
+        title, color = "📦 Session archived", COLOR_MUTED
+    elif conversation.state.value == "uninitialized":
+        title, color = "⚪ Session not started", COLOR_MUTED
+    elif conversation.state.value == "active":
+        title, color = "🟢 Session active", COLOR_SUCCESS
+    else:
+        title, color = "⚠️ Session unavailable", COLOR_FAILURE
+
+    revision = view.active_revision
+    description_parts = []
+    if revision is not None and revision.name:
+        description_parts.append(_safe_plain(revision.name, 120))
+    description_parts.append(f"Project **{_safe_plain(view.project_name, 120)}**")
+    embed = discord.Embed(
+        title=title,
+        description=" · ".join(description_parts)[:4096],
+        color=color,
+    )
+
+    behavior = view.behavior
+    modalities = (
+        "/".join(_safe_plain(item, 24) for item in behavior.input_modalities)
+        if behavior.input_modalities
+        else "resolves on next Turn"
+    )
+    model_lines = [
+        f"**{_safe_plain(behavior.model.value, 128)}** · "
+        f"{_safe_plain(behavior.model.source, 48)}",
+        f"Reasoning `{_safe_plain(behavior.reasoning_effort.value, 64)}` · "
+        f"summary `{_safe_plain(behavior.reasoning_summary.value, 64)}`",
+        f"Personality `{_safe_plain(behavior.personality.value, 64)}` · "
+        f"tier `{_safe_plain(behavior.service_tier.value, 64)}`",
+        f"Web `{_safe_plain(behavior.web_search_mode, 48)}` · "
+        f"input `{modalities}`",
+    ]
+    if behavior.resolution != "resolved":
+        model_lines.append(f"Resolution: {_safe_plain(behavior.resolution, 128)}")
+    embed.add_field(
+        name="Model & behavior · next Turn",
+        value="\n".join(model_lines)[:1024],
+        inline=False,
+    )
+
+    activity = view.activity
+    runtime = f"Runtime `{_safe_plain(runtime_state, 48)}`"
+    if activity.runtime_generation > 0:
+        runtime += f" · generation `{activity.runtime_generation}`"
+    activity_lines = [
+        runtime,
+        f"Turns active `{activity.active_turns}` · queued `{activity.queued_turns}`",
+        f"Last completed {_relative_time(activity.last_completed_at)}",
+    ]
+    if activity.active_turn is not None:
+        turn = activity.active_turn
+        current = (
+            f"Current Turn `{_safe_plain(turn.effective_model or 'provider default', 96)}`"
+            " · reasoning `"
+            + _safe_plain(
+                turn.effective_reasoning_effort or "provider default",
+                48,
+            )
+            + "`"
+        )
+        if activity.active_settings_differ:
+            current += " · differs from next Turn"
+        activity_lines.append(current)
+    embed.add_field(
+        name="Activity",
+        value="\n".join(activity_lines)[:1024],
+        inline=False,
+    )
+
+    session_lines = [
+        (
+            f"Revision `{revision.id[:8]}` · Codex "
+            f"`{_safe_plain(revision.provider_version, 64)}`"
+            if revision is not None
+            else "Revision `none`"
+        ),
+        f"Provider identity {_safe_plain(view.resume_verification, 160)}",
+    ]
+    embed.add_field(name="Session", value="\n".join(session_lines), inline=False)
+
+    execution_lines = ["**FULL ACCESS** · `auto_review`"]
+    if conversation.provider_barrier_kind is not None:
+        execution_lines.append(
+            "⚠️ Provider barrier `"
+            + _safe_plain(conversation.provider_barrier_kind, 64)
+            + "`"
+        )
+    if view.degraded_reason is not None:
+        execution_lines.append(
+            "⚠️ " + _safe_plain(view.degraded_reason, 180)
+        )
+    embed.add_field(
+        name="Execution",
+        value="\n".join(execution_lines)[:1024],
+        inline=False,
+    )
+    embed.set_footer(
+        text="Advanced: /model show · /usage · /session list · /capabilities"
+    )
     return embed
 
 
@@ -289,6 +406,12 @@ def _duration_text(started_at: object, ended_at: object) -> str | None:
         return f"{seconds:.1f}s"
     minutes, remaining = divmod(int(seconds), 60)
     return f"{minutes}m {remaining}s"
+
+
+def _relative_time(timestamp_ms: int | None) -> str:
+    if timestamp_ms is None:
+        return "`never`"
+    return f"<t:{timestamp_ms // 1000}:R>"
 
 
 def _optional_text(value: object, limit: int) -> str | None:

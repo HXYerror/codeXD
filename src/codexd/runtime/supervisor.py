@@ -563,6 +563,26 @@ class RuntimeSupervisor:
                 return None
             return await slot.runtime.account_status()
 
+    async def model_catalog_if_loaded(
+        self,
+        project_id: str,
+    ) -> ModelCatalogSnapshot | None:
+        """Read the catalog without creating or starting a Runtime Slot."""
+
+        key = project_id if self._topology == "project_scoped" else "shared"
+        async with self._slots_lock:
+            slot = self._slots.get(key)
+        if slot is None:
+            return None
+        async with slot.lock:
+            if (
+                slot.runtime is None
+                or slot.lease is None
+                or slot.lease.state != "ready"
+            ):
+                return None
+            return await slot.runtime.list_models()
+
     async def _slot(self, key: str) -> RuntimeSlot:
         async with self._slots_lock:
             return self._slots.setdefault(key, RuntimeSlot(key=key))

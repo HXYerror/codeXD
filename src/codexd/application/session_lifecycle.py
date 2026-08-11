@@ -27,16 +27,58 @@ from codexd.storage.records import (
     ConversationRecord,
     ProjectRecord,
     ThreadRevisionRecord,
+    TurnRecord,
 )
 from codexd.storage.repository import Repository
 
 logger = logging.getLogger(__name__)
+_STATUS_CATALOG_TIMEOUT_SECONDS = 3.0
 
 
 @dataclass(frozen=True)
 class SessionStatus:
     conversation: ConversationRecord
     active_revision: ThreadRevisionRecord | None
+
+
+@dataclass(frozen=True)
+class SessionStatusValue:
+    value: str
+    source: str
+
+
+@dataclass(frozen=True)
+class SessionBehaviorStatus:
+    model: SessionStatusValue
+    reasoning_effort: SessionStatusValue
+    reasoning_summary: SessionStatusValue
+    personality: SessionStatusValue
+    service_tier: SessionStatusValue
+    web_search_mode: str
+    input_modalities: tuple[str, ...]
+    resolution: str
+
+
+@dataclass(frozen=True)
+class SessionActivityStatus:
+    runtime_state: str
+    runtime_generation: int
+    queued_turns: int
+    active_turns: int
+    last_completed_at: int | None
+    active_turn: TurnRecord | None
+    active_settings_differ: bool
+
+
+@dataclass(frozen=True)
+class SessionStatusView:
+    conversation: ConversationRecord
+    active_revision: ThreadRevisionRecord | None
+    project_name: str
+    behavior: SessionBehaviorStatus
+    activity: SessionActivityStatus
+    resume_verification: str
+    degraded_reason: str | None
 
 
 class SessionLifecycleCoordinator:
@@ -83,6 +125,85 @@ class SessionLifecycleCoordinator:
             asyncio.to_thread(self._repository.get_active_revision, conversation_id),
         )
         return SessionStatus(conversation, revision)
+
+    async def status_view(self, conversation_id: str) -> SessionStatusView:
+        conversation, revision, project, turn_summary, active_turn = await asyncio.gather(
+            asyncio.to_thread(self._repository.get_conversation, conversation_id),
+            asyncio.to_thread(self._repository.get_active_revision, conversation_id),
+            asyncio.to_thread(self._project_for_conversation, conversation_id),
+            asyncio.to_thread(
+                self._repository.conversation_turn_summary,
+                conversation_id,
+            ),
+            asyncio.to_thread(
+                self._repository.active_turn_for_conversation,
+                conversation_id,
+            ),
+        )
+        runtime_status = await self._runtimes.project_status(project.id)
+        catalog: ModelCatalogSnapshot | None = None
+        degraded_reason: str | None = None
+        if runtime_status["state"] == "ready":
+            try:
+                catalog = await asyncio.wait_for(
+                    self._runtimes.model_catalog_if_loaded(project.id),
+                    timeout=_STATUS_CATALOG_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                degraded_reason = "model catalog timed out"
+            except Exception as exc:
+                degraded_reason = "model catalog unavailable"
+                logger.warning(
+                    "Session status could not read the loaded model catalog",
+                    extra={
+                        "stable_code": "session_status_catalog_unavailable",
+                        "exception_type": type(exc).__name__,
+                    },
+                )
+            else:
+                if catalog is None:
+                    degraded_reason = "model catalog unavailable"
+                elif not catalog.complete:
+                    degraded_reason = "model catalog is incomplete"
+        elif runtime_status["state"] in {"starting", "unhealthy"}:
+            degraded_reason = f"runtime {runtime_status['state']}"
+
+        behavior = _session_behavior(conversation, project, catalog)
+        if degraded_reason is None and behavior.resolution in {
+            "catalog incomplete",
+            "configured model unavailable",
+        }:
+            degraded_reason = behavior.resolution
+        active_settings_differ = bool(
+            active_turn is not None
+            and _turn_behavior_tuple(active_turn) != _behavior_tuple(behavior)
+        )
+        activity = SessionActivityStatus(
+            runtime_state=str(runtime_status["state"]),
+            runtime_generation=int(runtime_status["generation"]),
+            queued_turns=int(turn_summary["queued"]),
+            active_turns=int(turn_summary["active"]),
+            last_completed_at=turn_summary["last_completed_at"],
+            active_turn=active_turn,
+            active_settings_differ=active_settings_differ,
+        )
+        return SessionStatusView(
+            conversation=conversation,
+            active_revision=revision,
+            project_name=project.name,
+            behavior=behavior,
+            activity=activity,
+            resume_verification=(
+                "verified by active provider Turn"
+                if active_turn is not None
+                else "will verify on next provider use"
+            ),
+            degraded_reason=degraded_reason,
+        )
+
+    def _project_for_conversation(self, conversation_id: str) -> ProjectRecord:
+        conversation = self._repository.get_conversation(conversation_id)
+        return self._repository.get_project(conversation.project_id)
 
     async def new(
         self,
@@ -1213,6 +1334,132 @@ def _decode_thread_config(raw_json: str) -> ThreadConfig:
         approval_mode=approval,
         service_tier=optional_string("service_tier"),
         web_search_mode=web_search,
+    )
+
+
+def _session_behavior(
+    conversation: ConversationRecord,
+    project: ProjectRecord,
+    catalog: ModelCatalogSnapshot | None,
+) -> SessionBehaviorStatus:
+    requested_model, model_source = _configured_value(
+        conversation.model_override,
+        project.default_model,
+    )
+    descriptor: ModelDescriptor | None = None
+    resolution = "resolved"
+    if catalog is None:
+        resolution = "resolves on next Turn"
+    elif requested_model is not None:
+        try:
+            descriptor = _find_model(catalog, requested_model)
+        except InvariantError:
+            resolution = (
+                "configured model unavailable"
+                if catalog.complete
+                else "catalog incomplete"
+            )
+    else:
+        descriptor = next((model for model in catalog.models if model.is_default), None)
+        if descriptor is None:
+            resolution = (
+                "configured model unavailable"
+                if catalog.complete
+                else "catalog incomplete"
+            )
+
+    model = SessionStatusValue(
+        value=(
+            descriptor.model
+            if descriptor is not None
+            else requested_model or "provider default"
+        ),
+        source=(model_source if requested_model is not None else "provider default"),
+    )
+    reasoning_effort = _resolved_value(
+        conversation.reasoning_effort_override,
+        project.default_reasoning_effort,
+        descriptor.default_reasoning_effort if descriptor is not None else None,
+        model_default_source="model default",
+    )
+    reasoning_summary = _resolved_value(
+        conversation.reasoning_summary_override,
+        project.default_reasoning_summary,
+        None,
+        model_default_source="provider default",
+    )
+    personality = _resolved_value(
+        conversation.personality_override,
+        project.default_personality,
+        None,
+        model_default_source="provider default",
+    )
+    service_tier = _resolved_value(
+        conversation.service_tier_override,
+        project.default_service_tier,
+        descriptor.default_service_tier if descriptor is not None else None,
+        model_default_source="model default",
+    )
+    return SessionBehaviorStatus(
+        model=model,
+        reasoning_effort=reasoning_effort,
+        reasoning_summary=reasoning_summary,
+        personality=personality,
+        service_tier=service_tier,
+        web_search_mode=conversation.web_search_mode,
+        input_modalities=(
+            descriptor.input_modalities if descriptor is not None else ()
+        ),
+        resolution=resolution,
+    )
+
+
+def _configured_value(
+    conversation_override: str | None,
+    project_default: str | None,
+) -> tuple[str | None, str]:
+    if conversation_override is not None:
+        return conversation_override, "conversation override"
+    if project_default is not None:
+        return project_default, "project default"
+    return None, "provider default"
+
+
+def _resolved_value(
+    conversation_override: str | None,
+    project_default: str | None,
+    model_default: str | None,
+    *,
+    model_default_source: str,
+) -> SessionStatusValue:
+    if conversation_override is not None:
+        return SessionStatusValue(conversation_override, "conversation override")
+    if project_default is not None:
+        return SessionStatusValue(project_default, "project default")
+    if model_default is not None:
+        return SessionStatusValue(model_default, model_default_source)
+    return SessionStatusValue("provider default", "provider default")
+
+
+def _behavior_tuple(behavior: SessionBehaviorStatus) -> tuple[str, ...]:
+    return (
+        behavior.model.value,
+        behavior.reasoning_effort.value,
+        behavior.reasoning_summary.value,
+        behavior.personality.value,
+        behavior.service_tier.value,
+        behavior.web_search_mode,
+    )
+
+
+def _turn_behavior_tuple(turn: TurnRecord) -> tuple[str, ...]:
+    return (
+        turn.effective_model or "provider default",
+        turn.effective_reasoning_effort or "provider default",
+        turn.effective_reasoning_summary or "provider default",
+        turn.effective_personality or "provider default",
+        turn.effective_service_tier or "provider default",
+        turn.effective_web_search_mode,
     )
 
 

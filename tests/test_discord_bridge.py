@@ -17,7 +17,13 @@ from discord import app_commands
 
 from codexd.application.schedule_coordinator import ScheduleCoordinator
 from codexd.application.session_coordinator import ResolvedProject, SessionCoordinator
-from codexd.application.session_lifecycle import SessionStatus
+from codexd.application.session_lifecycle import (
+    SessionActivityStatus,
+    SessionBehaviorStatus,
+    SessionStatus,
+    SessionStatusValue,
+    SessionStatusView,
+)
 from codexd.config import AppConfig, DiscordConfig, ScheduleConfig, SecurityConfig
 from codexd.domain.conversations import (
     SandboxProfile,
@@ -246,6 +252,38 @@ async def test_every_registered_discord_command_executes_through_bridge(
     lifecycle.status = AsyncMock(
         return_value=SessionStatus(conversation, revision)
     )
+    lifecycle.status_view = AsyncMock(
+        return_value=SessionStatusView(
+            conversation=conversation,
+            active_revision=revision,
+            project_name=storage_context.project.name,
+            behavior=SessionBehaviorStatus(
+                model=SessionStatusValue("gpt-test", "provider default"),
+                reasoning_effort=SessionStatusValue("medium", "model default"),
+                reasoning_summary=SessionStatusValue(
+                    "provider default", "provider default"
+                ),
+                personality=SessionStatusValue(
+                    "provider default", "provider default"
+                ),
+                service_tier=SessionStatusValue("fast", "model default"),
+                web_search_mode="cached",
+                input_modalities=("text", "image"),
+                resolution="resolved",
+            ),
+            activity=SessionActivityStatus(
+                runtime_state="ready",
+                runtime_generation=1,
+                queued_turns=0,
+                active_turns=1,
+                last_completed_at=None,
+                active_turn=running_turn,
+                active_settings_differ=True,
+            ),
+            resume_verification="verified by active provider Turn",
+            degraded_reason=None,
+        )
+    )
     for name in (
         "set_model",
         "set_reasoning_effort",
@@ -454,6 +492,19 @@ async def test_every_registered_discord_command_executes_through_bridge(
     )
     status = interactions["/status"].followup.send.await_args.args[0]
     assert "Schedule: active 1 · paused 0 · blocked 0" in status
+    session_status_call = interactions["/session/status"].followup.send.await_args
+    session_embed = session_status_call.kwargs["embed"]
+    assert session_status_call.kwargs["ephemeral"] is True
+    assert session_embed.title == "🟢 Session active"
+    assert [field.name for field in session_embed.fields] == [
+        "Model & behavior · next Turn",
+        "Activity",
+        "Session",
+        "Execution",
+    ]
+    assert "Optional capabilities" not in json.dumps(
+        session_embed.to_dict(), ensure_ascii=False
+    )
     capabilities = interactions["/capabilities"].followup.send.await_args.args[0]
     assert "`bot_mention_input`" in capabilities
     assert "`sdk_mention_input`" in capabilities
@@ -484,6 +535,7 @@ async def test_every_registered_discord_command_executes_through_bridge(
         getattr(lifecycle, name).assert_awaited_once()
     assert lifecycle.set_service_tier.await_count == 2
     assert lifecycle.set_reasoning_summary.await_count == 2
+    lifecycle.status_view.assert_awaited_once_with(conversation.id)
     for name in (
         "set_web_search",
         "new",

@@ -3050,19 +3050,25 @@ Discord permission 重新分类，permanent denial 进入 blocked/dead letter。
 
 #### `/session status`
 
-显示：
+返回单个分组清晰的 ephemeral Embed，标题同时以 icon 和文字表达
+active/uninitialized/archived/needs-attention，颜色只作辅助。字段顺序固定为：
 
-- Conversation state；
-- active Thread Revision 的短 ID；
-- provider version；
-- Runtime Slot state/generation；
-- queued/active Turn；
-- effective model/reasoning effort/summary/personality/service-tier/web-search/sandbox；
-- last completed Turn time；
-- resume 是否已在当前 runtime 验证；
-- optional capabilities。
+1. `Model & behavior · next Turn`：实际 model display、来源（Conversation override /
+   Project default / provider default）、effective reasoning effort/summary/personality/
+   service tier/web search 和 input modalities；
+2. `Activity`：Runtime state、非零 generation、queued/active Turn、last completed relative
+   time；有 active Turn 时显示其 enqueue-time effective snapshot，若与 next-Turn settings
+   不同则明确标注；
+3. `Session`：active revision short ID/name、provider version 和 resume verification；
+4. `Execution`：固定 `FULL ACCESS / auto_review`，仅在 provider barrier 或 degraded
+   resolution 存在时显示 warning。
 
-不显示完整本地路径给普通 channel；详细路径只在 ephemeral response。
+完整 optional capability 名称列表只由 `/capabilities` 展示，不进入 status。runtime 未
+加载时 status 不得 cold-start app-server；显示 persisted configured value，无配置则显示
+`provider default · resolves on next Turn`。只有已加载且 ready 的 runtime 可在 bounded
+timeout 内读取 catalog；timeout/incomplete/error 均降级为安全状态文字，不能使整个
+status 失败。Embed 不显示完整 provider ID/hash、本地路径、账号或 secret，所有动态文本
+经过 mention/Markdown suppression 和 Discord 长度限制。
 
 #### `/session new`
 
