@@ -141,6 +141,7 @@ class IngressMessageRecord:
     discord_channel_id: int
     conversation_id: str | None
     requested_by_user_id: int | None
+    discovery_kind: str
     state: str
     turn_id: str | None
     accepted_boot_id: str
@@ -286,6 +287,32 @@ class SideQueryRecord:
     created_at: int
     started_at: int | None
     completed_at: int | None
+
+
+@dataclass(frozen=True)
+class DiscordIngressCheckpointRecord:
+    id: str
+    discord_guild_id: int
+    discord_channel_id: int
+    scope_kind: str
+    conversation_id: str | None
+    discord_parent_channel_id: int | None
+    last_scanned_message_id: int
+    in_progress_barrier_id: int | None
+    in_progress_after_id: int | None
+    scan_state: str
+    last_scan_started_at: int | None
+    last_scan_completed_at: int | None
+    last_error_code: str | None
+
+
+@dataclass(frozen=True)
+class DiscordIngressTargetRecord:
+    discord_guild_id: int
+    discord_channel_id: int
+    scope_kind: str
+    conversation_id: str | None
+    discord_parent_channel_id: int | None
 
 
 @dataclass(frozen=True)

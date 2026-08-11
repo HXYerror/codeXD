@@ -869,8 +869,11 @@ class Repository:
         discord_guild_id: int,
         discord_channel_id: int,
         requested_by_user_id: int | None = None,
+        discovery_kind: str = "live",
         boot_id: str,
     ) -> tuple[bool, str | None]:
+        if discovery_kind not in {"live", "backfill"}:
+            raise InvariantError("invalid Discord ingress discovery kind")
         now = utc_now_ms()
         with self.store.transaction() as connection:
             row = connection.execute(
@@ -909,8 +912,9 @@ class Repository:
                     id, discord_message_id, accepted_content_hash,
                     accepted_attachment_manifest_hash, project_id,
                     conversation_id, discord_guild_id, discord_channel_id,
-                    requested_by_user_id, state, accepted_boot_id, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_preflight', ?, ?)
+                    requested_by_user_id, discovery_kind, state,
+                    accepted_boot_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_preflight', ?, ?)
                 """,
                 (
                     new_id(),
@@ -926,6 +930,7 @@ class Repository:
                         if requested_by_user_id is not None
                         else None
                     ),
+                    discovery_kind,
                     boot_id,
                     now,
                 ),
@@ -944,8 +949,11 @@ class Repository:
         discord_guild_id: int,
         discord_channel_id: int,
         owner_user_id: int,
+        discovery_kind: str = "live",
         boot_id: str,
     ) -> tuple[bool, str]:
+        if discovery_kind not in {"live", "backfill"}:
+            raise InvariantError("invalid Discord ingress discovery kind")
         now = utc_now_ms()
         with self.store.transaction() as connection:
             project = connection.execute(
@@ -1019,9 +1027,10 @@ class Repository:
                     id, discord_message_id, accepted_content_hash,
                     accepted_attachment_manifest_hash, project_id, state,
                     discord_guild_id, discord_channel_id,
-                    requested_by_user_id, thread_creation_outbox_id,
+                    requested_by_user_id, discovery_kind,
+                    thread_creation_outbox_id,
                     accepted_boot_id, created_at
-                ) VALUES (?, ?, ?, ?, ?, 'pending_thread', ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, 'pending_thread', ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     ingress_id,
@@ -1032,6 +1041,7 @@ class Repository:
                     str(discord_guild_id),
                     str(discord_channel_id),
                     str(owner_user_id),
+                    discovery_kind,
                     outbox_id,
                     boot_id,
                     now,
@@ -1140,6 +1150,18 @@ class Repository:
         if row is None:
             raise NotFoundError(f"ingress message not found: {discord_message_id}")
         return _ingress(row)
+
+    def pending_backfill_preflight_ids(self) -> tuple[str, ...]:
+        return tuple(
+            str(row["discord_message_id"])
+            for row in self.store.query_all(
+                """
+                SELECT discord_message_id FROM ingress_messages
+                WHERE state = 'pending_preflight' AND discovery_kind = 'backfill'
+                ORDER BY CAST(discord_message_id AS INTEGER)
+                """
+            )
+        )
 
     def reject_ingress_message(
         self,
@@ -1382,6 +1404,11 @@ class Repository:
         from codexd.storage.outbound_images import OutboundImageRepository
 
         return OutboundImageRepository(self.store).registered_for_turn(turn_id)
+
+    def ingress_reconciliation_counts(self) -> dict[str, int | str | None]:
+        from codexd.storage.ingress_reconciliation import IngressCheckpointRepository
+
+        return IngressCheckpointRepository(self.store).counts()
 
     def persist_render_plan(
         self,
@@ -5573,9 +5600,13 @@ class Repository:
         with self.store.transaction() as connection:
             interrupted_rows = connection.execute(
                 """
-                SELECT id, state FROM turns
-                WHERE state IN ('starting', 'running', 'cancelling')
-                   OR (state = 'queued' AND source_kind = 'discord')
+                SELECT t.id, t.state FROM turns t
+                LEFT JOIN ingress_messages i ON i.turn_id = t.id
+                WHERE t.state IN ('starting', 'running', 'cancelling')
+                   OR (
+                       t.state = 'queued' AND t.source_kind = 'discord'
+                       AND COALESCE(i.discovery_kind, 'live') <> 'backfill'
+                   )
                 """,
             ).fetchall()
             for interrupted in interrupted_rows:
@@ -5620,6 +5651,7 @@ class Repository:
                     completed_at = ?
                 WHERE state = 'pending_preflight'
                   AND accepted_boot_id <> ?
+                  AND discovery_kind = 'live'
                 """,
                 (now, current_boot_id),
             ).rowcount
@@ -7063,6 +7095,7 @@ def _ingress(row: sqlite3.Row) -> IngressMessageRecord:
             if row["requested_by_user_id"] is not None
             else None
         ),
+        discovery_kind=str(row["discovery_kind"]),
         state=str(row["state"]),
         turn_id=str(row["turn_id"]) if row["turn_id"] is not None else None,
         accepted_boot_id=str(row["accepted_boot_id"]),

@@ -40,6 +40,7 @@ from codexd.rendering.media_worker import MediaWorker
 from codexd.runtime.supervisor import RuntimeSupervisor
 from codexd.security.redaction import redact_diff
 from codexd.security.signing import ComponentSigner
+from codexd.storage.ingress_reconciliation import IngressCheckpointRepository
 from codexd.storage.records import (
     CommandIntentRecord,
     ConversationRecord,
@@ -70,6 +71,7 @@ from codexd.transport.discord.presentation import (
     schedule_draft_embed,
     session_status_embed,
 )
+from codexd.transport.discord.reconciliation import DiscordInboundReconciler
 
 logger = logging.getLogger(__name__)
 _DISCORD_INTERACTION_ACK_DEADLINE_SECONDS = 3.0
@@ -214,6 +216,19 @@ class CodexDBot(discord.Client):
         self._codex_auth_state = "unknown"
         self._security_responses_sent: set[str] = set()
         self._active_command_intents: set[str] = set()
+        self._inbound_catching_up = False
+        self._inbound_reconciliation_degraded = False
+        self._inbound_reconciler = (
+            DiscordInboundReconciler(
+                repository=IngressCheckpointRepository(repository.store),
+                guild_id=config.discord.guild_id,
+                handler=self._handle_reconciled_message,
+                status_observer=self._observe_reconciliation_status,
+            )
+            if config.discord.guild_id is not None
+            else None
+        )
+        self._inbound_reconciler_started = False
         self.tree.error(self._on_command_error)
 
     @property
@@ -246,6 +261,9 @@ class CodexDBot(discord.Client):
             initial_ingress_ready=self._process_initial_ingress,
         )
         self._outbox.start()
+        if self._inbound_reconciler is not None:
+            self._inbound_reconciler.start(self)
+            self._inbound_reconciler_started = True
         self._register_commands()
         guild_id = self.config.discord.guild_id
         if guild_id is None:
@@ -281,6 +299,8 @@ class CodexDBot(discord.Client):
     ) -> bool:
         self._accepting_ingress = False
         self._gateway_ready = False
+        if self._inbound_reconciler is not None:
+            await self._inbound_reconciler.close()
         started = time.monotonic()
         try:
             if deadline_seconds is None:
@@ -323,6 +343,32 @@ class CodexDBot(discord.Client):
                     await self._ready_preflight()
                 else:
                     self._update_discord_ready_status()
+            if (
+                self._inbound_reconciler is not None
+                and self._inbound_reconciler_started
+                and self._accepting_ingress
+            ):
+                await self._recover_pending_backfill_preflights()
+                await self._inbound_reconciler.trigger(self, reason="ready")
+        finally:
+            self._untrack_ingress(task)
+
+    async def _recover_pending_backfill_preflights(self) -> None:
+        message_ids = await asyncio.to_thread(
+            self.repository.pending_backfill_preflight_ids
+        )
+        for message_id in message_ids:
+            await self._process_initial_ingress_locked(message_id)
+
+    async def on_resumed(self) -> None:
+        task = self._track_ingress()
+        try:
+            if (
+                self._inbound_reconciler is not None
+                and self._inbound_reconciler_started
+                and self._accepting_ingress
+            ):
+                await self._inbound_reconciler.trigger(self, reason="resumed")
         finally:
             self._untrack_ingress(task)
 
@@ -513,11 +559,21 @@ class CodexDBot(discord.Client):
     def _update_discord_ready_status(self) -> None:
         if not self._gateway_ready:
             return
+        if self._inbound_catching_up:
+            self._discord_status("catching_up")
+            return
         self._discord_status(
             "degraded"
-            if self._ready_preflight_degraded or self._command_sync_degraded
+            if self._ready_preflight_degraded
+            or self._command_sync_degraded
+            or self._inbound_reconciliation_degraded
             else "ready"
         )
+
+    def _observe_reconciliation_status(self, status: str) -> None:
+        self._inbound_catching_up = status == "catching_up"
+        self._inbound_reconciliation_degraded = status == "degraded"
+        self._update_discord_ready_status()
 
     def _track_ingress(self) -> asyncio.Task[Any] | None:
         task = asyncio.current_task()
@@ -1086,11 +1142,29 @@ class CodexDBot(discord.Client):
             async with self._ingress_lock:
                 if not self._accepting_ingress:
                     return
-            await self._handle_message(message)
+            if (
+                self._inbound_reconciler is not None
+                and self._inbound_reconciler_started
+            ):
+                await self._inbound_reconciler.process_live(message)
+            else:
+                await self._handle_message(message)
         finally:
             self._untrack_ingress(task)
 
-    async def _handle_message(self, message: discord.Message) -> None:
+    async def _handle_reconciled_message(
+        self,
+        message: discord.Message,
+        backfill: bool,
+    ) -> None:
+        await self._handle_message(message, backfill=backfill)
+
+    async def _handle_message(
+        self,
+        message: discord.Message,
+        *,
+        backfill: bool = False,
+    ) -> None:
         if (
             message.author.bot
             or message.webhook_id is not None
@@ -1102,6 +1176,12 @@ class CodexDBot(discord.Client):
             return
         conversation: ConversationRecord | None = None
         try:
+            if backfill and self._inbound_reconciler is not None:
+                known = await self._inbound_reconciler.known_ingress(message)
+                if known:
+                    if known == ("pending_preflight", "backfill"):
+                        await self._process_initial_ingress_locked(str(message.id))
+                    return
             content = message.content
             if isinstance(message.channel, discord.Thread):
                 conversation = await self.sessions.conversation_for_thread(message.channel.id)
@@ -1118,6 +1198,7 @@ class CodexDBot(discord.Client):
                     conversation=conversation,
                     content=content,
                     preclaimed=False,
+                    backfill=backfill,
                 )
             elif (
                 isinstance(message.channel, discord.TextChannel)
@@ -1155,11 +1236,14 @@ class CodexDBot(discord.Client):
                     discord_guild_id=message.guild.id,
                     discord_channel_id=message.channel.id,
                     owner_user_id=message.author.id,
+                    discovery_kind="backfill" if backfill else "live",
                     boot_id=self.boot_id,
                 )
             else:
                 return
         except (CodexDError, ValueError) as exc:
+            if backfill and isinstance(exc, SecurityError):
+                raise
             await message.channel.send(
                 _bounded_response(
                     f"codexD `{getattr(exc, 'code', 'invalid_input')}`: {exc}"
@@ -1181,6 +1265,8 @@ class CodexDBot(discord.Client):
                 ),
                 details={"exception": type(exc).__name__},
             )
+            if backfill:
+                raise
             await message.channel.send(
                 "codexD `internal_error`: message ingestion failed; see diagnostics.",
                 allowed_mentions=discord.AllowedMentions.none(),
@@ -1213,7 +1299,10 @@ class CodexDBot(discord.Client):
         conversation = await asyncio.to_thread(
             self.repository.get_conversation, ingress.conversation_id
         )
-        if ingress.accepted_boot_id != self.boot_id:
+        if (
+            ingress.accepted_boot_id != self.boot_id
+            and ingress.discovery_kind != "backfill"
+        ):
             await self._reject_initial_ingress(
                 ingress.discord_message_id,
                 conversation,
@@ -1265,6 +1354,7 @@ class CodexDBot(discord.Client):
                 conversation=conversation,
                 content=content,
                 preclaimed=True,
+                backfill=ingress.discovery_kind == "backfill",
             )
         except asyncio.CancelledError:
             raise
@@ -1314,6 +1404,7 @@ class CodexDBot(discord.Client):
         conversation: ConversationRecord,
         content: str,
         preclaimed: bool,
+        backfill: bool = False,
     ) -> None:
         attachments = _message_attachments(message)
         if not content.strip() and not attachments:
@@ -1334,6 +1425,7 @@ class CodexDBot(discord.Client):
                 discord_guild_id=conversation.discord_guild_id,
                 discord_channel_id=message.channel.id,
                 requested_by_user_id=message.author.id,
+                discovery_kind="backfill" if backfill else "live",
                 boot_id=self.boot_id,
             )
             if not claimed:
@@ -2067,16 +2159,21 @@ class CodexDBot(discord.Client):
     async def _status(self, interaction: discord.Interaction[Any]) -> None:
         await self._defer_authorized(interaction)
         project, conversation, routing = await self._command_scope(interaction)
-        counts, runtime, account = await asyncio.gather(
+        counts, runtime, account, inbound = await asyncio.gather(
             asyncio.to_thread(self.repository.health_counts),
             self.runtimes.project_status(project.id),
             self.runtimes.account_status_if_loaded(project.id),
+            asyncio.to_thread(self.repository.ingress_reconciliation_counts),
         )
         discord_state = (
             "disconnected"
             if not self._gateway_ready
+            else "catching_up"
+            if self._inbound_catching_up
             else "degraded"
-            if self._ready_preflight_degraded or self._command_sync_degraded
+            if self._ready_preflight_degraded
+            or self._command_sync_degraded
+            or self._inbound_reconciliation_degraded
             else "ready"
         )
         service_state = (
@@ -2167,6 +2264,9 @@ class CodexDBot(discord.Client):
                     f"Delivery: pending {counts['outbox_pending']} · retry "
                     f"{counts['outbox_retry']} · dead-letter "
                     f"{counts['outbox_dead_letter']}",
+                    "Inbound recovery: scanning "
+                    f"{inbound['scanning']} · retry {inbound['retry']} · "
+                    f"blocked {inbound['blocked']}",
                 )
             ),
             ephemeral=True,
