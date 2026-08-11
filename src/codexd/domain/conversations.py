@@ -98,6 +98,7 @@ class ThreadIdentity:
     forked_from_thread_id: str | None
     parent_thread_id: str | None
     provider_version: str
+    dynamic_tools_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -106,4 +107,3 @@ class ThreadSnapshot:
     state: ThreadProviderState
     active_flags: tuple[str, ...] = ()
     error_message: str | None = None
-

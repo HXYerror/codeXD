@@ -269,6 +269,88 @@ def task_card_embed(
     return embed
 
 
+def schedule_draft_embed(payload: Mapping[str, object]) -> discord.Embed:
+    state = str(payload.get("state") or "pending")
+    if state == "confirmed":
+        description = "✅ Confirmed by the configured Discord owner."
+        color = COLOR_SUCCESS
+    elif state == "cancelled":
+        description = "Cancelled; no Schedule was activated."
+        color = COLOR_MUTED
+    elif state in {"expired", "delivery_failed"}:
+        description = "Expired; no Schedule was activated."
+        color = COLOR_FAILURE
+    else:
+        description = (
+            "⚠️ **FULL ACCESS / unattended:** confirming activates work with "
+            "unrestricted project and system access."
+        )
+        color = COLOR_FAILURE
+    embed = discord.Embed(
+        title=f"Schedule · {_safe_plain(payload.get('action') or 'create', 32)}",
+        description=description,
+        color=color,
+    )
+    embed.add_field(
+        name="Name",
+        value=_safe_plain(payload.get("name") or "unknown", 1024),
+        inline=True,
+    )
+    expression = _safe_plain(payload.get("expression") or "unknown", 512)
+    timezone = _safe_plain(payload.get("timezone") or "unknown", 256)
+    embed.add_field(
+        name="When",
+        value=f"`{expression}`\n{timezone}"[:1024],
+        inline=True,
+    )
+    embed.add_field(
+        name="Misfire",
+        value=f"`{_safe_plain(payload.get('misfire_policy') or 'unknown', 64)}`",
+        inline=True,
+    )
+    embed.add_field(
+        name="Prompt",
+        value=_safe_plain(payload.get("prompt_text") or "unavailable", 1000),
+        inline=False,
+    )
+    occurrences = payload.get("occurrences")
+    preview: list[str] = []
+    if isinstance(occurrences, Sequence) and not isinstance(occurrences, str):
+        for index, item in enumerate(occurrences[:3], start=1):
+            if not isinstance(item, Mapping):
+                continue
+            utc_ms = item.get("utc_ms")
+            local = item.get("local_display")
+            if (
+                isinstance(utc_ms, int)
+                and not isinstance(utc_ms, bool)
+                and isinstance(local, str)
+            ):
+                preview.append(
+                    f"{index}. <t:{utc_ms // 1000}:F> "
+                    f"(`{_safe_plain(local, 160)}`)"
+                )
+    embed.add_field(
+        name="Next occurrences",
+        value="\n".join(preview)[:1024] or "No future occurrence resolved.",
+        inline=False,
+    )
+    if state == "confirmed":
+        schedule_ref = _safe_plain(payload.get("schedule_ref") or "unknown", 16)
+        next_due_at = payload.get("next_due_at")
+        detail = f"Schedule `{schedule_ref}` is active."
+        if isinstance(next_due_at, int) and not isinstance(next_due_at, bool):
+            detail += f" Next: <t:{next_due_at // 1000}:F>."
+        embed.add_field(name="Result", value=detail[:1024], inline=False)
+    footer = (
+        "codexD · confirmation expires in 10 minutes"
+        if state == "pending"
+        else f"codexD · {state}"
+    )
+    embed.set_footer(text=footer)
+    return embed
+
+
 def notice_embed(
     content: str,
     *,

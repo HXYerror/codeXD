@@ -66,6 +66,7 @@ class TurnCoordinator:
         critical_failure: Callable[[BaseException], None] | None = None,
         provider_barrier_observer: Callable[[str], None] | None = None,
         skill_input_supported: bool = True,
+        schedule_tool_supported: bool = False,
     ) -> None:
         self._repository = repository
         self._runtime_supervisor = runtime_supervisor
@@ -76,6 +77,7 @@ class TurnCoordinator:
             lambda _conversation_id: None
         )
         self._skill_input_supported = skill_input_supported
+        self._schedule_tool_supported = schedule_tool_supported
         self._active: dict[str, ActiveTurn] = {}
         self._inflight: set[str] = set()
         self._active_lock = asyncio.Lock()
@@ -136,6 +138,7 @@ class TurnCoordinator:
         input_message_id: str | None = None,
         schedule_fire_id: str | None = None,
         ingress_message_id: str | None = None,
+        requested_by_user_id: int | None = None,
     ) -> TurnRecord:
         if self._closing:
             raise ConflictError("Turn coordinator is shutting down")
@@ -150,6 +153,7 @@ class TurnCoordinator:
                 input_message_id=input_message_id,
                 schedule_fire_id=schedule_fire_id,
                 ingress_message_id=ingress_message_id,
+                requested_by_user_id=requested_by_user_id,
             )
         await self._mailboxes.wake(conversation_id)
         return turn
@@ -405,6 +409,17 @@ class TurnCoordinator:
             revision = await asyncio.to_thread(
                 self._repository.get_active_revision, conversation.id
             )
+            if (
+                revision is not None
+                and self._schedule_tool_supported
+                and not revision.dynamic_tools_enabled
+                and queued.source_kind is TurnSource.DISCORD
+            ):
+                await asyncio.to_thread(
+                    self._repository.enqueue_dynamic_tool_upgrade_notice,
+                    conversation_id=conversation.id,
+                    turn_id=queued.id,
+                )
             if revision is None:
                 await asyncio.to_thread(
                     self._repository.set_provider_barrier,

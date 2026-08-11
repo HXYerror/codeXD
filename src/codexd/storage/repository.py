@@ -867,6 +867,7 @@ class Repository:
         conversation_id: str,
         discord_guild_id: int,
         discord_channel_id: int,
+        requested_by_user_id: int | None = None,
         boot_id: str,
     ) -> tuple[bool, str | None]:
         now = utc_now_ms()
@@ -875,7 +876,7 @@ class Repository:
                 """
                 SELECT accepted_content_hash, accepted_attachment_manifest_hash,
                        project_id, conversation_id, discord_guild_id,
-                       discord_channel_id, turn_id
+                       discord_channel_id, requested_by_user_id, turn_id
                 FROM ingress_messages
                 WHERE discord_message_id = ?
                 """,
@@ -890,6 +891,11 @@ class Repository:
                     or row["conversation_id"] != conversation_id
                     or row["discord_guild_id"] != str(discord_guild_id)
                     or row["discord_channel_id"] != str(discord_channel_id)
+                    or (
+                        requested_by_user_id is not None
+                        and row["requested_by_user_id"]
+                        != str(requested_by_user_id)
+                    )
                 ):
                     raise ConflictError(
                         "Discord message ID was already accepted with different content"
@@ -902,8 +908,8 @@ class Repository:
                     id, discord_message_id, accepted_content_hash,
                     accepted_attachment_manifest_hash, project_id,
                     conversation_id, discord_guild_id, discord_channel_id,
-                    state, accepted_boot_id, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending_preflight', ?, ?)
+                    requested_by_user_id, state, accepted_boot_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_preflight', ?, ?)
                 """,
                 (
                     new_id(),
@@ -914,6 +920,11 @@ class Repository:
                     conversation_id,
                     str(discord_guild_id),
                     str(discord_channel_id),
+                    (
+                        str(requested_by_user_id)
+                        if requested_by_user_id is not None
+                        else None
+                    ),
                     boot_id,
                     now,
                 ),
@@ -954,6 +965,7 @@ class Repository:
                     or existing["project_id"] != project_id
                     or existing["discord_guild_id"] != str(discord_guild_id)
                     or existing["discord_channel_id"] != str(discord_channel_id)
+                    or existing["requested_by_user_id"] != str(owner_user_id)
                 ):
                     raise ConflictError(
                         "Discord message ID was already accepted with different content"
@@ -1006,8 +1018,9 @@ class Repository:
                     id, discord_message_id, accepted_content_hash,
                     accepted_attachment_manifest_hash, project_id, state,
                     discord_guild_id, discord_channel_id,
-                    thread_creation_outbox_id, accepted_boot_id, created_at
-                ) VALUES (?, ?, ?, ?, ?, 'pending_thread', ?, ?, ?, ?, ?)
+                    requested_by_user_id, thread_creation_outbox_id,
+                    accepted_boot_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, 'pending_thread', ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     ingress_id,
@@ -1017,6 +1030,7 @@ class Repository:
                     project_id,
                     str(discord_guild_id),
                     str(discord_channel_id),
+                    str(owner_user_id),
                     outbox_id,
                     boot_id,
                     now,
@@ -2295,8 +2309,8 @@ class Repository:
                         id, conversation_id, provider_thread_id, provider_session_id,
                         provider_forked_from_thread_id, provider_parent_thread_id,
                         parent_revision_id, state, thread_config_json, requested_resume_id,
-                        provider_version, created_at, activated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)
+                        provider_version, dynamic_tools_enabled, created_at, activated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         revision_id,
@@ -2309,6 +2323,7 @@ class Repository:
                         canonical_json(config.as_dict()),
                         identity.requested_thread_id,
                         identity.provider_version,
+                        int(identity.dynamic_tools_enabled),
                         now,
                         now,
                     ),
@@ -2319,13 +2334,16 @@ class Repository:
                     """
                     UPDATE thread_revisions
                     SET state = 'active', activated_at = ?, archived_at = NULL,
-                        thread_config_json = ?, requested_resume_id = ?
+                        thread_config_json = ?, requested_resume_id = ?,
+                        dynamic_tools_enabled = CASE
+                            WHEN ? THEN 1 ELSE dynamic_tools_enabled END
                     WHERE id = ?
                     """,
                     (
                         now,
                         canonical_json(config.as_dict()),
                         identity.requested_thread_id,
+                        identity.dynamic_tools_enabled,
                         revision_id,
                     ),
                 )
@@ -2383,6 +2401,59 @@ class Repository:
             (conversation_id,),
         )
         return _revision(row) if row else None
+
+    def enqueue_dynamic_tool_upgrade_notice(
+        self,
+        *,
+        conversation_id: str,
+        turn_id: str,
+    ) -> None:
+        now = utc_now_ms()
+        with self.store.transaction() as connection:
+            scope = connection.execute(
+                """
+                SELECT c.discord_thread_id
+                FROM conversations c
+                JOIN thread_revisions r ON r.id = c.active_revision_id
+                JOIN turns t ON t.conversation_id = c.id
+                WHERE c.id = ? AND t.id = ? AND t.source_kind = 'discord'
+                  AND r.dynamic_tools_enabled = 0
+                """,
+                (conversation_id, turn_id),
+            ).fetchone()
+            if scope is None:
+                return
+            dedupe_key = f"conversation:{conversation_id}:dynamic-tools-upgrade"
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO discord_outbox(
+                    id, destination_key, operation, payload_json, dedupe_key,
+                    delivery_marker, state, attempts, next_attempt_at,
+                    created_at, updated_at
+                ) VALUES (?, ?, 'send', ?, ?, ?, 'pending', 0, ?, ?, ?)
+                """,
+                (
+                    new_id(),
+                    f"thread:{scope['discord_thread_id']}",
+                    canonical_json(
+                        {
+                            "kind": "notice",
+                            "level": "info",
+                            "title": "Schedule tool available in a new session",
+                            "content": (
+                                "This Codex session predates `codexd.schedule_create`. "
+                                "Run `/session new` once to let Codex prepare Schedule "
+                                "confirmation cards from natural-language requests."
+                            ),
+                        }
+                    ),
+                    dedupe_key,
+                    dedupe_key,
+                    now,
+                    now,
+                    now,
+                ),
+            )
 
     def create_runtime_lease(
         self,
@@ -2643,6 +2714,7 @@ class Repository:
         input_message_id: str | None = None,
         schedule_fire_id: str | None = None,
         ingress_message_id: str | None = None,
+        requested_by_user_id: int | None = None,
     ) -> TurnRecord:
         if source is TurnSource.DISCORD and (not input_message_id or schedule_fire_id):
             raise InvariantError("Discord Turn requires only input_message_id")
@@ -2683,6 +2755,13 @@ class Repository:
                     str(existing["input_hash"]),
                 ):
                     raise ConflictError("duplicate Turn source has different input")
+                if (
+                    requested_by_user_id is not None
+                    and "requested_by_user_id" in tuple(existing.keys())
+                    and existing["requested_by_user_id"]
+                    != str(requested_by_user_id)
+                ):
+                    raise ConflictError("duplicate Turn source has a different actor")
                 return _turn(existing)
 
             turn_id = new_id()
@@ -2710,11 +2789,52 @@ class Repository:
             )
             tier = conversation["service_tier_override"] or conversation["default_service_tier"]
             web_search = conversation["web_search_mode"] or conversation["default_web_search_mode"]
+            actor_column_available = _table_has_column(
+                connection,
+                table="turns",
+                column="requested_by_user_id",
+            )
+            actor_column = ", requested_by_user_id" if actor_column_available else ""
+            actor_value = ", ?" if actor_column_available else ""
+            parameters: tuple[object, ...] = (
+                turn_id,
+                conversation_id,
+                conversation["active_revision_id"],
+                source.value,
+                input_message_id,
+                *(
+                    (
+                        str(requested_by_user_id)
+                        if requested_by_user_id is not None
+                        else None,
+                    )
+                    if actor_column_available
+                    else ()
+                ),
+                schedule_fire_id,
+                turn_input.input_hash,
+                redacted_summary(
+                    turn_input.text or "",
+                    project_root=Path(str(conversation["root_path"])),
+                ),
+                turn_input.text,
+                skill_json,
+                skill_names_json,
+                model,
+                effort,
+                summary,
+                personality,
+                tier,
+                web_search,
+                conversation["sandbox_profile"],
+                now,
+            )
             connection.execute(
-                """
+                f"""
                 INSERT INTO turns(
                     id, conversation_id, thread_revision_id, source_kind,
-                    input_message_id, schedule_fire_id, state, input_hash,
+                    input_message_id{actor_column}, schedule_fire_id,
+                    state, input_hash,
                     input_summary, queued_input_text, queued_skill_inputs_json,
                     effective_skill_names_json,
                     effective_model, effective_reasoning_effort,
@@ -2722,37 +2842,14 @@ class Repository:
                     effective_service_tier, effective_web_search_mode,
                     effective_sandbox, effective_approval_mode, queued_at
                 ) VALUES (
-                    ?, ?, ?, ?, ?, ?, 'queued',
+                    ?, ?, ?, ?, ?{actor_value}, ?, 'queued',
                     ?, ?, ?, ?,
                     ?, ?, ?, ?,
                     ?, ?, ?, ?,
                     'auto_review', ?
                 )
                 """,
-                (
-                    turn_id,
-                    conversation_id,
-                    conversation["active_revision_id"],
-                    source.value,
-                    input_message_id,
-                    schedule_fire_id,
-                    turn_input.input_hash,
-                    redacted_summary(
-                        turn_input.text or "",
-                        project_root=Path(str(conversation["root_path"])),
-                    ),
-                    turn_input.text,
-                    skill_json,
-                    skill_names_json,
-                    model,
-                    effort,
-                    summary,
-                    personality,
-                    tier,
-                    web_search,
-                    conversation["sandbox_profile"],
-                    now,
-                ),
+                parameters,
             )
             if ingress_message_id is not None:
                 insert_prompt_reaction_update(
@@ -2862,6 +2959,36 @@ class Repository:
                 (now, now, conversation_id),
             )
             if ingress_message_id is not None:
+                ingress = connection.execute(
+                    """
+                    SELECT requested_by_user_id
+                    FROM ingress_messages
+                    WHERE discord_message_id = ?
+                    """,
+                    (ingress_message_id,),
+                ).fetchone()
+                if ingress is None:
+                    raise ConflictError(
+                        f"Ingress message {ingress_message_id} is missing"
+                    )
+                if (
+                    requested_by_user_id is not None
+                    and ingress["requested_by_user_id"] is None
+                ):
+                    connection.execute(
+                        """
+                        UPDATE ingress_messages
+                        SET requested_by_user_id = ?
+                        WHERE discord_message_id = ?
+                          AND requested_by_user_id IS NULL
+                        """,
+                        (str(requested_by_user_id), ingress_message_id),
+                    )
+                elif (
+                    requested_by_user_id is not None
+                    and ingress["requested_by_user_id"] != str(requested_by_user_id)
+                ):
+                    raise ConflictError("Ingress message actor changed")
                 completed = connection.execute(
                     """
                     UPDATE ingress_messages
@@ -3580,6 +3707,11 @@ class Repository:
             if current not in {TurnState.STARTING, TurnState.CANCELLING}:
                 raise ConflictError(f"Turn cannot accept provider identity from {current.value}")
             target = TurnState.RUNNING if current is TurnState.STARTING else TurnState.CANCELLING
+            if (
+                row["provider_turn_id"] is not None
+                and row["provider_turn_id"] != provider_turn_id
+            ):
+                raise ConflictError("Turn already has another provider identity")
             connection.execute(
                 """
                 UPDATE turns
@@ -4489,6 +4621,7 @@ class Repository:
         discord_message_id: str | None = None,
         task_card_view_id: str | None = None,
         turn_progress_id: str | None = None,
+        schedule_draft_id: str | None = None,
     ) -> None:
         now = utc_now_ms()
         with self.store.transaction() as connection:
@@ -4542,11 +4675,89 @@ class Repository:
                     raise NotFoundError(
                         f"Turn progress view not found: {turn_progress_id}"
                     )
+            if schedule_draft_id is not None and discord_message_id is not None:
+                draft = connection.execute(
+                    "SELECT * FROM schedule_drafts WHERE id = ?",
+                    (schedule_draft_id,),
+                ).fetchone()
+                if draft is None:
+                    raise NotFoundError(
+                        f"Schedule draft not found: {schedule_draft_id}"
+                    )
+                if draft["confirmation_message_id"] is None:
+                    if draft["confirmation_outbox_id"] != outbox_id:
+                        raise ConflictError(
+                            "Schedule draft message was bound by another outbox"
+                        )
+                    connection.execute(
+                        """
+                        UPDATE schedule_drafts
+                        SET confirmation_message_id = ?, updated_at = ?
+                        WHERE id = ? AND confirmation_message_id IS NULL
+                        """,
+                        (discord_message_id, now, schedule_draft_id),
+                    )
+                elif str(draft["confirmation_message_id"]) != discord_message_id:
+                    raise ConflictError("Schedule draft message identity changed")
+                if draft["state"] == "pending" and int(draft["expires_at"]) <= now:
+                    connection.execute(
+                        """
+                        UPDATE schedule_drafts
+                        SET state = 'expired', payload_json = '{}', updated_at = ?
+                        WHERE id = ? AND state = 'pending'
+                        """,
+                        (now, schedule_draft_id),
+                    )
             _apply_progress_cleanup_after_ack(
                 connection,
                 outbox=outbox,
                 now=now,
             )
+
+    def schedule_draft_message(self, draft_id: str) -> str | None:
+        row = self.store.query_one(
+            """
+            SELECT confirmation_message_id
+            FROM schedule_drafts
+            WHERE id = ? AND confirmation_outbox_id IS NOT NULL
+            """,
+            (draft_id,),
+        )
+        if row is None:
+            raise NotFoundError(f"Schedule draft not found: {draft_id}")
+        value = row["confirmation_message_id"]
+        return str(value) if value is not None else None
+
+    def bind_schedule_draft_message(
+        self,
+        *,
+        draft_id: str,
+        outbox_id: str,
+        discord_message_id: str,
+    ) -> None:
+        now = utc_now_ms()
+        with self.store.transaction() as connection:
+            draft = connection.execute(
+                "SELECT * FROM schedule_drafts WHERE id = ?",
+                (draft_id,),
+            ).fetchone()
+            if draft is None:
+                raise NotFoundError(f"Schedule draft not found: {draft_id}")
+            if draft["confirmation_outbox_id"] != outbox_id:
+                raise ConflictError(
+                    "Schedule draft message was bound by another outbox"
+                )
+            if draft["confirmation_message_id"] is None:
+                connection.execute(
+                    """
+                    UPDATE schedule_drafts
+                    SET confirmation_message_id = ?, updated_at = ?
+                    WHERE id = ? AND confirmation_message_id IS NULL
+                    """,
+                    (discord_message_id, now, draft_id),
+                )
+            elif str(draft["confirmation_message_id"]) != discord_message_id:
+                raise ConflictError("Schedule draft message identity changed")
 
     def retry_outbox(
         self,
@@ -4633,6 +4844,85 @@ class Repository:
                 payload = json.loads(str(outbox["payload_json"]))
             except (json.JSONDecodeError, TypeError, ValueError):
                 payload = {}
+            if (
+                isinstance(payload, dict)
+                and payload.get("kind") == "schedule_draft_card"
+            ):
+                draft_id = payload.get("draft_id")
+                draft = (
+                    connection.execute(
+                        """
+                        SELECT d.*, c.project_id
+                        FROM schedule_drafts d
+                        JOIN conversations c ON c.id = d.conversation_id
+                        WHERE d.id = ?
+                        """,
+                        (draft_id,),
+                    ).fetchone()
+                    if isinstance(draft_id, str)
+                    else None
+                )
+                if (
+                    draft is not None
+                    and draft["confirmation_outbox_id"] == outbox_id
+                    and draft["state"] == "pending"
+                ):
+                    connection.execute(
+                        """
+                        UPDATE schedule_drafts
+                        SET state = 'expired', payload_json = '{}', updated_at = ?
+                        WHERE id = ? AND state = 'pending'
+                        """,
+                        (now, draft_id),
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO incidents(
+                        id, severity, code, project_id, conversation_id,
+                        turn_id, summary, details_json, occurrence_count,
+                        first_seen_at, last_seen_at
+                    ) VALUES (?, 'error', 'schedule_draft_card_delivery_permanent',
+                              ?, ?, ?, ?, ?, 1, ?, ?)
+                    """,
+                    (
+                        new_id(),
+                        draft["project_id"] if draft is not None else None,
+                        draft["conversation_id"] if draft is not None else None,
+                        (
+                            payload.get("turn_id")
+                            if isinstance(payload.get("turn_id"), str)
+                            else None
+                        ),
+                        "A Schedule confirmation card could not be delivered",
+                        canonical_json(
+                            {
+                                "error_code": error_code,
+                                "outbox_id": outbox_id,
+                                "draft_found": draft is not None,
+                            }
+                        ),
+                        now,
+                        now,
+                    ),
+                )
+                if draft is not None:
+                    self._insert_audit(
+                        connection,
+                        actor_kind="system",
+                        actor_id=None,
+                        action="schedule.draft.delivery_failed",
+                        project_id=str(draft["project_id"]),
+                        conversation_id=str(draft["conversation_id"]),
+                        turn_id=None,
+                        schedule_id=None,
+                        correlation_id=f"outbox:{outbox_id}",
+                        payload={
+                            "error_code": error_code,
+                            "draft_ref": str(draft["id"])[:8],
+                        },
+                        now=now,
+                    )
+                return
             cleanup_like = _terminal_progress_cleanup_like(
                 outbox=outbox,
                 payload=payload,
@@ -6314,6 +6604,7 @@ def _revision(row: sqlite3.Row) -> ThreadRevisionRecord:
         state=str(row["state"]),
         thread_config_json=str(row["thread_config_json"]),
         provider_version=str(row["provider_version"]),
+        dynamic_tools_enabled=bool(row["dynamic_tools_enabled"]),
         created_at=int(row["created_at"]),
         activated_at=(
             int(row["activated_at"]) if row["activated_at"] is not None else None
@@ -6328,6 +6619,21 @@ def _runtime_lease(row: sqlite3.Row) -> RuntimeLeaseRecord:
         scope_key=str(row["scope_key"]),
         generation=int(row["generation"]),
         state=str(row["state"]),
+    )
+
+
+def _table_has_column(
+    connection: sqlite3.Connection,
+    *,
+    table: str,
+    column: str,
+) -> bool:
+    return (
+        connection.execute(
+            "SELECT 1 FROM pragma_table_info(?) WHERE name = ?",
+            (table, column),
+        ).fetchone()
+        is not None
     )
 
 
@@ -6346,6 +6652,12 @@ def _turn(row: sqlite3.Row) -> TurnRecord:
         ),
         interrupt_reason=row["interrupt_reason"],
         input_message_id=row["input_message_id"],
+        requested_by_user_id=(
+            int(row["requested_by_user_id"])
+            if "requested_by_user_id" in tuple(row.keys())
+            and row["requested_by_user_id"] is not None
+            else None
+        ),
         schedule_fire_id=row["schedule_fire_id"],
         input_hash=str(row["input_hash"]),
         input_summary=str(row["input_summary"]),
@@ -6726,6 +7038,11 @@ def _ingress(row: sqlite3.Row) -> IngressMessageRecord:
         conversation_id=(
             str(row["conversation_id"])
             if row["conversation_id"] is not None
+            else None
+        ),
+        requested_by_user_id=(
+            int(row["requested_by_user_id"])
+            if row["requested_by_user_id"] is not None
             else None
         ),
         state=str(row["state"]),

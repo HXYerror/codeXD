@@ -175,7 +175,8 @@ def run_retention(
             WHERE state IN ('sent', 'dead_letter', 'superseded')
               AND updated_at < ?
               AND json_extract(payload_json, '$.kind') IN (
-                  'turn_final', 'turn_progress', 'task_card'
+                  'turn_final', 'turn_progress', 'task_card',
+                  'schedule_draft_card'
               )
             """,
             (now, content_cutoff),
@@ -394,6 +395,7 @@ def run_retention(
                 effective_service_tier = NULL,
                 error_message_redacted = NULL,
                 usage_scope = NULL,
+                requested_by_user_id = NULL,
                 retained_at = ?
             WHERE state IN ({_placeholders(_TERMINAL_TURNS)})
               AND ended_at IS NOT NULL
@@ -452,11 +454,42 @@ def run_retention(
             """,
             (now, now),
         )
+        outbox_payloads += connection.execute(
+            """
+            UPDATE discord_outbox
+            SET payload_json = json_object(
+                    'kind', 'retained_tombstone',
+                    'original_kind', 'schedule_draft_card'
+                ),
+                updated_at = ?
+            WHERE state IN ('sent', 'dead_letter', 'superseded')
+              AND json_extract(payload_json, '$.kind') = 'schedule_draft_card'
+              AND json_extract(payload_json, '$.draft_id') IN (
+                  SELECT id FROM schedule_drafts
+                  WHERE updated_at < ?
+                    AND state IN ('confirmed', 'cancelled', 'expired')
+              )
+            """,
+            (now, intent_cutoff),
+        ).rowcount
         schedule_drafts = connection.execute(
             """
             DELETE FROM schedule_drafts
             WHERE updated_at < ?
               AND state IN ('confirmed', 'cancelled', 'expired')
+              AND NOT EXISTS (
+                  SELECT 1 FROM discord_outbox o
+                  WHERE json_extract(o.payload_json, '$.kind') = 'schedule_draft_card'
+                    AND json_extract(o.payload_json, '$.draft_id') = schedule_drafts.id
+                    AND o.state NOT IN ('sent', 'dead_letter', 'superseded')
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM dynamic_tool_invocations dti
+                  JOIN turns t ON t.id = dti.turn_id
+                  WHERE dti.draft_id = schedule_drafts.id
+                    AND t.state IN ('queued', 'starting', 'running', 'cancelling')
+              )
             """,
             (intent_cutoff,),
         ).rowcount

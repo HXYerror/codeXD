@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -28,6 +28,24 @@ class RuntimeSlotConfig:
     environment_hash: str
     topology_contract: str
     codex_bin: Path | None = None
+
+
+@dataclass(frozen=True)
+class DynamicToolCall:
+    runtime_generation: int
+    local_turn_id: str
+    provider_thread_id: str
+    provider_turn_id: str
+    provider_call_id: str
+    namespace: str | None
+    tool: str
+    arguments: object
+
+
+DynamicToolHandler = Callable[
+    [DynamicToolCall],
+    Awaitable[dict[str, object]],
+]
 
 
 class TurnStream:

@@ -8,7 +8,7 @@ import logging
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Literal, Protocol, overload
+from typing import Any, Literal, Protocol, overload
 
 import discord
 
@@ -31,6 +31,7 @@ from codexd.transport.discord.presentation import (
     attachment_embed,
     notice_embed,
     progress_embed,
+    schedule_draft_embed,
     table_copy_view,
     table_embed,
     table_source_embed,
@@ -52,6 +53,7 @@ class DeliveryResult:
     task_card_view_id: str | None = None
     turn_progress_id: str | None = None
     initial_ingress_message_id: str | None = None
+    schedule_draft_id: str | None = None
 
 
 class DeliveryError(RuntimeError):
@@ -240,6 +242,7 @@ class OutboxWorker:
             discord_message_id=result.discord_message_id,
             task_card_view_id=result.task_card_view_id,
             turn_progress_id=result.turn_progress_id,
+            schedule_draft_id=result.schedule_draft_id,
         )
         if (
             result.initial_ingress_message_id is not None
@@ -389,6 +392,15 @@ class DiscordOutboxTransport:
                 return await self._deliver_task_card(
                     channel,
                     payload,
+                    record.operation,
+                    record.delivery_marker,
+                    record.state,
+                )
+            if payload.get("kind") == "schedule_draft_card":
+                return await self._deliver_schedule_draft_card(
+                    channel,
+                    payload,
+                    record.id,
                     record.operation,
                     record.delivery_marker,
                     record.state,
@@ -1057,6 +1069,147 @@ class DiscordOutboxTransport:
             allowed_mentions=discord.AllowedMentions.none(),
         )
         return DeliveryResult(str(message.id), view_id)
+
+    async def _deliver_schedule_draft_card(
+        self,
+        channel: discord.TextChannel | discord.Thread,
+        payload: dict[str, object],
+        outbox_id: str,
+        operation: str,
+        marker: str,
+        record_state: str,
+    ) -> DeliveryResult:
+        if not isinstance(channel, discord.Thread):
+            raise DeliveryError(
+                "schedule_draft_destination_invalid",
+                permanent=True,
+            )
+        draft_id = payload.get("draft_id")
+        state = payload.get("state")
+        if (
+            not isinstance(draft_id, str)
+            or not draft_id
+            or len(draft_id) > 64
+            or state not in {"pending", "confirmed", "cancelled", "expired"}
+        ):
+            raise DeliveryError("schedule_draft_payload_invalid", permanent=True)
+        effective_payload = dict(payload)
+        view: discord.ui.View | None = None
+        if state == "pending":
+            nonce = payload.get("nonce")
+            expires_at = payload.get("expires_at")
+            if (
+                not isinstance(nonce, str)
+                or not nonce
+                or isinstance(expires_at, bool)
+                or not isinstance(expires_at, int)
+            ):
+                raise DeliveryError(
+                    "schedule_draft_payload_invalid",
+                    permanent=True,
+                )
+            if expires_at <= utc_now_ms():
+                effective_payload["state"] = "expired"
+            else:
+                view = discord.ui.View(timeout=None)
+                view.add_item(
+                    discord.ui.Button(
+                        label="Confirm",
+                        style=discord.ButtonStyle.danger,
+                        custom_id=self._signer.schedule_draft_id(
+                            draft_id=draft_id,
+                            action="confirm",
+                            nonce=nonce,
+                        ),
+                    )
+                )
+                view.add_item(
+                    discord.ui.Button(
+                        label="Cancel",
+                        style=discord.ButtonStyle.secondary,
+                        custom_id=self._signer.schedule_draft_id(
+                            draft_id=draft_id,
+                            action="cancel",
+                            nonce=nonce,
+                        ),
+                    )
+                )
+
+        if operation == "edit":
+            message_id = await asyncio.to_thread(
+                self._repository.schedule_draft_message,
+                draft_id,
+            )
+            if message_id is None:
+                raise DeliveryError(
+                    "schedule_draft_message_unbound",
+                    permanent=False,
+                )
+            try:
+                message = await channel.fetch_message(int(message_id))
+            except ValueError as exc:
+                raise DeliveryError(
+                    "schedule_draft_message_invalid",
+                    permanent=True,
+                ) from exc
+            bot_user = self._client.user
+            if bot_user is None or message.author.id != bot_user.id:
+                raise DeliveryError(
+                    "schedule_draft_message_author_mismatch",
+                    permanent=True,
+                )
+            await message.edit(
+                content=_with_marker("", marker),
+                embed=schedule_draft_embed(effective_payload),
+                view=None,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return DeliveryResult(
+                discord_message_id=str(message.id),
+                schedule_draft_id=draft_id,
+            )
+
+        if record_state != "pending":
+            existing = await self._find_marker(channel, marker)
+            if existing is not None:
+                await asyncio.to_thread(
+                    self._repository.bind_schedule_draft_message,
+                    draft_id=draft_id,
+                    outbox_id=outbox_id,
+                    discord_message_id=str(existing.id),
+                )
+                return DeliveryResult(
+                    discord_message_id=str(existing.id),
+                    schedule_draft_id=draft_id,
+                )
+        source_url = _final_source_url(channel, payload)
+        visible_content = (
+            f"-# Original request: <{source_url}>" if source_url is not None else ""
+        )
+        reference = _final_message_reference(channel, payload)
+        send_options: dict[str, Any] = {
+            "embed": schedule_draft_embed(effective_payload),
+            "mention_author": False,
+            "allowed_mentions": discord.AllowedMentions.none(),
+        }
+        if view is not None:
+            send_options["view"] = view
+        if reference is not None:
+            send_options["reference"] = reference
+        message = await channel.send(
+            _with_marker(visible_content, marker),
+            **send_options,
+        )
+        await asyncio.to_thread(
+            self._repository.bind_schedule_draft_message,
+            draft_id=draft_id,
+            outbox_id=outbox_id,
+            discord_message_id=str(message.id),
+        )
+        return DeliveryResult(
+            discord_message_id=str(message.id),
+            schedule_draft_id=draft_id,
+        )
 
     async def _deliver_turn_progress(
         self,

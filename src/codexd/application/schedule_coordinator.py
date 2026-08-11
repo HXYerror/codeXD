@@ -35,6 +35,13 @@ class Occurrence:
         return str(self.utc_ms)
 
 
+@dataclass(frozen=True)
+class PreparedScheduleDraft:
+    payload: dict[str, object]
+    occurrences: tuple[dict[str, object], ...]
+    expires_at: int
+
+
 class ScheduleCoordinator:
     _MAX_DUE_OCCURRENCES_PER_TICK = 100
 
@@ -129,13 +136,16 @@ class ScheduleCoordinator:
         now_ms: int | None = None,
         modal_submission: ScheduleModalSubmission | None = None,
     ) -> ScheduleDraftRecord:
-        spec = parse_schedule_spec(kind, expression, timezone, misfire_policy)
         now = utc_now_ms() if now_ms is None else now_ms
-        occurrences = preview_occurrences(spec, now - 1, limit=3)
-        if not occurrences:
-            raise ConfigurationError("schedule has no future occurrence")
-        normalized_name = _schedule_name(name)
-        prompt = _schedule_prompt(prompt_text)
+        prepared = prepare_schedule_create_draft(
+            name=name,
+            kind=kind,
+            expression=expression,
+            timezone=timezone,
+            misfire_policy=misfire_policy,
+            prompt_text=prompt_text,
+            now_ms=now,
+        )
         return await asyncio.to_thread(
             self._repository.create_draft,
             conversation_id=conversation_id,
@@ -143,25 +153,10 @@ class ScheduleCoordinator:
             guild_id=guild_id,
             channel_id=channel_id,
             action="create",
-            payload={
-                "name": normalized_name,
-                "kind": spec.kind.value,
-                "expression": spec.expression,
-                "timezone": spec.timezone,
-                "misfire_policy": spec.misfire_policy.value,
-                "prompt_text": prompt,
-                "prompt_hash": sha256_text(prompt),
-                "next_due_at": occurrences[0].utc_ms,
-            },
-            occurrences=tuple(
-                {
-                    "utc_ms": occurrence.utc_ms,
-                    "local_display": occurrence.local_display,
-                }
-                for occurrence in occurrences
-            ),
+            payload=prepared.payload,
+            occurrences=prepared.occurrences,
             component_nonce=component_nonce,
-            expires_at=now + 10 * 60 * 1000,
+            expires_at=prepared.expires_at,
             modal_submission=modal_submission,
         )
 
@@ -229,6 +224,7 @@ class ScheduleCoordinator:
         owner_user_id: int,
         guild_id: int,
         channel_id: int,
+        message_id: str | None = None,
         audit: ScheduleAuditContext | None = None,
     ) -> ScheduleRecord:
         return await asyncio.to_thread(
@@ -238,6 +234,7 @@ class ScheduleCoordinator:
             owner_user_id=owner_user_id,
             guild_id=guild_id,
             channel_id=channel_id,
+            message_id=message_id,
             audit=audit,
         )
 
@@ -249,6 +246,7 @@ class ScheduleCoordinator:
         owner_user_id: int,
         guild_id: int,
         channel_id: int,
+        message_id: str | None = None,
         audit: ScheduleAuditContext | None = None,
     ) -> None:
         await asyncio.to_thread(
@@ -258,6 +256,7 @@ class ScheduleCoordinator:
             owner_user_id=owner_user_id,
             guild_id=guild_id,
             channel_id=channel_id,
+            message_id=message_id,
             audit=audit,
         )
 
@@ -638,6 +637,44 @@ def parse_schedule_spec(
         cron = CronExpression.parse(expression)
         canonical = cron.canonical
     return ScheduleSpec(schedule_kind, canonical, timezone, policy)
+
+
+def prepare_schedule_create_draft(
+    *,
+    name: str,
+    kind: str,
+    expression: str,
+    timezone: str,
+    misfire_policy: str,
+    prompt_text: str,
+    now_ms: int,
+) -> PreparedScheduleDraft:
+    spec = parse_schedule_spec(kind, expression, timezone, misfire_policy)
+    occurrences = preview_occurrences(spec, now_ms - 1, limit=3)
+    if not occurrences:
+        raise ConfigurationError("schedule has no future occurrence")
+    normalized_name = _schedule_name(name)
+    prompt = _schedule_prompt(prompt_text)
+    return PreparedScheduleDraft(
+        payload={
+            "name": normalized_name,
+            "kind": spec.kind.value,
+            "expression": spec.expression,
+            "timezone": spec.timezone,
+            "misfire_policy": spec.misfire_policy.value,
+            "prompt_text": prompt,
+            "prompt_hash": sha256_text(prompt),
+            "next_due_at": occurrences[0].utc_ms,
+        },
+        occurrences=tuple(
+            {
+                "utc_ms": occurrence.utc_ms,
+                "local_display": occurrence.local_display,
+            }
+            for occurrence in occurrences
+        ),
+        expires_at=now_ms + 10 * 60 * 1000,
+    )
 
 
 def schedule_spec(schedule: ScheduleRecord) -> ScheduleSpec:

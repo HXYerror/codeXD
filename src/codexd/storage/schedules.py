@@ -17,10 +17,17 @@ from codexd.domain.schedules import (
     validate_persisted_schedule_spec,
 )
 from codexd.domain.turns import TurnInput, TurnSkill
-from codexd.errors import ConfigurationError, ConflictError, NotFoundError, SecurityError
+from codexd.errors import (
+    ConfigurationError,
+    ConflictError,
+    InvariantError,
+    NotFoundError,
+    SecurityError,
+)
 from codexd.security.redaction import redacted_summary
 from codexd.storage.progress import insert_initial_progress
 from codexd.storage.records import (
+    DynamicToolInvocationRecord,
     MaterializedScheduleTurn,
     ScheduleDraftRecord,
     ScheduleFireRecord,
@@ -80,10 +87,7 @@ class ScheduleRepository:
         if (
             action == "create"
             and (schedule_id is not None or expected_version is not None)
-        ) or (
-            action == "update"
-            and (schedule_id is None or expected_version is None)
-        ):
+        ) or (action == "update" and (schedule_id is None or expected_version is None)):
             raise ConflictError("Schedule draft target is invalid")
         now = utc_now_ms()
         draft_id = new_id()
@@ -172,6 +176,7 @@ class ScheduleRepository:
         schedule_id: str | None,
         expected_version: int | None,
         now: int,
+        confirmation_outbox_id: str | None = None,
     ) -> ScheduleDraftRecord:
         target = _schedule_target(connection, conversation_id)
         self._require_project_root(str(target["root_path"]))
@@ -209,9 +214,10 @@ class ScheduleRepository:
                 schedule_id, expected_version, payload_json,
                 occurrences_json, state, component_nonce_hash,
                 expires_at, created_at, updated_at,
-                discord_guild_id, discord_channel_id
+                discord_guild_id, discord_channel_id,
+                confirmation_outbox_id
             ) VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?
             )
             """,
             (
@@ -229,6 +235,7 @@ class ScheduleRepository:
                 now,
                 str(guild_id),
                 str(channel_id),
+                confirmation_outbox_id,
             ),
         )
         row = connection.execute(
@@ -238,6 +245,479 @@ class ScheduleRepository:
         assert row is not None
         return _schedule_draft(row)
 
+    def preflight_schedule_create_tool(
+        self,
+        *,
+        local_turn_id: str,
+        runtime_generation: int,
+        provider_thread_id: str,
+        provider_turn_id: str,
+        provider_call_id: str,
+        namespace: str,
+        tool_name: str,
+        arguments_hash: str,
+        configured_owner_user_id: int,
+        configured_guild_id: int,
+    ) -> DynamicToolInvocationRecord | None:
+        now = utc_now_ms()
+        with self.store.transaction() as connection:
+            existing = connection.execute(
+                """
+                SELECT * FROM dynamic_tool_invocations
+                WHERE runtime_generation = ?
+                  AND provider_thread_id = ?
+                  AND provider_turn_id = ?
+                  AND provider_call_id = ?
+                """,
+                (
+                    runtime_generation,
+                    provider_thread_id,
+                    provider_turn_id,
+                    provider_call_id,
+                ),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["turn_id"] != local_turn_id
+                    or existing["namespace"] != namespace
+                    or existing["tool_name"] != tool_name
+                    or existing["arguments_hash"] != arguments_hash
+                ):
+                    raise ConflictError(
+                        "dynamic tool call identity was reused with different input"
+                    )
+                return _dynamic_tool_invocation(existing)
+            scope = _dynamic_tool_scope(connection, local_turn_id)
+            if scope is None:
+                raise SecurityError("dynamic tool local Turn is unavailable")
+            authorization_error = self._dynamic_schedule_tool_authorization_error(
+                scope,
+                runtime_generation=runtime_generation,
+                provider_thread_id=provider_thread_id,
+                provider_turn_id=provider_turn_id,
+                namespace=namespace,
+                tool_name=tool_name,
+                configured_owner_user_id=configured_owner_user_id,
+                configured_guild_id=configured_guild_id,
+            )
+            if authorization_error is None:
+                return None
+            return self._insert_dynamic_tool_failure(
+                connection,
+                scope=scope,
+                local_turn_id=local_turn_id,
+                runtime_generation=runtime_generation,
+                provider_thread_id=provider_thread_id,
+                provider_turn_id=provider_turn_id,
+                provider_call_id=provider_call_id,
+                namespace=namespace,
+                tool_name=tool_name,
+                arguments_hash=arguments_hash,
+                code=authorization_error[0],
+                message=authorization_error[1],
+                now=now,
+            )
+
+    def execute_schedule_create_tool(
+        self,
+        *,
+        local_turn_id: str,
+        runtime_generation: int,
+        provider_thread_id: str,
+        provider_turn_id: str,
+        provider_call_id: str,
+        namespace: str,
+        tool_name: str,
+        arguments_hash: str,
+        configured_owner_user_id: int,
+        configured_guild_id: int,
+        payload: Mapping[str, Any] | None,
+        occurrences: tuple[Mapping[str, Any], ...],
+        component_nonce: str,
+        expires_at: int,
+        validation_error: tuple[str, str] | None = None,
+    ) -> DynamicToolInvocationRecord:
+        now = utc_now_ms()
+        with self.store.transaction() as connection:
+            existing = connection.execute(
+                """
+                SELECT * FROM dynamic_tool_invocations
+                WHERE runtime_generation = ?
+                  AND provider_thread_id = ?
+                  AND provider_turn_id = ?
+                  AND provider_call_id = ?
+                """,
+                (
+                    runtime_generation,
+                    provider_thread_id,
+                    provider_turn_id,
+                    provider_call_id,
+                ),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["turn_id"] != local_turn_id
+                    or existing["namespace"] != namespace
+                    or existing["tool_name"] != tool_name
+                    or existing["arguments_hash"] != arguments_hash
+                ):
+                    raise ConflictError(
+                        "dynamic tool call identity was reused with different input"
+                    )
+                return _dynamic_tool_invocation(existing)
+
+            scope = _dynamic_tool_scope(connection, local_turn_id)
+            if scope is None:
+                raise SecurityError("dynamic tool local Turn is unavailable")
+
+            authorization_error = self._dynamic_schedule_tool_authorization_error(
+                scope,
+                runtime_generation=runtime_generation,
+                provider_thread_id=provider_thread_id,
+                provider_turn_id=provider_turn_id,
+                namespace=namespace,
+                tool_name=tool_name,
+                configured_owner_user_id=configured_owner_user_id,
+                configured_guild_id=configured_guild_id,
+            )
+            if authorization_error is not None:
+                code, message = authorization_error
+                return self._insert_dynamic_tool_failure(
+                    connection,
+                    scope=scope,
+                    local_turn_id=local_turn_id,
+                    runtime_generation=runtime_generation,
+                    provider_thread_id=provider_thread_id,
+                    provider_turn_id=provider_turn_id,
+                    provider_call_id=provider_call_id,
+                    namespace=namespace,
+                    tool_name=tool_name,
+                    arguments_hash=arguments_hash,
+                    code=code,
+                    message=message,
+                    now=now,
+                )
+            if validation_error is not None:
+                return self._insert_dynamic_tool_failure(
+                    connection,
+                    scope=scope,
+                    local_turn_id=local_turn_id,
+                    runtime_generation=runtime_generation,
+                    provider_thread_id=provider_thread_id,
+                    provider_turn_id=provider_turn_id,
+                    provider_call_id=provider_call_id,
+                    namespace=namespace,
+                    tool_name=tool_name,
+                    arguments_hash=arguments_hash,
+                    code=validation_error[0],
+                    message=validation_error[1],
+                    now=now,
+                )
+            if payload is None or not occurrences:
+                raise InvariantError("validated Schedule tool draft is incomplete")
+
+            draft_id = new_id()
+            outbox_id = new_id()
+            input_channel_id = (
+                int(scope["discord_parent_channel_id"])
+                if str(scope["input_message_id"]) == str(scope["discord_thread_id"])
+                else int(scope["discord_thread_id"])
+            )
+            card_payload = {
+                "kind": "schedule_draft_card",
+                "state": "pending",
+                "draft_id": draft_id,
+                "turn_id": local_turn_id,
+                "action": "create",
+                "nonce": component_nonce,
+                "expires_at": expires_at,
+                "name": payload["name"],
+                "schedule_kind": payload["kind"],
+                "expression": payload["expression"],
+                "timezone": payload["timezone"],
+                "misfire_policy": payload["misfire_policy"],
+                "prompt_text": payload["prompt_text"],
+                "occurrences": [dict(item) for item in occurrences],
+                "input_message_id": scope["input_message_id"],
+                "input_channel_id": input_channel_id,
+                "discord_guild_id": scope["discord_guild_id"],
+            }
+            connection.execute(
+                """
+                INSERT INTO discord_outbox(
+                    id, destination_key, operation, payload_json, dedupe_key,
+                    delivery_marker, state, attempts, next_attempt_at,
+                    created_at, updated_at
+                ) VALUES (?, ?, 'send', ?, ?, ?, 'pending', 0, ?, ?, ?)
+                """,
+                (
+                    outbox_id,
+                    f"thread:{scope['discord_thread_id']}",
+                    canonical_json(card_payload),
+                    f"schedule-draft:{draft_id}:card",
+                    f"schedule-draft-{draft_id}",
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            draft = self._insert_draft(
+                connection,
+                draft_id=draft_id,
+                conversation_id=str(scope["conversation_id"]),
+                owner_user_id=configured_owner_user_id,
+                guild_id=configured_guild_id,
+                channel_id=int(scope["discord_thread_id"]),
+                action="create",
+                payload=payload,
+                occurrences=occurrences,
+                component_nonce=component_nonce,
+                expires_at=expires_at,
+                schedule_id=None,
+                expected_version=None,
+                now=now,
+                confirmation_outbox_id=outbox_id,
+            )
+            result = {
+                "status": "confirmation_required",
+                "draft_ref": draft_id[:8],
+                "confirmation_required": True,
+                "expires_at": expires_at,
+                "normalized": {
+                    "name": payload["name"],
+                    "kind": payload["kind"],
+                    "expression": payload["expression"],
+                    "timezone": payload["timezone"],
+                    "misfire_policy": payload["misfire_policy"],
+                },
+                "next_occurrences": [item["utc_ms"] for item in occurrences],
+            }
+            invocation_id = new_id()
+            connection.execute(
+                """
+                INSERT INTO dynamic_tool_invocations(
+                    id, turn_id, runtime_generation, provider_thread_id,
+                    provider_turn_id, provider_call_id, namespace, tool_name,
+                    arguments_hash, success, result_json, draft_id, outbox_id,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+                """,
+                (
+                    invocation_id,
+                    local_turn_id,
+                    runtime_generation,
+                    provider_thread_id,
+                    provider_turn_id,
+                    provider_call_id,
+                    namespace,
+                    tool_name,
+                    arguments_hash,
+                    canonical_json(result),
+                    draft_id,
+                    outbox_id,
+                    now,
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO audit_log(
+                    id, actor_kind, actor_id_hash, action, correlation_id,
+                    project_id, conversation_id, turn_id, payload_json,
+                    occurred_at
+                ) VALUES (?, 'discord_user', ?, 'schedule.draft.create_tool',
+                          ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    new_id(),
+                    sha256_text(f"discord_user:{configured_owner_user_id}"),
+                    f"dynamic-tool:{invocation_id}",
+                    scope["project_id"],
+                    scope["conversation_id"],
+                    local_turn_id,
+                    canonical_json(
+                        {
+                            "draft_ref": draft_id[:8],
+                            "arguments_hash": arguments_hash,
+                        }
+                    ),
+                    now,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM dynamic_tool_invocations WHERE id = ?",
+                (invocation_id,),
+            ).fetchone()
+            assert row is not None
+            assert draft.id == draft_id
+            return _dynamic_tool_invocation(row)
+
+    def get_dynamic_tool_invocation(
+        self,
+        *,
+        runtime_generation: int,
+        provider_thread_id: str,
+        provider_turn_id: str,
+        provider_call_id: str,
+    ) -> DynamicToolInvocationRecord:
+        row = self.store.query_one(
+            """
+            SELECT * FROM dynamic_tool_invocations
+            WHERE runtime_generation = ?
+              AND provider_thread_id = ?
+              AND provider_turn_id = ?
+              AND provider_call_id = ?
+            """,
+            (
+                runtime_generation,
+                provider_thread_id,
+                provider_turn_id,
+                provider_call_id,
+            ),
+        )
+        if row is None:
+            raise NotFoundError("dynamic tool invocation was not found")
+        return _dynamic_tool_invocation(row)
+
+    def get_draft(self, draft_id: str) -> ScheduleDraftRecord:
+        row = self.store.query_one(
+            "SELECT * FROM schedule_drafts WHERE id = ?",
+            (draft_id,),
+        )
+        if row is None:
+            raise NotFoundError(f"Schedule draft not found: {draft_id}")
+        return _schedule_draft(row)
+
+    def _dynamic_schedule_tool_authorization_error(
+        self,
+        scope: sqlite3.Row,
+        *,
+        runtime_generation: int,
+        provider_thread_id: str,
+        provider_turn_id: str,
+        namespace: str,
+        tool_name: str,
+        configured_owner_user_id: int,
+        configured_guild_id: int,
+    ) -> tuple[str, str] | None:
+        if namespace != "codexd" or tool_name != "schedule_create":
+            return "unsupported_tool", "This codexD tool is not available."
+        if scope["source_kind"] != "discord":
+            return (
+                "tool_not_allowed_for_source",
+                "Schedule creation is unavailable for background Turns.",
+            )
+        if (
+            scope["requested_by_user_id"] is None
+            or int(scope["requested_by_user_id"]) != configured_owner_user_id
+        ):
+            return "owner_required", "The configured Discord owner must request this."
+        if scope["conversation_state"] != "active" or scope["turn_state"] not in {
+            "starting",
+            "running",
+        }:
+            return "stale_turn", "The originating Discord Turn is no longer active."
+        if (
+            scope["thread_revision_id"] is None
+            or scope["thread_revision_id"] != scope["active_revision_id"]
+            or scope["revision_state"] != "active"
+            or scope["revision_provider_thread_id"] != provider_thread_id
+        ):
+            return "stale_thread", "The Codex Thread identity changed."
+        if (
+            scope["runtime_generation"] != runtime_generation
+            or scope["lease_generation"] != runtime_generation
+            or scope["lease_state"] != "ready"
+        ):
+            return "stale_runtime", "The Codex runtime generation changed."
+        if (
+            scope["provider_turn_id"] is not None
+            and scope["provider_turn_id"] != provider_turn_id
+        ):
+            return "stale_turn", "The Codex Turn identity changed."
+        if scope["provider_turn_id"] is None and scope["turn_state"] != "starting":
+            return "stale_turn", "The Codex Turn identity is unavailable."
+        if (
+            int(scope["discord_guild_id"]) != configured_guild_id
+            or scope["input_message_id"] is None
+        ):
+            return "scope_mismatch", "The Discord Conversation scope changed."
+        if self._project_root_error(str(scope["root_path"])) is not None:
+            return "project_unavailable", "The Schedule project is unavailable."
+        return None
+
+    def _insert_dynamic_tool_failure(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        scope: sqlite3.Row,
+        local_turn_id: str,
+        runtime_generation: int,
+        provider_thread_id: str,
+        provider_turn_id: str,
+        provider_call_id: str,
+        namespace: str,
+        tool_name: str,
+        arguments_hash: str,
+        code: str,
+        message: str,
+        now: int,
+    ) -> DynamicToolInvocationRecord:
+        result = {
+            "status": "error",
+            "code": code,
+            "message": message[:512],
+            "confirmation_required": False,
+        }
+        invocation_id = new_id()
+        connection.execute(
+            """
+            INSERT INTO dynamic_tool_invocations(
+                id, turn_id, runtime_generation, provider_thread_id,
+                provider_turn_id, provider_call_id, namespace, tool_name,
+                arguments_hash, success, result_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+            """,
+            (
+                invocation_id,
+                local_turn_id,
+                runtime_generation,
+                provider_thread_id,
+                provider_turn_id,
+                provider_call_id,
+                namespace,
+                tool_name,
+                arguments_hash,
+                canonical_json(result),
+                now,
+                now,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO audit_log(
+                id, actor_kind, actor_id_hash, action, correlation_id,
+                project_id, conversation_id, turn_id, payload_json,
+                occurred_at
+            ) VALUES (?, 'system', NULL, 'dynamic_tool.rejected', ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                new_id(),
+                f"dynamic-tool:{invocation_id}",
+                scope["project_id"],
+                scope["conversation_id"],
+                local_turn_id,
+                canonical_json({"code": code, "arguments_hash": arguments_hash}),
+                now,
+            ),
+        )
+        row = connection.execute(
+            "SELECT * FROM dynamic_tool_invocations WHERE id = ?",
+            (invocation_id,),
+        ).fetchone()
+        assert row is not None
+        return _dynamic_tool_invocation(row)
+
     def confirm_draft(
         self,
         *,
@@ -246,6 +726,7 @@ class ScheduleRepository:
         owner_user_id: int,
         guild_id: int,
         channel_id: int,
+        message_id: str | None = None,
         audit: ScheduleAuditContext | None = None,
     ) -> ScheduleRecord:
         now = utc_now_ms()
@@ -262,6 +743,7 @@ class ScheduleRepository:
                 owner_user_id=owner_user_id,
                 guild_id=guild_id,
                 channel_id=channel_id,
+                message_id=message_id,
             )
             if draft["state"] == "confirmed":
                 result = json.loads(str(draft["payload_json"]))
@@ -283,6 +765,7 @@ class ScheduleRepository:
                 owner_user_id=owner_user_id,
                 guild_id=guild_id,
                 channel_id=channel_id,
+                message_id=message_id,
                 now=now,
             )
             target = _schedule_target(connection, str(draft["conversation_id"]))
@@ -291,9 +774,7 @@ class ScheduleRepository:
             if not isinstance(payload, dict):
                 raise ConflictError("Schedule draft payload is invalid")
             schedule_id = (
-                new_id()
-                if draft["action"] == "create"
-                else str(draft["schedule_id"])
+                new_id() if draft["action"] == "create" else str(draft["schedule_id"])
             )
             try:
                 kind = ScheduleKind(str(payload["kind"]))
@@ -309,7 +790,9 @@ class ScheduleRepository:
                     next_due_at=cast(int | None, payload["next_due_at"]),
                 )
             except (KeyError, TypeError, ValueError, ConfigurationError) as exc:
-                raise ConflictError(f"Schedule draft payload is invalid: {exc}") from exc
+                raise ConflictError(
+                    f"Schedule draft payload is invalid: {exc}"
+                ) from exc
             if draft["action"] == "create":
                 try:
                     connection.execute(
@@ -396,6 +879,15 @@ class ScheduleRepository:
                     draft_id,
                 ),
             )
+            _insert_schedule_draft_terminal_outbox(
+                connection,
+                draft=draft,
+                payload=payload,
+                state="confirmed",
+                schedule_id=schedule_id,
+                next_due_at=cast(int | None, payload["next_due_at"]),
+                now=now,
+            )
             context = _audit_context(
                 audit,
                 f"schedule:{schedule_id}:confirm:{draft_id}",
@@ -445,6 +937,7 @@ class ScheduleRepository:
         owner_user_id: int,
         guild_id: int,
         channel_id: int,
+        message_id: str | None = None,
         audit: ScheduleAuditContext | None = None,
     ) -> None:
         now = utc_now_ms()
@@ -461,6 +954,7 @@ class ScheduleRepository:
                 owner_user_id=owner_user_id,
                 guild_id=guild_id,
                 channel_id=channel_id,
+                message_id=message_id,
             )
             if draft["state"] == "cancelled":
                 _mark_draft_command_effect(
@@ -476,8 +970,12 @@ class ScheduleRepository:
                 owner_user_id=owner_user_id,
                 guild_id=guild_id,
                 channel_id=channel_id,
+                message_id=message_id,
                 now=now,
             )
+            payload = json.loads(str(draft["payload_json"]))
+            if not isinstance(payload, dict):
+                raise ConflictError("Schedule draft payload is invalid")
             connection.execute(
                 """
                 UPDATE schedule_drafts
@@ -485,6 +983,15 @@ class ScheduleRepository:
                 WHERE id = ? AND state = 'pending'
                 """,
                 (now, draft_id),
+            )
+            _insert_schedule_draft_terminal_outbox(
+                connection,
+                draft=draft,
+                payload=payload,
+                state="cancelled",
+                schedule_id=None,
+                next_due_at=None,
+                now=now,
             )
             _mark_draft_command_effect(
                 connection,
@@ -572,7 +1079,9 @@ class ScheduleRepository:
                     ),
                 )
             except sqlite3.IntegrityError as exc:
-                raise ConflictError("schedule name already exists in this Conversation") from exc
+                raise ConflictError(
+                    "schedule name already exists in this Conversation"
+                ) from exc
             _insert_schedule_audit(
                 connection,
                 audit=_audit_context(
@@ -596,7 +1105,9 @@ class ScheduleRepository:
             return _schedule(row)
 
     def get(self, schedule_id: str) -> ScheduleRecord:
-        row = self.store.query_one("SELECT * FROM schedules WHERE id = ?", (schedule_id,))
+        row = self.store.query_one(
+            "SELECT * FROM schedules WHERE id = ?", (schedule_id,)
+        )
         if row is None:
             raise NotFoundError(f"schedule not found: {schedule_id}")
         return _schedule(row)
@@ -658,9 +1169,7 @@ class ScheduleRepository:
                 state=str(row["state"]),
                 turn_id=str(row["turn_id"]) if row["turn_id"] is not None else None,
                 error_code=(
-                    str(row["error_code"])
-                    if row["error_code"] is not None
-                    else None
+                    str(row["error_code"]) if row["error_code"] is not None else None
                 ),
                 created_at=int(row["created_at"]),
             )
@@ -752,19 +1261,21 @@ class ScheduleRepository:
             current = ScheduleState(str(target["schedule_state"]))
             if state is ScheduleState.PAUSED:
                 if current is not ScheduleState.ACTIVE:
-                    raise ConflictError(
-                        f"schedule cannot pause from {current.value}"
-                    )
+                    raise ConflictError(f"schedule cannot pause from {current.value}")
             elif state is ScheduleState.ACTIVE:
                 if current not in {ScheduleState.PAUSED, ScheduleState.BLOCKED}:
-                    raise ConflictError(
-                        f"schedule cannot resume from {current.value}"
-                    )
+                    raise ConflictError(f"schedule cannot resume from {current.value}")
             else:
                 raise ConflictError(f"unsupported Schedule state target: {state.value}")
             if state is ScheduleState.ACTIVE:
-                if next_due_at is None or isinstance(next_due_at, bool) or next_due_at < 0:
-                    raise ConflictError("active Schedule requires a valid next due cursor")
+                if (
+                    next_due_at is None
+                    or isinstance(next_due_at, bool)
+                    or next_due_at < 0
+                ):
+                    raise ConflictError(
+                        "active Schedule requires a valid next due cursor"
+                    )
                 if (
                     target["conversation_state"] != "active"
                     or target["active_revision_id"] is None
@@ -863,12 +1374,9 @@ class ScheduleRepository:
                 )
             except ConfigurationError as exc:
                 raise ConflictError(f"invalid Schedule definition: {exc}") from exc
-            if (
-                target["schedule_state"] == "active"
-                and (
-                    target["conversation_state"] != "active"
-                    or target["active_revision_id"] is None
-                )
+            if target["schedule_state"] == "active" and (
+                target["conversation_state"] != "active"
+                or target["active_revision_id"] is None
             ):
                 raise ConflictError(
                     "active schedule target Conversation is unavailable"
@@ -1133,7 +1641,10 @@ class ScheduleRepository:
                 )
             if schedule["state"] != "active":
                 raise ConflictError(f"schedule is {schedule['state']}")
-            if expected_version is not None and int(schedule["version"]) != expected_version:
+            if (
+                expected_version is not None
+                and int(schedule["version"]) != expected_version
+            ):
                 raise ConflictError("schedule was modified concurrently")
             fire_id = new_id()
             target_error: str | None = None
@@ -1253,7 +1764,8 @@ class ScheduleRepository:
                     schedule["reasoning_summary_override"]
                     or schedule["default_reasoning_summary"],
                     schedule["personality_override"] or schedule["default_personality"],
-                    schedule["service_tier_override"] or schedule["default_service_tier"],
+                    schedule["service_tier_override"]
+                    or schedule["default_service_tier"],
                     schedule["web_search_mode"] or schedule["default_web_search_mode"],
                     schedule["sandbox_profile"],
                     now,
@@ -1346,7 +1858,9 @@ def _validate_schedule_definition(
     del misfire_policy
     normalized_name = " ".join(name.split())
     if not normalized_name or normalized_name != name or len(name) > 100:
-        raise ConfigurationError("schedule name must be canonical and contain 1-100 characters")
+        raise ConfigurationError(
+            "schedule name must be canonical and contain 1-100 characters"
+        )
     if (
         not prompt_text
         or prompt_text != prompt_text.strip()
@@ -1360,7 +1874,9 @@ def _validate_schedule_definition(
     if require_cursor and next_due_at is None:
         raise ConfigurationError("active Schedule requires a valid next due cursor")
     if next_due_at is not None and (
-        isinstance(next_due_at, bool) or not isinstance(next_due_at, int) or next_due_at < 0
+        isinstance(next_due_at, bool)
+        or not isinstance(next_due_at, int)
+        or next_due_at < 0
     ):
         raise ConfigurationError("Schedule next due cursor is invalid")
     validate_persisted_schedule_spec(kind, expression, timezone)
@@ -1579,8 +2095,7 @@ def _block_schedule(
                     "kind": "schedule_blocked",
                     "schedule_id": schedule_id,
                     "content": (
-                        f"Schedule `{schedule_id[:8]}` was blocked "
-                        f"(`{reason[:96]}`)."
+                        f"Schedule `{schedule_id[:8]}` was blocked (`{reason[:96]}`)."
                     ),
                 }
             ),
@@ -1621,6 +2136,7 @@ def _assert_pending_draft(
     owner_user_id: int,
     guild_id: int,
     channel_id: int,
+    message_id: str | None,
     now: int,
 ) -> None:
     _assert_draft_identity(
@@ -1629,11 +2145,97 @@ def _assert_pending_draft(
         owner_user_id=owner_user_id,
         guild_id=guild_id,
         channel_id=channel_id,
+        message_id=message_id,
     )
     if draft["state"] != "pending":
         raise ConflictError(f"Schedule draft is {draft['state']}")
     if int(draft["expires_at"]) <= now:
         raise ConflictError("Schedule draft expired")
+
+
+def _dynamic_tool_scope(
+    connection: sqlite3.Connection,
+    local_turn_id: str,
+) -> sqlite3.Row | None:
+    return cast(
+        sqlite3.Row | None,
+        connection.execute(
+            """
+        SELECT t.id AS turn_id, t.state AS turn_state,
+               t.source_kind, t.requested_by_user_id,
+               t.input_message_id, t.thread_revision_id,
+               t.runtime_lease_id, t.runtime_generation,
+               t.provider_turn_id,
+               c.id AS conversation_id, c.project_id,
+               c.state AS conversation_state,
+               c.active_revision_id, c.discord_guild_id,
+               c.discord_thread_id, c.discord_parent_channel_id,
+               r.provider_thread_id AS revision_provider_thread_id,
+               r.state AS revision_state,
+               l.generation AS lease_generation,
+               l.state AS lease_state,
+               p.root_path
+        FROM turns t
+        JOIN conversations c ON c.id = t.conversation_id
+        JOIN projects p ON p.id = c.project_id
+        LEFT JOIN thread_revisions r ON r.id = t.thread_revision_id
+        LEFT JOIN runtime_leases l ON l.id = t.runtime_lease_id
+        WHERE t.id = ?
+        """,
+            (local_turn_id,),
+        ).fetchone(),
+    )
+
+
+def _insert_schedule_draft_terminal_outbox(
+    connection: sqlite3.Connection,
+    *,
+    draft: sqlite3.Row,
+    payload: Mapping[str, Any],
+    state: str,
+    schedule_id: str | None,
+    next_due_at: int | None,
+    now: int,
+) -> None:
+    confirmation_outbox_id = draft["confirmation_outbox_id"]
+    if confirmation_outbox_id is None:
+        return
+    draft_id = str(draft["id"])
+    terminal_payload = {
+        "kind": "schedule_draft_card",
+        "state": state,
+        "draft_id": draft_id,
+        "action": str(draft["action"]),
+        "name": payload.get("name"),
+        "schedule_kind": payload.get("kind"),
+        "expression": payload.get("expression"),
+        "timezone": payload.get("timezone"),
+        "misfire_policy": payload.get("misfire_policy"),
+        "prompt_text": payload.get("prompt_text"),
+        "occurrences": json.loads(str(draft["occurrences_json"])),
+        "schedule_ref": schedule_id[:8] if schedule_id is not None else None,
+        "next_due_at": next_due_at,
+    }
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO discord_outbox(
+            id, destination_key, operation, depends_on_outbox_id,
+            payload_json, dedupe_key, delivery_marker, state, attempts,
+            next_attempt_at, created_at, updated_at
+        ) VALUES (?, ?, 'edit', ?, ?, ?, ?, 'pending', 0, ?, ?, ?)
+        """,
+        (
+            new_id(),
+            f"thread:{draft['discord_channel_id']}",
+            confirmation_outbox_id,
+            canonical_json(terminal_payload),
+            f"schedule-draft:{draft_id}:terminal:{state}",
+            f"schedule-draft-{draft_id}",
+            now,
+            now,
+            now,
+        ),
+    )
 
 
 def _assert_draft_identity(
@@ -1643,6 +2245,7 @@ def _assert_draft_identity(
     owner_user_id: int,
     guild_id: int,
     channel_id: int,
+    message_id: str | None,
 ) -> None:
     if int(draft["owner_user_id"]) != owner_user_id:
         raise SecurityError("Schedule draft belongs to another owner")
@@ -1658,6 +2261,11 @@ def _assert_draft_identity(
         sha256_text(component_nonce),
     ):
         raise ConflictError("Schedule draft component nonce changed")
+    confirmation_message_id = draft["confirmation_message_id"]
+    if confirmation_message_id is not None and (
+        message_id is None or str(confirmation_message_id) != message_id
+    ):
+        raise SecurityError("Schedule draft confirmation message changed")
 
 
 def _schedule(row: sqlite3.Row) -> ScheduleRecord:
@@ -1686,9 +2294,7 @@ def _schedule_draft(row: sqlite3.Row) -> ScheduleDraftRecord:
         conversation_id=str(row["conversation_id"]),
         owner_user_id=int(row["owner_user_id"]),
         discord_guild_id=(
-            int(row["discord_guild_id"])
-            if row["discord_guild_id"] is not None
-            else 0
+            int(row["discord_guild_id"]) if row["discord_guild_id"] is not None else 0
         ),
         discord_channel_id=(
             int(row["discord_channel_id"])
@@ -1702,5 +2308,33 @@ def _schedule_draft(row: sqlite3.Row) -> ScheduleDraftRecord:
         occurrences_json=str(row["occurrences_json"]),
         state=str(row["state"]),
         component_nonce_hash=str(row["component_nonce_hash"]),
+        confirmation_message_id=(
+            str(row["confirmation_message_id"])
+            if row["confirmation_message_id"] is not None
+            else None
+        ),
+        confirmation_outbox_id=(
+            str(row["confirmation_outbox_id"])
+            if row["confirmation_outbox_id"] is not None
+            else None
+        ),
         expires_at=int(row["expires_at"]),
+    )
+
+
+def _dynamic_tool_invocation(row: sqlite3.Row) -> DynamicToolInvocationRecord:
+    return DynamicToolInvocationRecord(
+        id=str(row["id"]),
+        turn_id=str(row["turn_id"]),
+        runtime_generation=int(row["runtime_generation"]),
+        provider_thread_id=str(row["provider_thread_id"]),
+        provider_turn_id=str(row["provider_turn_id"]),
+        provider_call_id=str(row["provider_call_id"]),
+        namespace=str(row["namespace"]),
+        tool_name=str(row["tool_name"]),
+        arguments_hash=str(row["arguments_hash"]),
+        success=bool(row["success"]),
+        result_json=str(row["result_json"]),
+        draft_id=(str(row["draft_id"]) if row["draft_id"] is not None else None),
+        outbox_id=(str(row["outbox_id"]) if row["outbox_id"] is not None else None),
     )

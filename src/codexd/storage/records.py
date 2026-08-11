@@ -55,6 +55,7 @@ class ThreadRevisionRecord:
     state: str
     thread_config_json: str
     provider_version: str
+    dynamic_tools_enabled: bool
     created_at: int
     activated_at: int | None
     archived_at: int | None
@@ -81,6 +82,7 @@ class TurnRecord:
     interrupt_origin: InterruptOrigin | None
     interrupt_reason: str | None
     input_message_id: str | None
+    requested_by_user_id: int | None
     schedule_fire_id: str | None
     input_hash: str
     input_summary: str
@@ -138,6 +140,7 @@ class IngressMessageRecord:
     discord_guild_id: int
     discord_channel_id: int
     conversation_id: str | None
+    requested_by_user_id: int | None
     state: str
     turn_id: str | None
     accepted_boot_id: str
@@ -209,7 +212,26 @@ class ScheduleDraftRecord:
     occurrences_json: str
     state: str
     component_nonce_hash: str
+    confirmation_message_id: str | None
+    confirmation_outbox_id: str | None
     expires_at: int
+
+
+@dataclass(frozen=True)
+class DynamicToolInvocationRecord:
+    id: str
+    turn_id: str
+    runtime_generation: int
+    provider_thread_id: str
+    provider_turn_id: str
+    provider_call_id: str
+    namespace: str
+    tool_name: str
+    arguments_hash: str
+    success: bool
+    result_json: str
+    draft_id: str | None
+    outbox_id: str | None
 
 
 @dataclass(frozen=True)
