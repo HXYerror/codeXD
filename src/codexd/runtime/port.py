@@ -68,6 +68,21 @@ class StartedTurn:
 
 
 @dataclass(frozen=True)
+class SideQueryIdentity:
+    local_query_id: str
+    source_thread_id: str
+    side_thread_id: str
+    provider_turn_id: str
+    runtime_generation: int
+
+
+@dataclass(frozen=True)
+class StartedSideQuery:
+    identity: SideQueryIdentity
+    stream: TurnStream
+
+
+@dataclass(frozen=True)
 class CompactStartResult:
     accepted: bool
 
@@ -105,6 +120,21 @@ class CodexRuntime(Protocol):
         input: TurnInput,
         config: TurnConfig,
     ) -> StartedTurn: ...
+
+    async def start_side_query(
+        self,
+        *,
+        local_query_id: str,
+        source_thread: ThreadIdentity,
+        question: str,
+        cwd: Path,
+        thread_config: ThreadConfig,
+        turn_config: TurnConfig,
+    ) -> StartedSideQuery: ...
+
+    async def interrupt_side_query(self, query: SideQueryIdentity) -> None: ...
+
+    async def close_side_query(self, query: SideQueryIdentity) -> None: ...
 
     async def steer(self, turn: TurnIdentity, text: str) -> None: ...
 

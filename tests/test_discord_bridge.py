@@ -47,6 +47,7 @@ from codexd.storage.schedules import ScheduleRepository
 from codexd.transport.discord.bot import (
     CodexDBot,
     _ScheduleModal,
+    _SideQueryModal,
     _timezone_with_offset,
 )
 
@@ -166,6 +167,96 @@ def _thread_channels() -> tuple[discord.Thread, discord.TextChannel]:
     text_channel = Mock(spec=discord.TextChannel)
     text_channel.id = 200
     return thread, text_channel
+
+
+@pytest.mark.asyncio
+async def test_btw_and_side_register_together_and_return_ephemeral_answer(
+    storage_context: StorageContext,
+    tmp_path: Path,
+) -> None:
+    bot = _storage_bot(storage_context, tmp_path)
+    side_queries = Mock()
+    side_queries.ask = AsyncMock(return_value="A **temporary** answer.")
+    bot.side_queries = side_queries
+    bot._register_commands()
+    commands = _leaf_commands(bot)
+    assert "/btw" in commands and "/side" in commands
+    thread, text_channel = _thread_channels()
+    interaction = _interaction(
+        9001,
+        thread=thread,
+        text_channel=text_channel,
+        in_thread=True,
+    )
+    interaction.edit_original_response = AsyncMock()
+
+    await bot._apply_side_query(interaction, "Why this approach?")
+
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+    side_queries.ask.assert_awaited_once_with(
+        interaction_id="9001",
+        conversation_id=storage_context.conversation.id,
+        requested_by_user_id=400,
+        question="Why this approach?",
+    )
+    assert interaction.edit_original_response.await_count == 2
+    final = interaction.edit_original_response.await_args.kwargs["content"]
+    assert "A **temporary** answer." in final
+    assert "main task unchanged" in final
+
+
+@pytest.mark.asyncio
+async def test_btw_without_question_opens_signed_scoped_modal(
+    storage_context: StorageContext,
+    tmp_path: Path,
+) -> None:
+    bot = _storage_bot(storage_context, tmp_path)
+    bot.side_queries = Mock()
+    thread, text_channel = _thread_channels()
+    interaction = _interaction(
+        9002,
+        thread=thread,
+        text_channel=text_channel,
+        in_thread=True,
+    )
+
+    await bot._btw(interaction, None)
+
+    modal = interaction.response.send_modal.await_args.args[0]
+    assert isinstance(modal, _SideQueryModal)
+    action = bot.signer.verify_modal_id(modal.custom_id)
+    assert action.kind == "side_query"
+    record = storage_context.repository.get_modal_intent(action.intent_id)
+    assert record.conversation_id == storage_context.conversation.id
+    assert record.owner_user_id == 400
+
+
+@pytest.mark.asyncio
+async def test_btw_long_answer_stays_ephemeral_and_uses_markdown_attachment(
+    storage_context: StorageContext,
+    tmp_path: Path,
+) -> None:
+    bot = _storage_bot(storage_context, tmp_path)
+    side_queries = Mock()
+    side_queries.ask = AsyncMock(return_value="临时解释" * 5_000)
+    bot.side_queries = side_queries
+    thread, text_channel = _thread_channels()
+    interaction = _interaction(
+        9003,
+        thread=thread,
+        text_channel=text_channel,
+        in_thread=True,
+    )
+    interaction.edit_original_response = AsyncMock()
+
+    await bot._apply_side_query(interaction, "请详细解释?")
+
+    followup = interaction.followup.send.await_args
+    assert followup.kwargs["ephemeral"] is True
+    assert followup.kwargs["file"].filename == "btw-answer.md"
+    assert "main task unchanged" in (
+        interaction.edit_original_response.await_args.kwargs["content"]
+    )
 
 
 @pytest.mark.asyncio

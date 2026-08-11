@@ -115,6 +115,7 @@ class ComponentSigner:
             "schedule_create": "sc",
             "schedule_update": "su",
             "steer": "st",
+            "side_query": "bt",
         }.get(kind)
         if kind_code is None:
             raise ValueError("invalid modal intent kind")
@@ -144,6 +145,7 @@ class ComponentSigner:
             "sc": "schedule_create",
             "su": "schedule_update",
             "st": "steer",
+            "bt": "side_query",
         }.get(kind_code)
         if prefix != "mi" or version != "v1" or kind is None:
             raise SecurityError("invalid modal custom ID")

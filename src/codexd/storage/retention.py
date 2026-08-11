@@ -480,6 +480,15 @@ def run_retention(
         ).rowcount
         connection.execute(
             """
+            DELETE FROM side_queries
+            WHERE state IN ('completed', 'failed', 'interrupted')
+              AND completed_at IS NOT NULL
+              AND completed_at < ?
+            """,
+            (intent_cutoff,),
+        )
+        connection.execute(
+            """
             UPDATE schedule_drafts
             SET state = 'expired', payload_json = '{}', updated_at = ?
             WHERE state = 'pending' AND expires_at <= ?

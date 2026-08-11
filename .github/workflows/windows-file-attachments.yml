@@ -32,6 +32,8 @@ jobs:
           tests/test_file_attachment_foundation.py
           tests/test_outbound_images.py
           tests/test_runtime_turns.py
+          tests/test_side_queries.py
+          tests/test_side_runtime.py
           tests/test_sdk_contract.py
       - name: Run visible transcript regressions
         run: >-

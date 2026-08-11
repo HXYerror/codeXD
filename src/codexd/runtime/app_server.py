@@ -39,6 +39,8 @@ from openai_codex.generated.v2_all import (
     ThreadResumeParams,
     ThreadSetNameResponse,
     ThreadStartParams,
+    ThreadUnsubscribeParams,
+    ThreadUnsubscribeResponse,
     TurnCompletedNotification,
     TurnInterruptResponse,
     TurnStartParams,
@@ -216,6 +218,7 @@ class DynamicAsyncCodex:
         model: str | None,
         sandbox: Sandbox | None,
         service_tier: str | None,
+        developer_instructions: str | None = None,
     ) -> DynamicAsyncThread:
         approval_policy, reviewer = _approval_settings(approval_mode)
         params = ThreadForkParams(
@@ -228,6 +231,7 @@ class DynamicAsyncCodex:
             model=model,
             sandbox=_sandbox_mode(sandbox),
             service_tier=service_tier,
+            developer_instructions=developer_instructions,
         )
         response = await asyncio.to_thread(
             self._sync_client.thread_fork,
@@ -235,6 +239,16 @@ class DynamicAsyncCodex:
             params,
         )
         return DynamicAsyncThread(self, response.thread.id)
+
+    async def thread_unsubscribe(self, thread_id: str) -> str:
+        params = ThreadUnsubscribeParams(thread_id=thread_id)
+        response = await asyncio.to_thread(
+            self._sync_client.request,
+            "thread/unsubscribe",
+            _model_payload(params),
+            response_model=ThreadUnsubscribeResponse,
+        )
+        return str(response.status.value)
 
     async def thread_archive(self, thread_id: str) -> None:
         await asyncio.to_thread(self._sync_client.thread_archive, thread_id)
@@ -337,6 +351,20 @@ class DynamicAsyncCodex:
         params: JsonObject | None,
     ) -> JsonObject:
         if method in _APPROVAL_METHODS:
+            provider_turn_id = (
+                params.get("turnId") if isinstance(params, dict) else None
+            )
+            provider_thread_id = (
+                params.get("threadId") if isinstance(params, dict) else None
+            )
+            local_turn_id = (
+                self._resolve_local_turn(provider_thread_id, provider_turn_id)
+                if isinstance(provider_thread_id, str)
+                and isinstance(provider_turn_id, str)
+                else None
+            )
+            if local_turn_id is not None and local_turn_id.startswith("side:"):
+                return {"decision": "decline"}
             return {"decision": "accept"}
         if method != "item/tool/call":
             return {}
