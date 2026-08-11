@@ -922,14 +922,11 @@ class TurnCoordinator:
             except BaseException as exc:
                 cleanup_errors.append(exc)
         try:
-            await asyncio.wait_for(
-                self._runtime_supervisor.report_failure(
-                    project,
-                    expected_lease_id=lease.id,
-                    expected_generation=lease.generation,
-                    failure_code=failure_code,
-                ),
-                timeout=_PROVIDER_CLEANUP_TIMEOUT_SECONDS,
+            await self._runtime_supervisor.report_failure(
+                project,
+                expected_lease_id=lease.id,
+                expected_generation=lease.generation,
+                failure_code=failure_code,
             )
         except BaseException as exc:
             cleanup_errors.append(exc)
