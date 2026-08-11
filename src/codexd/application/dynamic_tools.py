@@ -9,6 +9,10 @@ from typing import Any, cast
 from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
 from openai_codex.models import JsonObject
 
+from codexd.application.outbound_images import (
+    PUBLISH_IMAGE_INPUT_SCHEMA,
+    OutboundImageBroker,
+)
 from codexd.application.schedule_coordinator import (
     PreparedScheduleDraft,
     prepare_schedule_create_draft,
@@ -63,7 +67,21 @@ CODEXD_DYNAMIC_TOOLS: tuple[JsonObject, ...] = (
                     "Schedule is active from this tool result alone."
                 ),
                 "inputSchema": SCHEDULE_CREATE_INPUT_SCHEMA,
-            }
+            },
+            {
+                "type": "function",
+                "name": "publish_image",
+                "description": (
+                    "Register a raster image generated for the user's current "
+                    "request so codexD can attach it to the final Discord response. "
+                    "Use only when the user asked to receive an image or visualization. "
+                    "Inspect the generated image first, then pass that exact observed "
+                    "path. Do not emit visualize control markup as a substitute. A "
+                    "successful result means registered for durable delivery, not that "
+                    "Discord upload has completed."
+                ),
+                "inputSchema": PUBLISH_IMAGE_INPUT_SCHEMA,
+            },
         ],
     },
 )
@@ -76,15 +94,46 @@ class DynamicToolDispatcher:
         self,
         *,
         schedules: ScheduleRepository,
+        images: OutboundImageBroker | None = None,
         owner_user_id: int,
         guild_id: int,
     ) -> None:
         self._schedules = schedules
+        self._images = images
         self._owner_user_id = owner_user_id
         self._guild_id = guild_id
 
     async def handle(self, call: DynamicToolCall) -> dict[str, object]:
         namespace = call.namespace or ""
+        if namespace != "codexd":
+            return _tool_response(
+                False,
+                {
+                    "status": "error",
+                    "code": "unsupported_tool",
+                    "message": "This codexD tool is not available.",
+                },
+            )
+        if call.tool == "publish_image":
+            if self._images is None:
+                return _tool_response(
+                    False,
+                    {
+                        "status": "error",
+                        "code": "tool_unavailable",
+                        "message": "Image publication is unavailable.",
+                    },
+                )
+            return await self._images.handle(call)
+        if call.tool != "schedule_create":
+            return _tool_response(
+                False,
+                {
+                    "status": "error",
+                    "code": "unsupported_tool",
+                    "message": "This codexD tool is not available.",
+                },
+            )
         arguments_hash, arguments_error = _arguments_hash(call.arguments)
         try:
             preflight = await asyncio.to_thread(

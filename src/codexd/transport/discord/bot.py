@@ -2138,22 +2138,38 @@ class CodexDBot(discord.Client):
     async def _capabilities(self, interaction: discord.Interaction[Any]) -> None:
         await self._defer_authorized(interaction)
         manifest = self.capability_manifest
-        core = [
-            f"  `{name}`: {'available' if available else 'unavailable'}"
-            for name, available in sorted(manifest.required.items())
+        core_available = [
+            name for name, available in sorted(manifest.required.items()) if available
         ]
-        optional = [
-            f"  `{name}`: `{_capability_label(value)}`"
-            for name, value in sorted(manifest.optional.items())
+        core_unavailable = [
+            name for name, available in sorted(manifest.required.items()) if not available
         ]
+        optional_groups: dict[str, list[str]] = {}
+        for name, value in sorted(manifest.optional.items()):
+            optional_groups.setdefault(_capability_label(value), []).append(name)
         lines = [
             f"SDK `{manifest.sdk_version}` · runtime `{manifest.runtime_version}`",
             f"Compatibility: `{manifest.compatibility.matrix_tier}` · "
             f"`{manifest.compatibility.handshake}`",
             "**Core**",
-            *core,
+            "  available: " + ", ".join(f"`{name}`" for name in core_available),
+            *(
+                [
+                    "  unavailable: "
+                    + ", ".join(f"`{name}`" for name in core_unavailable)
+                ]
+                if core_unavailable
+                else []
+            ),
             "**Optional**",
-            *(optional or ["  none"]),
+            *(
+                [
+                    f"  `{label}`: "
+                    + ", ".join(f"`{name}`" for name in names)
+                    for label, names in sorted(optional_groups.items())
+                ]
+                or ["  none"]
+            ),
             "**Product-gated**",
             "  `review`, `plan_mode`, `agent_control`, `sdk_mention_input`, "
             "`account_mutation`",

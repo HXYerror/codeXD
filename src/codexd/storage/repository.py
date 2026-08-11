@@ -58,6 +58,7 @@ from codexd.storage.records import (
     ConversationRecord,
     IngressMessageRecord,
     ModalIntentRecord,
+    OutboundImageInvocationRecord,
     OutboxRecord,
     ProjectRecord,
     RenderPlanRecord,
@@ -1374,6 +1375,14 @@ class Repository:
         )
         return _render_plan(row) if row is not None else None
 
+    def registered_outbound_images(
+        self,
+        turn_id: str,
+    ) -> tuple[OutboundImageInvocationRecord, ...]:
+        from codexd.storage.outbound_images import OutboundImageRepository
+
+        return OutboundImageRepository(self.store).registered_for_turn(turn_id)
+
     def persist_render_plan(
         self,
         *,
@@ -2423,7 +2432,7 @@ class Repository:
             ).fetchone()
             if scope is None:
                 return
-            dedupe_key = f"conversation:{conversation_id}:dynamic-tools-upgrade"
+            dedupe_key = f"conversation:{conversation_id}:dynamic-tools-upgrade-v2"
             connection.execute(
                 """
                 INSERT OR IGNORE INTO discord_outbox(
@@ -2439,11 +2448,12 @@ class Repository:
                         {
                             "kind": "notice",
                             "level": "info",
-                            "title": "Schedule tool available in a new session",
+                            "title": "New codexD tools available in a new session",
                             "content": (
-                                "This Codex session predates `codexd.schedule_create`. "
-                                "Run `/session new` once to let Codex prepare Schedule "
-                                "confirmation cards from natural-language requests."
+                                "This Codex session predates the latest codexD tools. "
+                                "Run `/session new` once to enable Schedule creation "
+                                "and generated-image delivery from natural-language "
+                                "requests."
                             ),
                         }
                     ),

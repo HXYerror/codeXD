@@ -106,6 +106,7 @@ async def test_low_level_facade_routes_tool_request_without_breaking_approvals(
     )
     facade._loop = asyncio.get_running_loop()
     facade._turn_routes["provider-turn"] = ("provider-thread", "local-turn")
+    facade.observe_image_path("provider-turn", "/tmp/generated.png")
     approval_handler = clients[0].approval_handler
 
     assert approval_handler(
@@ -140,6 +141,7 @@ async def test_low_level_facade_routes_tool_request_without_breaking_approvals(
         namespace="codexd",
         tool="schedule_create",
         arguments={"name": "daily"},
+        observed_image_paths=("/tmp/generated.png",),
     )
     assert facade._turn_routes["provider-turn"] == (
         "provider-thread",
@@ -194,6 +196,12 @@ def test_dynamic_tool_capability_is_exact_version_and_product_gated(
     supported = codex_sdk.capability_manifest(schedule_tool_enabled=True)
     assert supported.optional["dynamic_tool.call"] is True
     assert supported.optional["codexd.schedule_create_tool"] is True
+    assert supported.optional["codexd.publish_image_tool"] is False
+    publish_supported = codex_sdk.capability_manifest(
+        schedule_tool_enabled=True,
+        publish_image_enabled=True,
+    )
+    assert publish_supported.optional["codexd.publish_image_tool"] is True
 
     def version(_distribution: str) -> str:
         return "0.144.5"
@@ -202,6 +210,7 @@ def test_dynamic_tool_capability_is_exact_version_and_product_gated(
     unverified = codex_sdk.capability_manifest(schedule_tool_enabled=True)
     assert unverified.optional["dynamic_tool.call"] is False
     assert unverified.optional["codexd.schedule_create_tool"] is False
+    assert unverified.optional["codexd.publish_image_tool"] is False
 
 
 def test_missing_low_level_handler_degrades_only_dynamic_tool(
@@ -217,3 +226,4 @@ def test_missing_low_level_handler_degrades_only_dynamic_tool(
     manifest.assert_required()
     assert manifest.optional["dynamic_tool.call"] is False
     assert manifest.optional["codexd.schedule_create_tool"] is False
+    assert manifest.optional["codexd.publish_image_tool"] is False

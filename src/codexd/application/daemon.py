@@ -19,7 +19,10 @@ from codexd.domain.ids import utc_now_ms
 from codexd.errors import ConfigurationError, SecurityError
 from codexd.observability.health import HealthReporter
 from codexd.observability.logging import configure_logging
-from codexd.rendering.discord import DiscordRenderPlanner
+from codexd.rendering.discord import (
+    DISCORD_ATTACHMENT_LIMIT_BYTES,
+    DiscordRenderPlanner,
+)
 from codexd.rendering.media_worker import MediaWorker
 from codexd.rendering.tables import TableLimits
 from codexd.runtime.codex_sdk import CodexSDKRuntime, capability_manifest
@@ -99,7 +102,8 @@ async def _run_daemon(config: AppConfig, bootstrap_token: str | None) -> int:
             base_manifest.optional.get("dynamic_tool.call") is True
         )
         manifest = capability_manifest(
-            schedule_tool_enabled=dynamic_tools_available
+            schedule_tool_enabled=dynamic_tools_available,
+            publish_image_enabled=dynamic_tools_available,
         )
         await asyncio.to_thread(
             repository.acquire_daemon_lease,
@@ -118,15 +122,39 @@ async def _run_daemon(config: AppConfig, bootstrap_token: str | None) -> int:
             store,
             allowed_roots=runtime_allowed_roots,
         )
+        media = MediaWorker(
+            environment={
+                name: os.environ[name]
+                for name in config.runtime.nonsecret_env_allowlist
+                if name in os.environ
+            }
+        )
         from codexd.application.dynamic_tools import (
             CODEXD_DYNAMIC_TOOLS,
             DynamicToolDispatcher,
         )
+        from codexd.application.outbound_images import OutboundImageBroker
+        from codexd.storage.outbound_images import OutboundImageRepository
 
         assert config.discord.owner_user_id is not None
         assert config.discord.guild_id is not None
+        image_broker = OutboundImageBroker(
+            repository=OutboundImageRepository(store),
+            media_worker=media,
+            artifact_root=config.paths.attachments / "render",
+            configured_guild_id=config.discord.guild_id,
+            configured_owner_user_id=config.discord.owner_user_id,
+            allowed_user_ids=config.discord.allowed_user_ids,
+            max_bytes=min(
+                config.rendering.image_max_bytes,
+                DISCORD_ATTACHMENT_LIMIT_BYTES,
+            ),
+            max_pixels=config.rendering.image_max_pixels,
+            retention_days=config.retention.render_attachments_days,
+        )
         dynamic_tool_dispatcher = DynamicToolDispatcher(
             schedules=schedule_repository,
+            images=image_broker,
             owner_user_id=config.discord.owner_user_id,
             guild_id=config.discord.guild_id,
         )
@@ -217,13 +245,6 @@ async def _run_daemon(config: AppConfig, bootstrap_token: str | None) -> int:
             poll_seconds=config.schedule.poll_seconds,
             conversation_locks=conversation_locks,
             critical_failure=critical_failure,
-        )
-        media = MediaWorker(
-            environment={
-                name: os.environ[name]
-                for name in config.runtime.nonsecret_env_allowlist
-                if name in os.environ
-            }
         )
         renderer = DiscordRenderPlanner(
             media_worker=media,

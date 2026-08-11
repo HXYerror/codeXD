@@ -555,6 +555,7 @@ codexD 是单用户本机服务，但不能把“单用户”理解为“无边�
 | `dynamic_tool.item` | dynamic tool card | safe generic metadata |
 | `dynamic_tool.call` | 注册并响应 client-executed dynamic tool | 仅保留 `/schedule`；不向 Agent 描述不可调用工具 |
 | `codexd.schedule_create_tool` | 自然语言请求生成 Schedule 草稿与 Discord 确认卡 | 提示 owner 使用 `/schedule create` |
+| `codexd.publish_image_tool` | 显式登记 current-Turn raster image，并在 final Discord 回复附加 | 只输出文字；不得声称图片已发布 |
 | `collab.item` | `collabAgentToolCall` / `subAgentActivity` TaskCardBlock | 不展示 agent card，不猜测 |
 | `image_generation.item` | 生成图片附件 | safe metadata fallback |
 | `account.read` | `/status` auth 摘要 | 显示 unknown，要求本机 doctor |
@@ -856,7 +857,7 @@ mailbox 把 queued Turn 转为 `starting` 前，还要用幂等
 `CodexRuntimeAdapter` 是 codexD 唯一接触 `openai_codex` 的模块。它负责：
 
 - 普通能力以 `AsyncCodex(CodexConfig(experimental_api=False, ...))` 创建和关闭
-  SDK client；只有版本矩阵验证通过并启用 `codexd.schedule_create_tool` 时，改用围绕
+  SDK client；只有版本矩阵验证通过并启用 codexD product tools 时，改用围绕
   public low-level `CodexClient(config, approval_handler=...)` 的 async compatibility
   facade，并显式设置 `experimental_api=True`；
 - 将 domain request 转换为 SDK 参数；
@@ -1230,6 +1231,7 @@ Manifest 是 adapter 的显式输出，不通过 `hasattr` 散落判断：
     "dynamic_tool.item": "supported_not_observed",
     "dynamic_tool.call": true,
     "codexd.schedule_create_tool": true,
+    "codexd.publish_image_tool": true,
     "collab.item": "supported_not_observed",
     "image_generation.item": "supported_not_observed",
     "account.read": true,
@@ -1243,7 +1245,8 @@ Manifest 由 adapter、受支持版本矩阵和 contract tests 共同定义。�
 callable capability 与 `supported|unsupported|supported_not_observed` 事件
 capability 分开表示。
 
-`dynamic_tool.call` 与 `codexd.schedule_create_tool` 是不同门禁：前者只证明当前
+`dynamic_tool.call` 与 `codexd.schedule_create_tool` / `codexd.publish_image_tool`
+是不同门禁：前者只证明当前
 SDK/runtime pair 的 public `CodexClient` handler、experimental opt-in、request
 routing 和 response schema 通过 contract；后者还要求 actor persistence、owner
 gate、Schedule draft/outbox transaction 与 Discord card contract 全部接线完成。
@@ -1686,6 +1689,36 @@ message outbox，立即向 Agent 返回 `confirmation_required`，绝不在 app-
 unattended` 提示和 10 分钟有效的 signed Confirm/Cancel。只有 owner 点击原始、已绑定
 message 才能激活；Confirm/Cancel 再投递 durable terminal edit 并移除按钮。初始卡永久
 投递失败会使草稿 expired 并生成 incident，不会激活 Schedule 或阻塞整个 Conversation。
+
+### 8.9.2 `codexd.publish_image` 与 outbound artifact handoff
+
+`publish_image(source_path, display_name, description)` 只在用户明确要求图片或 raster
+visualization 时调用。`source_path` 是 runtime 内存参数：不进入 event、普通日志、
+diagnostics、tool projection 或 tool result。app-server adapter 在脱敏前暂存当前
+provider Turn 的 `imageView` / typed `imageGeneration.saved_path`，handler 只接受该 Turn
+已观察到、位于 canonical project root 或 OS temp root、且 mtime 属于当前 Turn 的
+regular single-link file；symlink/reparse、hard link、目录、设备、越界和替换竞态全部
+fail closed。
+
+handler 通过 no-follow descriptor 将 source 复制到 owner-only staging，再由隔离
+MediaWorker 按 magic bytes 完整 decode，应用 orientation、pixel/byte/memory budget，
+移除 EXIF/GPS/profile 并规范化为 PNG。最终文件位于
+`attachments/render/<turn_id>/outbound/`；SQLite 只保存 relative path、hash、dimensions、
+安全 display name/description 和 provider call identity。相同 call + argument hash 重放
+原 result，不同参数冲突；文件登记与 durable result 使用同一 DB transaction，崩溃前
+遗留但未登记的随机 staging 文件由 orphan retention 清理。
+
+final outbox 在 Markdown attachments 后按 `artifact_ordinal` 合并已登记图片，并把 artifact
+manifest 纳入 render-plan source hash。429/5xx 与 crash-before-ack 复用同一 immutable
+PNG 和 delivery marker；Discord 永久拒绝图片时发送可见失败卡并记录
+`outbound_image_delivery_failed`，不把二进制改成 base64 文本，也不改变 Turn terminal
+state。普通 `imageView` 永远只是检查事件，未调用 publish tool 时不上传。
+
+私有 `visualize…` marker 不是 provider output contract。final renderer 使用 bounded
+scanner 移除 marker；有 registered image 时由附件表达，没有时替换为可见失败提示并记录
+`visualization_attachment_missing`，绝不读取 marker 内 path、执行 HTML/JS 或发网络请求。
+现有 typed `imageGeneration` 若没有显式 publish 仍维持
+`image_generation_attachment_unavailable` incident，不能误报上传成功。
 
 ### 8.10 Outbox 状态机
 
@@ -2411,6 +2444,15 @@ argument hash、安全 result JSON，以及可选 draft/outbox correlation。四
 identity 唯一；成功记录必须同时关联 draft 与 outbox，失败记录两者都为空。该记录、
 草稿和确认卡 outbox 使用同一 transaction，因此 response 前崩溃与 request replay 都不
 会产生重复卡片或 Schedule。
+
+#### `outbound_image_invocations`
+
+每行同时表示 `publish_image` invocation 及其可选 registered artifact：local Turn、runtime
+generation、provider thread/turn/call 与 canonical argument hash 唯一；失败行只保存安全
+error result，成功行还必须包含 ordinal、render-root relative path、source/normalized hash、
+PNG size/dimensions、display name/description 和 retention deadline。成功 artifact 按
+`(turn_id, artifact_ordinal)` 唯一排序。Turn 删除级联清理记录；render plan/outbound
+retention 删除文件前会保护 active Turn、pending final delivery 和仍被 plan 引用的路径。
 
 #### `schedule_fires`
 

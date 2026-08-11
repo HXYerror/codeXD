@@ -369,6 +369,7 @@ class CodexSDKRuntime:
                 capability_manifest(
                     runtime_version=runtime_version,
                     schedule_tool_enabled=True,
+                    publish_image_enabled=True,
                 )
                 if dynamic_enabled
                 else capability_manifest(runtime_version=runtime_version)
@@ -824,6 +825,15 @@ class CodexSDKRuntime:
                         expected_turn_id=handle.id,
                         generation=self.generation,
                     )
+                    observed_image_path = _provider_image_path(notification)
+                    if (
+                        observed_image_path is not None
+                        and isinstance(self._client, DynamicAsyncCodex)
+                    ):
+                        self._client.observe_image_path(
+                            handle.id,
+                            observed_image_path,
+                        )
                     unknown_terminal = (
                         notification.method == "turn/completed"
                         and isinstance(notification.payload, UnknownNotification)
@@ -1320,6 +1330,21 @@ def _subagent_thread_id(notification: Notification) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _provider_image_path(notification: Notification) -> str | None:
+    if notification.method not in {"item/started", "item/completed"}:
+        return None
+    item_wrapper = getattr(notification.payload, "item", None)
+    item = getattr(item_wrapper, "root", None)
+    item_type = getattr(item, "type", None)
+    if item_type == "imageView":
+        path = getattr(getattr(item, "path", None), "root", None)
+    elif item_type == "imageGeneration":
+        path = getattr(getattr(item, "saved_path", None), "root", None)
+    else:
+        return None
+    return path if isinstance(path, str) and path else None
+
+
 def _notification_route_mismatch(
     *,
     generation: int,
@@ -1673,6 +1698,7 @@ def capability_manifest(
     *,
     runtime_version: str | None = None,
     schedule_tool_enabled: bool = False,
+    publish_image_enabled: bool = False,
 ) -> CapabilityManifest:
     _verify_public_contract()
     sdk_version = importlib.metadata.version("openai-codex")
@@ -1769,6 +1795,9 @@ def capability_manifest(
             "codexd.schedule_create_tool": (
                 dynamic_tool_call and schedule_tool_enabled
             ),
+            "codexd.publish_image_tool": (
+                dynamic_tool_call and publish_image_enabled
+            ),
             "collab.item": EventCapability.SUPPORTED_NOT_OBSERVED,
             "image_generation.item": EventCapability.SUPPORTED_NOT_OBSERVED,
             "account.read": True,
@@ -1778,7 +1807,10 @@ def capability_manifest(
 
 
 def _capability_manifest() -> CapabilityManifest:
-    return capability_manifest(schedule_tool_enabled=True)
+    return capability_manifest(
+        schedule_tool_enabled=True,
+        publish_image_enabled=True,
+    )
 
 
 def _initialized_runtime_version(

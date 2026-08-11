@@ -112,6 +112,7 @@ def run_retention(
     now = utc_now_ms() if now_ms is None else now_ms
     input_artifacts: list[tuple[str, Path]] = []
     render_artifacts: list[tuple[str, tuple[Path, ...]]] = []
+    outbound_artifacts: list[tuple[str, Path]] = []
     with store.transaction() as connection:
         attachment_rows = connection.execute(
             f"""
@@ -160,6 +161,37 @@ def run_retention(
             )
             turn_id = str(row["turn_id"])
             render_artifacts.append((turn_id, paths_for_plan))
+        outbound_rows = connection.execute(
+            f"""
+            SELECT oi.id, oi.relative_path
+            FROM outbound_image_invocations oi
+            JOIN turns t ON t.id = oi.turn_id
+            WHERE oi.success = 1 AND oi.retention_until <= ?
+              AND t.state IN ({_placeholders(_TERMINAL_TURNS)})
+              AND NOT EXISTS (
+                  SELECT 1 FROM discord_render_plans rp
+                  WHERE rp.turn_id = oi.turn_id
+              )
+              AND EXISTS (
+                  SELECT 1 FROM discord_outbox o
+                  WHERE json_extract(o.payload_json, '$.kind') = 'turn_final'
+                    AND json_extract(o.payload_json, '$.turn_id') = oi.turn_id
+                    AND o.state IN ('sent', 'dead_letter', 'superseded')
+              )
+            LIMIT 250
+            """,
+            (now, *_TERMINAL_TURNS),
+        ).fetchall()
+        for row in outbound_rows:
+            outbound_artifacts.append(
+                (
+                    str(row["id"]),
+                    _safe_relative_path(
+                        paths.attachments / "render",
+                        str(row["relative_path"]),
+                    ),
+                )
+            )
         event_cutoff = now - config.events_days * 24 * 60 * 60 * 1000
         tool_output_cutoff = now - 30 * 24 * 60 * 60 * 1000
         content_cutoff = now - 180 * 24 * 60 * 60 * 1000
@@ -535,6 +567,15 @@ def run_retention(
             )
         if removed_all:
             removed_render_turn_ids.append(turn_id)
+    removed_outbound_ids = tuple(
+        artifact_id
+        for artifact_id, path in outbound_artifacts
+        if _unlink_artifact(
+            path,
+            artifact_id=artifact_id,
+            artifact_kind="outbound_image",
+        )
+    )
     with store.transaction() as connection:
         if removed_attachment_ids:
             connection.executemany(
@@ -545,6 +586,15 @@ def run_retention(
             connection.executemany(
                 "DELETE FROM discord_render_plans WHERE turn_id = ?",
                 ((turn_id,) for turn_id in removed_render_turn_ids),
+            )
+            connection.executemany(
+                "DELETE FROM outbound_image_invocations WHERE turn_id = ?",
+                ((turn_id,) for turn_id in removed_render_turn_ids),
+            )
+        if removed_outbound_ids:
+            connection.executemany(
+                "DELETE FROM outbound_image_invocations WHERE id = ?",
+                ((artifact_id,) for artifact_id in removed_outbound_ids),
             )
     terminal_turns, linked_schedule_fires = _delete_expired_terminal_turns(
         store,
@@ -777,6 +827,15 @@ def _sweep_orphan_artifacts(
     render_root = paths.attachments / "render"
     for row in store.query_all("SELECT plan_json FROM discord_render_plans"):
         referenced.update(_render_plan_paths(render_root, str(row["plan_json"])))
+    for row in store.query_all(
+        """
+        SELECT relative_path FROM outbound_image_invocations
+        WHERE success = 1
+        """
+    ):
+        referenced.add(
+            _safe_relative_path(render_root, str(row["relative_path"]))
+        )
 
     removed = 0
     for root in (

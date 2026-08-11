@@ -40,6 +40,7 @@ class DynamicToolCall:
     namespace: str | None
     tool: str
     arguments: object
+    observed_image_paths: tuple[str, ...] = ()
 
 
 DynamicToolHandler = Callable[

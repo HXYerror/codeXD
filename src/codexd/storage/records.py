@@ -235,6 +235,40 @@ class DynamicToolInvocationRecord:
 
 
 @dataclass(frozen=True)
+class OutboundImageScope:
+    turn_id: str
+    conversation_id: str
+    project_id: str
+    project_root: Path
+    turn_started_at: int
+
+
+@dataclass(frozen=True)
+class OutboundImageInvocationRecord:
+    id: str
+    turn_id: str
+    runtime_generation: int
+    provider_thread_id: str
+    provider_turn_id: str
+    provider_call_id: str
+    arguments_hash: str
+    success: bool
+    result_json: str
+    artifact_ordinal: int | None
+    relative_path: str | None
+    source_sha256: str | None
+    normalized_sha256: str | None
+    size_bytes: int | None
+    width: int | None
+    height: int | None
+    media_type: str | None
+    display_name: str | None
+    description: str | None
+    state: str
+    retention_until: int | None
+
+
+@dataclass(frozen=True)
 class ScheduleFireRecord:
     id: str
     trigger_kind: str

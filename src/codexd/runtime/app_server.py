@@ -55,6 +55,7 @@ logger = logging.getLogger(__name__)
 
 _SERVER_REQUEST_TIMEOUT_SECONDS = 10.0
 _TURN_ROUTE_WAIT_SECONDS = 1.0
+_IMAGE_OBSERVATION_WAIT_SECONDS = 1.0
 _MAX_TOOL_RESPONSE_BYTES = 32 * 1024
 _APPROVAL_METHODS = frozenset(
     {
@@ -91,6 +92,7 @@ class DynamicAsyncCodex:
         self._route_condition = threading.Condition(self._route_lock)
         self._pending_turns: dict[str, str] = {}
         self._turn_routes: dict[str, tuple[str, str]] = {}
+        self._observed_image_paths: dict[str, set[str]] = {}
         self._sync_client = CodexClient(
             config=config,
             approval_handler=self._handle_server_request,
@@ -127,6 +129,7 @@ class DynamicAsyncCodex:
         with self._route_lock:
             self._pending_turns.clear()
             self._turn_routes.clear()
+            self._observed_image_paths.clear()
         self._metadata = None
         self._loop = None
 
@@ -296,6 +299,37 @@ class DynamicAsyncCodex:
     def _forget_turn(self, provider_turn_id: str) -> None:
         with self._route_lock:
             self._turn_routes.pop(provider_turn_id, None)
+            self._observed_image_paths.pop(provider_turn_id, None)
+
+    def observe_image_path(self, provider_turn_id: str, path: str) -> None:
+        if not path or len(path) > 4096 or "\x00" in path:
+            return
+        with self._route_condition:
+            if provider_turn_id not in self._turn_routes:
+                return
+            self._observed_image_paths.setdefault(provider_turn_id, set()).add(path)
+            self._route_condition.notify_all()
+
+    def _observed_paths_for_call(
+        self,
+        provider_turn_id: str,
+        arguments: object,
+    ) -> tuple[str, ...]:
+        source_path = (
+            arguments.get("source_path")
+            if isinstance(arguments, dict)
+            else None
+        )
+        with self._route_condition:
+            if isinstance(source_path, str) and source_path:
+                self._route_condition.wait_for(
+                    lambda: source_path
+                    in self._observed_image_paths.get(provider_turn_id, set()),
+                    timeout=_IMAGE_OBSERVATION_WAIT_SECONDS,
+                )
+            return tuple(
+                sorted(self._observed_image_paths.get(provider_turn_id, set()))
+            )
 
     def _handle_server_request(
         self,
@@ -355,6 +389,7 @@ class DynamicAsyncCodex:
         local_turn_id = self._resolve_local_turn(thread_id, turn_id)
         if local_turn_id is None:
             raise ValueError("dynamic tool call has no active local Turn")
+        arguments = cast(object, params.get("arguments"))
         return DynamicToolCall(
             runtime_generation=self._generation,
             local_turn_id=local_turn_id,
@@ -363,7 +398,11 @@ class DynamicAsyncCodex:
             provider_call_id=call_id,
             namespace=namespace,
             tool=tool,
-            arguments=cast(object, params.get("arguments")),
+            arguments=arguments,
+            observed_image_paths=self._observed_paths_for_call(
+                turn_id,
+                arguments,
+            ),
         )
 
 
