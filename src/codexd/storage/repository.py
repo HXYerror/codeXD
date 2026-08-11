@@ -176,7 +176,7 @@ class Repository:
         schedule_id: str | None = None,
         expected_version: int | None = None,
     ) -> ModalIntentRecord:
-        if kind not in {"schedule_create", "schedule_update", "steer"}:
+        if kind not in {"schedule_create", "schedule_update", "steer", "side_query"}:
             raise InvariantError("invalid modal intent kind")
         now = utc_now_ms()
         if expires_at <= now:
@@ -5895,6 +5895,13 @@ class Repository:
                     ),
                 )
                 unknown_intents += 1
+            from codexd.storage.side_queries import interrupt_for_restart
+
+            interrupted_side_queries = interrupt_for_restart(
+                connection,
+                current_boot_id=current_boot_id,
+                now=now,
+            )
             return {
                 "interrupted_turns": discord_turns,
                 "reconciling_outbox": outbox,
@@ -5904,6 +5911,7 @@ class Repository:
                 "reconciled_schedule_intents": reconciled_schedule_intents,
                 "reconciled_turn_cancel_intents": reconciled_turn_cancel_intents,
                 "unknown_intents": unknown_intents,
+                "interrupted_side_queries": interrupted_side_queries,
             }
 
     def interrupt_for_shutdown(self) -> int:

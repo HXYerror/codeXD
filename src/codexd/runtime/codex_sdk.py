@@ -100,6 +100,8 @@ from codexd.runtime.port import (
     CompactStartResult,
     DynamicToolHandler,
     RuntimeSlotConfig,
+    SideQueryIdentity,
+    StartedSideQuery,
     StartedTurn,
     TurnStream,
 )
@@ -114,6 +116,12 @@ _CANCELLED_STARTUP_CLEANUP_TIMEOUT_SECONDS = 30.0
 _FILE_INPUT_RUNTIME_RETIRE_TIMEOUT_SECONDS = 30.0
 _APP_SERVER_FORCE_WAIT_TIMEOUT_SECONDS = 2.0
 _NEW_THREAD_PERSISTENCE_NAME = "codexD session"
+_SIDE_QUERY_DEVELOPER_INSTRUCTIONS = (
+    "This is a temporary read-only side question. Answer the question without "
+    "changing files, running write commands, scheduling work, publishing artifacts, "
+    "calling codexD dynamic tools, or modifying external systems. Do not reveal local "
+    "paths, hidden reasoning, provider IDs, or secrets."
+)
 _ARCHIVE_DIRECT_HANDLE_CONTRACT_VERIFIED = False
 _MIN_SDK_VERSION = (0, 144, 4)
 _MAX_SDK_VERSION = (0, 145, 0)
@@ -319,6 +327,8 @@ class CodexSDKRuntime:
         self._turn_handles: dict[
             str, AsyncTurnHandle | DynamicAsyncTurnHandle
         ] = {}
+        self._side_threads: dict[str, DynamicAsyncThread] = {}
+        self._side_turn_handles: dict[str, DynamicAsyncTurnHandle] = {}
         self._file_input_leases: dict[str, _FileInputLeases] = {}
         self._pending_file_input_leases: set[_FileInputLeases] = set()
         self._file_lease_release_blocked = False
@@ -893,6 +903,193 @@ class CodexSDKRuntime:
 
         return StartedTurn(identity=identity, stream=TurnStream(iterator))
 
+    async def start_side_query(
+        self,
+        *,
+        local_query_id: str,
+        source_thread: ThreadIdentity,
+        question: str,
+        cwd: Path,
+        thread_config: ThreadConfig,
+        turn_config: TurnConfig,
+    ) -> StartedSideQuery:
+        self._ensure_open()
+        if not isinstance(self._client, DynamicAsyncCodex):
+            raise UnsupportedCapability(
+                AdapterFailure(
+                    code="side_query_unavailable",
+                    provider_exception="UnsupportedCapability",
+                    message="The active Codex runtime cannot clean up Side Queries",
+                    retryable=False,
+                    runtime_generation=self.generation,
+                    thread_id=source_thread.thread_id,
+                )
+            )
+        if _configured_mcp_servers(self._slot):
+            raise UnsupportedCapability(
+                AdapterFailure(
+                    code="side_query_mcp_not_isolated",
+                    provider_exception="ConfigurationConflict",
+                    message="Side Query is unavailable while MCP servers are configured",
+                    retryable=False,
+                    runtime_generation=self.generation,
+                    thread_id=source_thread.thread_id,
+                )
+            )
+        if not question.strip():
+            raise InvariantError("Side Query question may not be empty")
+        side_thread: DynamicAsyncThread | None = None
+        try:
+            side_thread = await self._client.thread_fork(
+                source_thread.thread_id,
+                approval_mode=ApprovalMode.deny_all,
+                config=_thread_wire_config(thread_config.web_search_mode),
+                cwd=str(cwd),
+                ephemeral=True,
+                model=thread_config.model,
+                sandbox=Sandbox.read_only,
+                service_tier=thread_config.service_tier,
+                developer_instructions=_SIDE_QUERY_DEVELOPER_INSTRUCTIONS,
+            )
+            fork_snapshot = await side_thread.read(include_turns=False)
+            if getattr(fork_snapshot.thread, "ephemeral", None) is not True:
+                raise InvariantError("Side Query provider Thread is not ephemeral")
+            identity = _thread_identity(
+                fork_snapshot.thread,
+                requested_thread_id=None,
+                sdk_version=self._manifest.sdk_version,
+            )
+            if (
+                identity.thread_id == source_thread.thread_id
+                or identity.forked_from_thread_id != source_thread.thread_id
+                or identity.provider_session_id != source_thread.provider_session_id
+            ):
+                raise InvariantError("Side Query fork identity does not match its source")
+            handle = await side_thread.turn(
+                [TextInput(question)],
+                local_turn_id=f"side:{local_query_id}",
+                approval_mode=ApprovalMode.deny_all,
+                cwd=str(turn_config.cwd),
+                effort=_effort(turn_config.reasoning_effort),
+                model=turn_config.model,
+                output_schema=None,
+                personality=_personality(turn_config.personality),
+                sandbox=Sandbox.read_only,
+                service_tier=turn_config.service_tier,
+                summary=_summary(turn_config.reasoning_summary),
+            )
+        except BaseException as exc:
+            if side_thread is not None:
+                try:
+                    await self._client.thread_unsubscribe(side_thread.id)
+                except BaseException as cleanup_error:
+                    exc.add_note(
+                        "Side Query fork cleanup failed: "
+                        f"{type(cleanup_error).__name__}"
+                    )
+            if isinstance(exc, CodexError):
+                raise _adapter_error(
+                    exc,
+                    operation="thread.side_query.start",
+                    generation=self.generation,
+                    thread_id=source_thread.thread_id,
+                ) from exc
+            raise
+        assert side_thread is not None
+        self._side_threads[identity.thread_id] = side_thread
+        self._side_turn_handles[handle.id] = handle
+        query_identity = SideQueryIdentity(
+            local_query_id=local_query_id,
+            source_thread_id=source_thread.thread_id,
+            side_thread_id=identity.thread_id,
+            provider_turn_id=handle.id,
+            runtime_generation=self.generation,
+        )
+
+        async def iterator() -> AsyncIterator[NormalizedEvent]:
+            terminal_seen = False
+            try:
+                async for notification in handle.stream():
+                    _assert_notification_route(
+                        notification,
+                        expected_thread_id=identity.thread_id,
+                        expected_turn_id=handle.id,
+                        generation=self.generation,
+                    )
+                    event = _normalize_notification(notification, cwd=turn_config.cwd)
+                    terminal = event.kind in {
+                        "turn.completed",
+                        "turn.failed",
+                        "turn.interrupted",
+                        "turn.terminal_unparseable",
+                    }
+                    terminal_seen = terminal_seen or terminal
+                    yield event
+                    if terminal:
+                        break
+            except CodexError as exc:
+                raise _adapter_error(
+                    exc,
+                    operation="thread.side_query.stream",
+                    generation=self.generation,
+                    thread_id=identity.thread_id,
+                    turn_id=handle.id,
+                ) from exc
+            if not terminal_seen:
+                raise RuntimeUnavailable(
+                    AdapterFailure(
+                        code="side_query_stream_ended",
+                        provider_exception="StreamEnded",
+                        message="Side Query stream ended without a terminal event",
+                        retryable=False,
+                        runtime_generation=self.generation,
+                        thread_id=identity.thread_id,
+                        turn_id=handle.id,
+                    )
+                )
+
+        return StartedSideQuery(
+            identity=query_identity,
+            stream=TurnStream(iterator),
+        )
+
+    async def interrupt_side_query(self, query: SideQueryIdentity) -> None:
+        if query.runtime_generation != self.generation:
+            raise InvariantError("Side Query belongs to another runtime generation")
+        handle = self._side_turn_handles.get(query.provider_turn_id)
+        if handle is None or handle.thread_id != query.side_thread_id:
+            return
+        try:
+            await handle.interrupt()
+        except CodexError as exc:
+            raise _adapter_error(
+                exc,
+                operation="thread.side_query.interrupt",
+                generation=self.generation,
+                thread_id=query.side_thread_id,
+                turn_id=query.provider_turn_id,
+            ) from exc
+
+    async def close_side_query(self, query: SideQueryIdentity) -> None:
+        if query.runtime_generation != self.generation:
+            return
+        self._side_turn_handles.pop(query.provider_turn_id, None)
+        self._side_threads.pop(query.side_thread_id, None)
+        if not isinstance(self._client, DynamicAsyncCodex):
+            return
+        try:
+            status = await self._client.thread_unsubscribe(query.side_thread_id)
+        except CodexError as exc:
+            raise _adapter_error(
+                exc,
+                operation="thread.side_query.unsubscribe",
+                generation=self.generation,
+                thread_id=query.side_thread_id,
+                turn_id=query.provider_turn_id,
+            ) from exc
+        if status not in {"unsubscribed", "notLoaded", "notSubscribed"}:
+            raise InvariantError("Side Query unsubscribe returned an unknown status")
+
     async def _subagent_detail(
         self,
         *,
@@ -1077,6 +1274,8 @@ class CodexSDKRuntime:
         self._closed = True
         self._turn_handles.clear()
         self._threads.clear()
+        self._side_turn_handles.clear()
+        self._side_threads.clear()
 
     async def _identity(
         self,
@@ -1234,6 +1433,43 @@ def _configured_provider_requires_openai_auth(
         return None
     requires_auth = provider.get("requires_openai_auth")
     return requires_auth if isinstance(requires_auth, bool) else None
+
+
+def _configured_mcp_servers(slot: RuntimeSlotConfig) -> bool:
+    codex_home = slot.codex_home
+    if codex_home is None:
+        configured_home = slot.environment.get("CODEX_HOME")
+        if configured_home:
+            codex_home = Path(configured_home)
+        else:
+            home = slot.environment.get("HOME") or slot.environment.get("USERPROFILE")
+            if not home:
+                return False
+            codex_home = Path(home) / ".codex"
+    try:
+        config = tomllib.loads(
+            (codex_home / "config.toml").read_text(encoding="utf-8")
+        )
+    except (OSError, tomllib.TOMLDecodeError):
+        return False
+    return _contains_mcp_configuration(config)
+
+
+def _contains_mcp_configuration(value: object) -> bool:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if (
+                isinstance(key, str)
+                and key.casefold() in {"mcp", "mcp_servers"}
+                and isinstance(child, (dict, list))
+                and bool(child)
+            ):
+                return True
+            if _contains_mcp_configuration(child):
+                return True
+    elif isinstance(value, list):
+        return any(_contains_mcp_configuration(child) for child in value)
+    return False
 
 
 async def _close_after_failed_create(
@@ -1694,6 +1930,18 @@ def _dynamic_tool_contract_supported(
     )
 
 
+def _side_query_contract_supported(
+    sdk_version: str,
+    runtime_version: str,
+) -> bool:
+    return (
+        _dynamic_tool_contract_supported(sdk_version, runtime_version)
+        and callable(getattr(DynamicAsyncCodex, "thread_fork", None))
+        and callable(getattr(DynamicAsyncCodex, "thread_unsubscribe", None))
+        and callable(getattr(DynamicAsyncTurnHandle, "interrupt", None))
+    )
+
+
 def capability_manifest(
     *,
     runtime_version: str | None = None,
@@ -1778,6 +2026,10 @@ def capability_manifest(
                 {"name"},
             ),
             "thread.compact": _callable_accepts(AsyncThread, "compact", set()),
+            "thread.side_query": _side_query_contract_supported(
+                sdk_version,
+                effective_runtime_version,
+            ),
             "turn.output_schema": True,
             "turn.personality": True,
             "turn.reasoning_summary": True,

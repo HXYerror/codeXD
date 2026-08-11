@@ -269,6 +269,26 @@ class OutboundImageInvocationRecord:
 
 
 @dataclass(frozen=True)
+class SideQueryRecord:
+    id: str
+    interaction_id: str
+    project_id: str
+    conversation_id: str
+    requested_by_user_id: int
+    question_hash: str
+    question_size: int
+    state: str
+    answer_hash: str | None
+    answer_size: int | None
+    terminal_code: str | None
+    error_code: str | None
+    accepted_boot_id: str
+    created_at: int
+    started_at: int | None
+    completed_at: int | None
+
+
+@dataclass(frozen=True)
 class ScheduleFireRecord:
     id: str
     trigger_kind: str

@@ -22,6 +22,7 @@ from discord import app_commands
 from codexd.application.schedule_coordinator import ScheduleCoordinator
 from codexd.application.session_coordinator import SessionCoordinator
 from codexd.application.session_lifecycle import SessionLifecycleCoordinator
+from codexd.application.side_queries import SideQueryCoordinator
 from codexd.application.turn_coordinator import TurnCoordinator
 from codexd.config import AppConfig
 from codexd.domain.capabilities import CapabilityManifest, EventCapability
@@ -160,6 +161,7 @@ class CodexDBot(discord.Client):
         signer: ComponentSigner,
         capability_manifest: CapabilityManifest,
         boot_id: str,
+        side_queries: SideQueryCoordinator | None = None,
         discord_status: Callable[[str], None] | None = None,
         codex_auth_status: Callable[[str], None] | None = None,
     ) -> None:
@@ -185,6 +187,7 @@ class CodexDBot(discord.Client):
         self.signer = signer
         self.capability_manifest = capability_manifest
         self.boot_id = boot_id
+        self.side_queries = side_queries
         self._discord_status = discord_status or (lambda _status: None)
         self._codex_auth_status = codex_auth_status or (lambda _status: None)
         self._http_session: aiohttp.ClientSession | None = None
@@ -1526,6 +1529,14 @@ class CodexDBot(discord.Client):
                         ),
                     }
                 )
+            elif modal.kind == "side_query":
+                question = values.get("side_query_question", "")
+                request.update(
+                    {
+                        "question_hash": sha256_text(question),
+                        "question_size": len(question.encode()),
+                    }
+                )
             else:
                 request["instruction_hash"] = sha256_text(
                     values.get("steer_instruction", "")
@@ -1591,6 +1602,12 @@ class CodexDBot(discord.Client):
             raise SecurityError("modal Conversation scope changed")
         if modal_kind == "steer":
             await self._apply_steer_modal(interaction, modal, values)
+            return
+        if modal_kind == "side_query":
+            await self._apply_side_query(
+                interaction,
+                values.get("side_query_question", ""),
+            )
             return
         await self._require_owner(interaction)
         await self._apply_schedule_modal(
@@ -1894,6 +1911,26 @@ class CodexDBot(discord.Client):
             ),
             guild=guild,
         )
+        if (
+            self.side_queries is not None
+            and self._optional_available("thread.side_query")
+        ):
+            self.tree.add_command(
+                app_commands.Command(
+                    name="btw",
+                    description="Ask a temporary question without changing the main task",
+                    callback=self._btw,
+                ),
+                guild=guild,
+            )
+            self.tree.add_command(
+                app_commands.Command(
+                    name="side",
+                    description="Alias for /btw temporary Side Query",
+                    callback=self._side,
+                ),
+                guild=guild,
+            )
         self.tree.add_command(
             app_commands.Command(
                 name="usage",
@@ -2542,6 +2579,116 @@ class CodexDBot(discord.Client):
             return _SteerModal(custom_id=modal_id)
 
         await self._open_modal(interaction, prepare)
+
+    async def _btw(
+        self,
+        interaction: discord.Interaction[Any],
+        question: str | None = None,
+    ) -> None:
+        await self._side_query_command(
+            interaction,
+            command_name="btw",
+            question=question,
+        )
+
+    async def _side(
+        self,
+        interaction: discord.Interaction[Any],
+        question: str | None = None,
+    ) -> None:
+        await self._side_query_command(
+            interaction,
+            command_name="side",
+            question=question,
+        )
+
+    async def _side_query_command(
+        self,
+        interaction: discord.Interaction[Any],
+        *,
+        command_name: str,
+        question: str | None,
+    ) -> None:
+        if self.side_queries is None:
+            raise ConflictError("Side Query is unavailable")
+        if question is None:
+            async def prepare() -> discord.ui.Modal:
+                if not self._authorized_interaction(interaction):
+                    raise SecurityError("Side Query is not authorized")
+                conversation = await self._conversation(interaction)
+                modal_id = await self._create_modal_intent(
+                    interaction,
+                    kind="side_query",
+                    conversation=conversation,
+                )
+                return _SideQueryModal(custom_id=modal_id)
+
+            await self._open_modal(interaction, prepare)
+            return
+        await self._run_intent_action(
+            interaction,
+            command_name=command_name,
+            request={
+                "question_hash": sha256_text(question),
+                "question_size": len(question.encode()),
+            },
+            action=lambda staged: self._apply_side_query(staged, question),
+        )
+
+    async def _apply_side_query(
+        self,
+        interaction: discord.Interaction[Any],
+        question: str,
+    ) -> None:
+        if self.side_queries is None:
+            raise ConflictError("Side Query is unavailable")
+        await self._defer_authorized(interaction)
+        conversation = await self._conversation(interaction)
+        await interaction.edit_original_response(
+            content="BTW · asking Codex…",
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        answer = await self.side_queries.ask(
+            interaction_id=str(interaction.id),
+            conversation_id=conversation.id,
+            requested_by_user_id=interaction.user.id,
+            question=question,
+        )
+        footer = "\n\n-# Temporary side answer · main task unchanged"
+        try:
+            chunks = list(split_discord_text(answer, limit=1750))
+        except ValueError:
+            chunks = list(split_discord_code(answer, limit=1700))
+        if not chunks:
+            raise InvariantError("Side Query answer could not be rendered")
+        if len(chunks) <= 6:
+            await interaction.edit_original_response(
+                content=chunks[0] + footer,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            for chunk in chunks[1:]:
+                await interaction.followup.send(
+                    chunk,
+                    ephemeral=True,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                    suppress_embeds=True,
+                )
+            return
+        file = discord.File(
+            io.BytesIO(answer.encode("utf-8")),
+            filename="btw-answer.md",
+            description="Complete temporary Side Query answer",
+        )
+        await interaction.edit_original_response(
+            content="The temporary answer is attached as Markdown." + footer,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        await interaction.followup.send(
+            "Complete temporary answer:",
+            file=file,
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
 
     async def _model_show(self, interaction: discord.Interaction[Any]) -> None:
         await self._defer_authorized(interaction)
@@ -3361,6 +3508,21 @@ class _SteerModal(discord.ui.Modal, title="Steer active Codex Turn"):
     instruction: discord.ui.TextInput[_SteerModal] = discord.ui.TextInput(
         label="Instruction",
         custom_id="steer_instruction",
+        style=discord.TextStyle.paragraph,
+        max_length=4000,
+    )
+
+    def __init__(self, *, custom_id: str) -> None:
+        super().__init__(custom_id=custom_id)
+
+    async def on_submit(self, interaction: discord.Interaction[Any]) -> None:
+        return
+
+
+class _SideQueryModal(discord.ui.Modal, title="Temporary Side Query"):
+    question: discord.ui.TextInput[_SideQueryModal] = discord.ui.TextInput(
+        label="Question",
+        custom_id="side_query_question",
         style=discord.TextStyle.paragraph,
         max_length=4000,
     )

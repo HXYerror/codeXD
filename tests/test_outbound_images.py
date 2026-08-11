@@ -110,7 +110,11 @@ def test_outbound_image_migration_marks_existing_toolset_for_new_session(
         )
         assert before.dynamic_tools_enabled is True
 
-        monkeypatch.setattr(sqlite_module, "_load_migrations", lambda: migrations)
+        monkeypatch.setattr(
+            sqlite_module,
+            "_load_migrations",
+            lambda: tuple(migration for migration in migrations if migration.version < 19),
+        )
         assert store.migrate() == 18
         after = repository.get_active_revision(conversation.id)
         assert after is not None

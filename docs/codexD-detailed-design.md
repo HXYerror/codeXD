@@ -540,6 +540,7 @@ codexD 是单用户本机服务，但不能把“单用户”理解为“无边�
 |---|---|---|
 | `thread.archive` / `thread.unarchive` | `/session archive` 与 archived resume | direct-handle/config-preservation contract 不通过时不注册 archive；已有 archived revision 标 blocked |
 | `thread.fork` | `/session fork` | 不注册该 subcommand |
+| `thread.side_query` | `/btw` 与 `/side` 一次性临时问答 | 不注册命令；不得降级为 steer、ordinary Turn 或持久 fork |
 | `thread.set_name` | `/session rename` | 不注册；已有 Discord thread title 不变 |
 | `thread.compact` | `/session compact` | 不注册该 subcommand |
 | `turn.output_schema` | 结构化内部任务 | 仅解析 Markdown |
@@ -1218,6 +1219,7 @@ Manifest 是 adapter 的显式输出，不通过 `hasattr` 散落判断：
     "thread.fork": true,
     "thread.set_name": true,
     "thread.compact": true,
+    "thread.side_query": true,
     "turn.output_schema": true,
     "turn.personality": true,
     "turn.reasoning_summary": true,
@@ -1719,6 +1721,32 @@ scanner 移除 marker；有 registered image 时由附件表达，没有时替�
 `visualization_attachment_missing`，绝不读取 marker 内 path、执行 HTML/JS 或发网络请求。
 现有 typed `imageGeneration` 若没有显式 publish 仍维持
 `image_generation_attachment_unavailable` incident，不能误报上传成功。
+
+### 8.9.3 `/btw` / `/side` ephemeral Side Query
+
+两个顶层 Discord command 共享同一个 application service。填写 `question` 时立即
+ephemeral defer；省略时打开 signed `side_query` modal，intent 绑定 Conversation、guild、
+thread、initiating allowed user、nonce 与 10 分钟 expiry。每次调用只执行一次问答，普通
+Thread message 永远不会隐式路由到 side。
+
+runtime 从当前 active Revision 的 provider Thread 执行 public
+`thread_fork(ephemeral=True)`，不创建/激活 `ThreadRevisionRecord`。fork 与 Turn 固定
+`read_only` sandbox、`deny_all` approval，并附 no-mutation developer instruction；若 Codex
+config 任意 profile 含 MCP server，Side Query capability 在该 runtime fail closed。低层
+approval router 也按 side provider Turn route 对 command/file escalation 返回 `decline`；
+side local ID 不存在于 ordinary `turns`，因此 schedule/image dynamic tools无法取得可信
+scope。
+
+SideQuery 使用独立 handle maps，notification 仍同时校验 side thread ID、Turn ID 与
+runtime generation。terminal/timeout/cancel/shutdown 时先 interrupt，再用 generated
+`ThreadUnsubscribeParams/Response` 经 public `CodexClient.request` 完成 typed unsubscribe；
+只有 `unsubscribed/notLoaded/notSubscribed` 为合法 cleanup 结果。主 active Turn、progress、
+events、usage、diff、task cards 与 transcript 均不接收 side event。
+
+Discord 原 ephemeral response 显示 `BTW · asking Codex…`，完成后更新为 bounded Markdown
+与 `Temporary side answer · main task unchanged` footer；长回答使用 ephemeral `.md`
+attachment，不回退到公共 channel。workspace 不是快照：Side Query 不写文件，但读取调用
+时可见的状态，主 Turn 可能同时改变这些文件。
 
 ### 8.10 Outbox 状态机
 
@@ -2233,7 +2261,7 @@ Schedule create/update 与 Turn steer 的 modal scope 必须跨 daemon restart �
 | 字段 | 约束/说明 |
 |---|---|
 | `id` | PK UUID；进入 signed Discord custom ID |
-| `kind` | schedule_create/schedule_update/steer |
+| `kind` | schedule_create/schedule_update/steer/side_query |
 | `project_id`, `conversation_id` | required immutable scope FK |
 | `turn_id` | steer required，其他 kind forbidden |
 | `schedule_id`, `expected_version` | schedule_update required |
@@ -2444,6 +2472,15 @@ argument hash、安全 result JSON，以及可选 draft/outbox correlation。四
 identity 唯一；成功记录必须同时关联 draft 与 outbox，失败记录两者都为空。该记录、
 草稿和确认卡 outbox 使用同一 transaction，因此 response 前崩溃与 request replay 都不
 会产生重复卡片或 Schedule。
+
+#### `side_queries`
+
+只保存 interaction ID、Conversation/project/user scope、accepted/running/terminal state、
+question/answer SHA-256 与 UTF-8 size、stable terminal/error code 和 timestamps；完整问题、
+回答及 provider side thread/turn ID 从不进入 DB、audit payload、main projection或
+diagnostics。`(conversation_id, requested_by_user_id)` 对 accepted/running 唯一，daemon-wide
+另有 bounded concurrency。restart 将旧 boot 的 accepted/running 标 interrupted 且绝不
+重放；terminal row 90 天后 retention 删除。
 
 #### `outbound_image_invocations`
 
@@ -3046,6 +3083,7 @@ codexD 有三种命令，不应混在一起：
 | `/session new` | Codex-native | `thread_start` | Core |
 | `/session resume` | Codex-native | `thread_resume` | Core |
 | `/session fork` | Codex-native | `thread_fork` | Optional |
+| `/btw`、`/side` | Codex-native ephemeral extension | `thread_fork(ephemeral=True)` + side Turn + typed unsubscribe | Optional `thread.side_query` |
 | `/session archive` | Codex-native | `thread_archive` | Optional |
 | `/session rename` | mixed | `Thread.set_name` + Discord title | Optional |
 | `/session compact` | Codex-native | `Thread.compact()` | Optional |

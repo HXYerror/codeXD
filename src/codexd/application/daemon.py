@@ -197,8 +197,10 @@ async def _run_daemon(config: AppConfig, bootstrap_token: str | None) -> int:
         from codexd.application.schedule_coordinator import ScheduleCoordinator
         from codexd.application.session_coordinator import SessionCoordinator
         from codexd.application.session_lifecycle import SessionLifecycleCoordinator
+        from codexd.application.side_queries import SideQueryCoordinator
         from codexd.application.turn_coordinator import TurnCoordinator
         from codexd.storage.retention import RetentionWorker
+        from codexd.storage.side_queries import SideQueryRepository
 
         conversation_locks = ConversationLocks()
         stop = asyncio.Event()
@@ -246,6 +248,12 @@ async def _run_daemon(config: AppConfig, bootstrap_token: str | None) -> int:
             conversation_locks=conversation_locks,
             critical_failure=critical_failure,
         )
+        side_queries = SideQueryCoordinator(
+            repository=repository,
+            side_repository=SideQueryRepository(store),
+            runtimes=runtimes,
+            boot_id=boot_id,
+        )
         renderer = DiscordRenderPlanner(
             media_worker=media,
             table_limits=TableLimits(
@@ -286,6 +294,7 @@ async def _run_daemon(config: AppConfig, bootstrap_token: str | None) -> int:
             signer=ComponentSigner(component_key),
             capability_manifest=manifest,
             boot_id=boot_id,
+            side_queries=side_queries,
             discord_status=health.observe_discord,
             codex_auth_status=health.observe_codex_auth,
         )
@@ -349,6 +358,12 @@ async def _run_daemon(config: AppConfig, bootstrap_token: str | None) -> int:
             await _cleanup_step(
                 "retention",
                 retention.close(),
+                deadline_seconds=10,
+                logger=logger,
+            )
+            await _cleanup_step(
+                "side queries",
+                side_queries.close(),
                 deadline_seconds=10,
                 logger=logger,
             )

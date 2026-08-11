@@ -23,10 +23,35 @@ class _LowLevelClient:
         self.config = config
         self.approval_handler = approval_handler
         self.thread_start_params: dict[str, object] | None = None
+        self.thread_fork_params: dict[str, object] | None = None
+        self.requests: list[tuple[str, dict[str, object] | None]] = []
 
     def thread_start(self, params: dict[str, object]) -> object:
         self.thread_start_params = params
         return SimpleNamespace(thread=SimpleNamespace(id="created-thread"))
+
+    def thread_fork(
+        self,
+        _thread_id: str,
+        params: object,
+    ) -> object:
+        assert hasattr(params, "model_dump")
+        self.thread_fork_params = params.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+        )
+        return SimpleNamespace(thread=SimpleNamespace(id="side-thread"))
+
+    def request(
+        self,
+        method: str,
+        params: dict[str, object] | None,
+        *,
+        response_model: Any,
+    ) -> object:
+        self.requests.append((method, params))
+        return response_model.model_validate({"status": "unsubscribed"})
 
 
 @pytest.mark.asyncio
@@ -73,6 +98,54 @@ async def test_low_level_facade_registers_exact_dynamic_tool_schema(
 
 
 @pytest.mark.asyncio
+async def test_low_level_facade_forks_ephemeral_side_and_typed_unsubscribes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clients: list[_LowLevelClient] = []
+
+    class CaptureClient(_LowLevelClient):
+        def __init__(self, config: CodexConfig, approval_handler: Any) -> None:
+            super().__init__(config, approval_handler)
+            clients.append(self)
+
+    monkeypatch.setattr(app_server, "CodexClient", CaptureClient)
+
+    async def handler(_call: DynamicToolCall) -> dict[str, object]:
+        return {"success": False, "contentItems": []}
+
+    facade = DynamicAsyncCodex(
+        CodexConfig(experimental_api=True),
+        generation=2,
+        dynamic_tools=CODEXD_DYNAMIC_TOOLS,
+        dynamic_tool_handler=handler,
+    )
+    thread = await facade.thread_fork(
+        "parent-thread",
+        approval_mode=ApprovalMode.deny_all,
+        config={"web_search": "cached"},
+        cwd="/project",
+        ephemeral=True,
+        model="gpt-5",
+        sandbox=Sandbox.read_only,
+        service_tier="fast",
+        developer_instructions="read only",
+    )
+    status = await facade.thread_unsubscribe(thread.id)
+
+    assert thread.id == "side-thread"
+    params = clients[0].thread_fork_params
+    assert params is not None
+    assert params["ephemeral"] is True
+    assert params["approvalPolicy"] == "never"
+    assert params["sandbox"] == "read-only"
+    assert params["developerInstructions"] == "read only"
+    assert status == "unsubscribed"
+    assert clients[0].requests == [
+        ("thread/unsubscribe", {"threadId": "side-thread"})
+    ]
+
+
+@pytest.mark.asyncio
 async def test_low_level_facade_routes_tool_request_without_breaking_approvals(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -116,6 +189,11 @@ async def test_low_level_facade_routes_tool_request_without_breaking_approvals(
         "decision": "accept"
     }
     assert approval_handler("unknown/request", {}) == {}
+    facade._turn_routes["side-turn"] = ("side-thread", "side:query")
+    assert approval_handler(
+        "item/commandExecution/requestApproval",
+        {"threadId": "side-thread", "turnId": "side-turn"},
+    ) == {"decision": "decline"}
 
     response = await asyncio.to_thread(
         approval_handler,
@@ -197,6 +275,7 @@ def test_dynamic_tool_capability_is_exact_version_and_product_gated(
     assert supported.optional["dynamic_tool.call"] is True
     assert supported.optional["codexd.schedule_create_tool"] is True
     assert supported.optional["codexd.publish_image_tool"] is False
+    assert supported.optional["thread.side_query"] is True
     publish_supported = codex_sdk.capability_manifest(
         schedule_tool_enabled=True,
         publish_image_enabled=True,
@@ -211,6 +290,7 @@ def test_dynamic_tool_capability_is_exact_version_and_product_gated(
     assert unverified.optional["dynamic_tool.call"] is False
     assert unverified.optional["codexd.schedule_create_tool"] is False
     assert unverified.optional["codexd.publish_image_tool"] is False
+    assert unverified.optional["thread.side_query"] is False
 
 
 def test_missing_low_level_handler_degrades_only_dynamic_tool(
@@ -227,3 +307,4 @@ def test_missing_low_level_handler_degrades_only_dynamic_tool(
     assert manifest.optional["dynamic_tool.call"] is False
     assert manifest.optional["codexd.schedule_create_tool"] is False
     assert manifest.optional["codexd.publish_image_tool"] is False
+    assert manifest.optional["thread.side_query"] is False
