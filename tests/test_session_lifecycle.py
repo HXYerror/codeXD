@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
 from pathlib import Path
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from conftest import StorageContext
@@ -18,12 +20,13 @@ from codexd.domain.conversations import (
     ThreadSnapshot,
 )
 from codexd.domain.models import ModelCatalogSnapshot, ModelDescriptor
-from codexd.domain.turns import InterruptOrigin, TurnInput, TurnSource
+from codexd.domain.turns import InterruptOrigin, TurnInput, TurnSource, TurnState
 from codexd.errors import ConflictError, InvariantError
 from codexd.runtime.errors import AdapterFailure, ProviderOutcomeUnknown
 from codexd.runtime.fake import FakeCodexRuntime
 from codexd.runtime.port import CompactStartResult
 from codexd.runtime.supervisor import RuntimeFactory, RuntimeSupervisor
+from codexd.transport.discord.presentation import session_status_embed
 
 
 def test_revision_listing_does_not_hide_older_sessions(
@@ -52,6 +55,259 @@ def test_revision_listing_does_not_hide_older_sessions(
     )
 
     assert len(revisions) == 105
+
+
+@pytest.mark.asyncio
+async def test_session_status_does_not_cold_start_runtime(
+    storage_context: StorageContext,
+) -> None:
+    factory_calls = 0
+
+    async def factory(_slot: object, _generation: int) -> FakeCodexRuntime:
+        nonlocal factory_calls
+        factory_calls += 1
+        return FakeCodexRuntime()
+
+    supervisor = RuntimeSupervisor(
+        repository=storage_context.repository,
+        factory=factory,
+        topology="project_scoped",
+        environment={},
+        environment_hash="environment",
+        codex_home=None,
+        neutral_cwd=storage_context.root / ".runtime",
+        allowed_roots=(storage_context.root.parent,),
+    )
+    lifecycle = SessionLifecycleCoordinator(
+        repository=storage_context.repository,
+        runtimes=supervisor,
+        locks=ConversationLocks(),
+    )
+    try:
+        view = await lifecycle.status_view(storage_context.conversation.id)
+
+        assert factory_calls == 0
+        assert view.activity.runtime_state == "not_loaded"
+        assert view.activity.runtime_generation == 0
+        assert view.behavior.model.value == "provider default"
+        assert view.behavior.model.source == "provider default"
+        assert view.behavior.resolution == "resolves on next Turn"
+        assert view.degraded_reason is None
+    finally:
+        await lifecycle.close()
+        await supervisor.close()
+
+
+@pytest.mark.asyncio
+async def test_session_status_model_source_precedence(
+    storage_context: StorageContext,
+) -> None:
+    fake = FakeCodexRuntime()
+
+    async def factory(_slot: object, _generation: int) -> FakeCodexRuntime:
+        return fake
+
+    supervisor = RuntimeSupervisor(
+        repository=storage_context.repository,
+        factory=factory,
+        topology="project_scoped",
+        environment={},
+        environment_hash="environment",
+        codex_home=None,
+        neutral_cwd=storage_context.root / ".runtime",
+        allowed_roots=(storage_context.root.parent,),
+    )
+    lifecycle = SessionLifecycleCoordinator(
+        repository=storage_context.repository,
+        runtimes=supervisor,
+        locks=ConversationLocks(),
+    )
+    try:
+        await supervisor.ensure(
+            storage_context.repository.get_project(storage_context.project.id)
+        )
+        provider = await lifecycle.status_view(storage_context.conversation.id)
+        assert provider.behavior.model.value == "fake-model"
+        assert provider.behavior.model.source == "provider default"
+        assert provider.behavior.reasoning_effort.value == "medium"
+        assert provider.behavior.reasoning_effort.source == "model default"
+        assert provider.behavior.service_tier.value == "flex"
+        assert provider.behavior.input_modalities == ("text", "image")
+
+        with storage_context.store.transaction() as connection:
+            connection.execute(
+                "UPDATE projects SET default_model = 'fake-model' WHERE id = ?",
+                (storage_context.project.id,),
+            )
+        project = await lifecycle.status_view(storage_context.conversation.id)
+        assert project.behavior.model.value == "fake-model"
+        assert project.behavior.model.source == "project default"
+
+        storage_context.repository.update_conversation_preferences(
+            storage_context.conversation.id,
+            model_override="fake-model",
+        )
+        conversation = await lifecycle.status_view(
+            storage_context.conversation.id
+        )
+        assert conversation.behavior.model.value == "fake-model"
+        assert conversation.behavior.model.source == "conversation override"
+    finally:
+        await lifecycle.close()
+        await supervisor.close()
+
+
+@pytest.mark.asyncio
+async def test_session_status_resolves_sources_and_active_turn_drift(
+    storage_context: StorageContext,
+) -> None:
+    repository = storage_context.repository
+    with storage_context.store.transaction() as connection:
+        connection.execute(
+            """
+            UPDATE projects
+            SET default_model = 'old-project-model',
+                default_reasoning_effort = 'low',
+                default_reasoning_summary = 'project-summary',
+                default_personality = 'pragmatic',
+                default_service_tier = 'flex'
+            WHERE id = ?
+            """,
+            (storage_context.project.id,),
+        )
+    repository.activate_thread_revision(
+        conversation_id=storage_context.conversation.id,
+        identity=ThreadIdentity(
+            thread_id="status-thread",
+            requested_thread_id=None,
+            provider_session_id="status-session",
+            forked_from_thread_id=None,
+            parent_thread_id=None,
+            provider_version="status-runtime",
+        ),
+        config=ThreadConfig(
+            model="old-project-model",
+            personality="pragmatic",
+            sandbox=SandboxProfile.FULL_ACCESS,
+            service_tier="flex",
+        ),
+    )
+    turn = repository.enqueue_turn(
+        conversation_id=storage_context.conversation.id,
+        source=TurnSource.DISCORD,
+        turn_input=TurnInput(text="status snapshot drift"),
+        input_message_id="status-snapshot-drift",
+    )
+    repository.update_conversation_preferences(
+        storage_context.conversation.id,
+        model_override="fake-model",
+        reasoning_effort_override="high",
+        reasoning_summary_override="concise",
+    )
+
+    fake = FakeCodexRuntime()
+
+    async def factory(_slot: object, _generation: int) -> FakeCodexRuntime:
+        return fake
+
+    supervisor = RuntimeSupervisor(
+        repository=repository,
+        factory=factory,
+        topology="project_scoped",
+        environment={},
+        environment_hash="environment",
+        codex_home=None,
+        neutral_cwd=storage_context.root / ".runtime",
+        allowed_roots=(storage_context.root.parent,),
+    )
+    lifecycle = SessionLifecycleCoordinator(
+        repository=repository,
+        runtimes=supervisor,
+        locks=ConversationLocks(),
+    )
+    try:
+        _runtime, lease = await supervisor.ensure(
+            repository.get_project(storage_context.project.id)
+        )
+        repository.claim_turn(
+            turn.id,
+            runtime_lease_id=lease.id,
+            runtime_generation=lease.generation,
+        )
+        running = repository.mark_turn_running(turn.id, "status-provider-turn")
+
+        view = await lifecycle.status_view(storage_context.conversation.id)
+
+        assert view.behavior.model.value == "fake-model"
+        assert view.behavior.model.source == "conversation override"
+        assert view.behavior.reasoning_effort.value == "high"
+        assert view.behavior.reasoning_effort.source == "conversation override"
+        assert view.behavior.reasoning_summary.value == "concise"
+        assert view.behavior.personality.value == "pragmatic"
+        assert view.behavior.personality.source == "project default"
+        assert view.behavior.service_tier.value == "flex"
+        assert view.behavior.input_modalities == ("text", "image")
+        assert view.behavior.resolution == "resolved"
+        assert view.activity.active_turn == running
+        assert view.activity.active_settings_differ
+        assert view.resume_verification == "verified by active provider Turn"
+
+        embed = session_status_embed(view)
+        payload = embed.to_dict()
+        assert payload["title"] == "🟢 Session active"
+        assert [field["name"] for field in payload["fields"]] == [
+            "Model & behavior · next Turn",
+            "Activity",
+            "Session",
+            "Execution",
+        ]
+        rendered = json.dumps(payload, ensure_ascii=False)
+        assert "fake-model" in rendered
+        assert "old-project-model" in rendered
+        assert "differs from next Turn" in rendered
+        assert "Optional capabilities" not in rendered
+        assert str(storage_context.root) not in rendered
+    finally:
+        repository.terminal_turn(
+            turn.id,
+            target=TurnState.INTERRUPTED,
+            terminal_code="status_test_cleanup",
+        )
+        await lifecycle.close()
+        await supervisor.close()
+
+
+@pytest.mark.asyncio
+async def test_session_status_catalog_failure_degrades_without_failing(
+    storage_context: StorageContext,
+) -> None:
+    runtimes = Mock()
+    runtimes.project_status = AsyncMock(
+        return_value={"state": "ready", "generation": 3, "failures": 0}
+    )
+    runtimes.model_catalog_if_loaded = AsyncMock(
+        side_effect=RuntimeError("private path must not escape")
+    )
+    lifecycle = SessionLifecycleCoordinator(
+        repository=storage_context.repository,
+        runtimes=runtimes,
+        locks=ConversationLocks(),
+    )
+
+    view = await lifecycle.status_view(storage_context.conversation.id)
+
+    assert view.activity.runtime_state == "ready"
+    assert view.degraded_reason == "model catalog unavailable"
+    assert "private path" not in json.dumps(
+        session_status_embed(view).to_dict(), ensure_ascii=False
+    )
+
+    hostile = replace(view, project_name="@everyone " + ("项目😀" * 200))
+    payload = session_status_embed(hostile).to_dict()
+    rendered = json.dumps(payload, ensure_ascii=False)
+    assert "@everyone" not in rendered
+    assert len(str(payload["description"])) <= 4096
+    assert all(len(str(field["value"])) <= 1024 for field in payload["fields"])
 
 
 @pytest.mark.asyncio

@@ -14,6 +14,12 @@ class ProjectRecord:
     name: str
     root_path: Path
     sandbox_profile: SandboxProfile
+    default_model: str | None
+    default_reasoning_effort: str | None
+    default_reasoning_summary: str | None
+    default_personality: str | None
+    default_service_tier: str | None
+    default_web_search_mode: str
 
 
 @dataclass(frozen=True)

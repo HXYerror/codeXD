@@ -66,6 +66,7 @@ from codexd.transport.discord.presentation import (
     TABLE_COPY_CUSTOM_ID,
     format_usage,
     notice_embed,
+    session_status_embed,
 )
 
 logger = logging.getLogger(__name__)
@@ -2733,64 +2734,9 @@ class CodexDBot(discord.Client):
     async def _session_status(self, interaction: discord.Interaction[Any]) -> None:
         await self._defer_authorized(interaction)
         conversation = await self._conversation(interaction)
-        status = await self.session_lifecycle.status(conversation.id)
-        revision = status.active_revision
-        project = await asyncio.to_thread(
-            self.repository.get_project,
-            conversation.project_id,
-        )
-        runtime, turn_summary = await asyncio.gather(
-            self.runtimes.project_status(project.id),
-            asyncio.to_thread(
-                self.repository.conversation_turn_summary,
-                conversation.id,
-            ),
-        )
-        optional = ", ".join(
-            name
-            for name, value in sorted(self.capability_manifest.optional.items())
-            if value is True or (
-                isinstance(value, EventCapability)
-                and value is not EventCapability.UNSUPPORTED
-            )
-        ) or "none"
+        view = await self.session_lifecycle.status_view(conversation.id)
         await interaction.followup.send(
-            "\n".join(
-                (
-                    f"Conversation: **{status.conversation.state.value}**",
-                    (
-                        f"Revision: `{revision.id[:8]}` · provider "
-                        f"hash `{sha256_text(revision.provider_thread_id)[:12]}` · "
-                        f"v{revision.provider_version}"
-                        if revision is not None
-                        else "Revision: none"
-                    ),
-                    f"Runtime: `{runtime['state']}` · generation "
-                    f"`{runtime['generation']}`",
-                    f"Turns: queued {turn_summary['queued']} · active "
-                    f"{turn_summary['active']} · last completed "
-                    f"{_discord_time(turn_summary['last_completed_at'])}",
-                    "Resume verification: "
-                    + (
-                        "`verified by active provider Turn`"
-                        if turn_summary["active"]
-                        else "`enforced on next provider use`"
-                    ),
-                    "Execution: **FULL ACCESS** / auto_review (fixed)",
-                    f"Model: `{status.conversation.model_override or 'default'}`",
-                    "Reasoning: "
-                    f"`{status.conversation.reasoning_effort_override or 'default'}` · "
-                    "summary "
-                    f"`{status.conversation.reasoning_summary_override or 'default'}`",
-                    f"Personality: "
-                    f"`{status.conversation.personality_override or 'default'}` · "
-                    f"tier `{status.conversation.service_tier_override or 'default'}`",
-                    f"Web search: `{status.conversation.web_search_mode}` · "
-                    f"provider barrier: "
-                    f"`{status.conversation.provider_barrier_kind or 'none'}`",
-                    f"Optional capabilities: `{optional}`",
-                )
-            ),
+            embed=session_status_embed(view),
             ephemeral=True,
         )
 

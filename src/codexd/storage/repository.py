@@ -6227,6 +6227,12 @@ def _project(row: sqlite3.Row) -> ProjectRecord:
         name=str(row["name"]),
         root_path=Path(row["root_path"]),
         sandbox_profile=SandboxProfile(row["sandbox_profile"]),
+        default_model=row["default_model"],
+        default_reasoning_effort=row["default_reasoning_effort"],
+        default_reasoning_summary=row["default_reasoning_summary"],
+        default_personality=row["default_personality"],
+        default_service_tier=row["default_service_tier"],
+        default_web_search_mode=str(row["default_web_search_mode"]),
     )
 
 
