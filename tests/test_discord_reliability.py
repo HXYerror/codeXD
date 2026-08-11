@@ -2492,7 +2492,7 @@ async def test_mention_creates_conversation_and_exactly_one_durable_turn(
 
     bot.turns.enqueue = AsyncMock(side_effect=enqueue)
 
-    await bot._handle_message(message)
+    await bot._handle_message(message, backfill=True)
     creation = storage_context.repository.claim_outbox(worker_id="mention-test")
     assert creation is not None
     client = Mock(spec=discord.Client)
@@ -2522,10 +2522,12 @@ async def test_mention_creates_conversation_and_exactly_one_durable_turn(
     )
 
     await bot._process_initial_ingress("903")
-    await bot._handle_message(message)
+    message.content = "<@999> edited after durable acceptance"
+    await bot._handle_message(message, backfill=True)
 
     ingress = storage_context.repository.get_ingress_message("903")
     assert ingress.state == "ready"
+    assert ingress.discovery_kind == "backfill"
     assert ingress.turn_id is not None
     conversation = storage_context.repository.conversation_for_thread(903)
     assert conversation is not None

@@ -2225,7 +2225,21 @@ Turn 存活期间保留只允许 `FILE_SHARE_READ` 的文件 handle，因此其�
 | `progress_outbox_id` | nullable FK |
 | `error_code` | nullable |
 | `accepted_boot_id` | required；接收该 Discord input 的 daemon boot，禁止重启后自动执行旧 prompt |
+| `discovery_kind` | live/backfill；只有 backfill initial snapshot 可在新 boot 重新 REST fetch + hash 复验 |
 | `created_at`, `completed_at` | UTC ms |
+
+#### `discord_ingress_checkpoints`
+
+每个 configured-guild parent channel 或 persisted Conversation Thread 以
+`(discord_guild_id, discord_channel_id)` 唯一保存 immutable scope、完成扫描的
+`last_scanned_message_id`、可恢复的 in-progress barrier/after cursor、
+idle/scanning/retry/blocked、last success/error timestamps。cursor 只在整个远端 barrier
+oldest-first 处理完成后推进；page progress 不是完成 cursor，crash 可从 page cursor继续或
+安全重扫。Checkpoint 不保存 message content、attachment URL 或用户资料。
+
+`discord_ingress_feature_state` 记录 migration activation time。首次 channel seed 使用
+`max(activation snowflake, 同 channel 已知 ingress ID)`，并上限到当前 remote barrier，
+因此升级不会无界执行历史 mention，也不会丢 migration 到首次 ready 之间的新消息。
 
 #### `command_intents`
 
@@ -3017,6 +3031,36 @@ Discord CDN URL 在长队列中失效。
 Discord 重复 delivery 时，unique `ingress_messages.discord_message_id`
 返回已有 creation intent/ingress/Turn，不创建重复 Discord thread、Conversation
 或 Turn。
+
+### 11.2.1 Durable inbound reconciliation
+
+Gateway ready、RESUMED 与 connected-periodic safety scan 都触发 REST history catch-up。
+范围包括 configured guild 所有 cached text channels（只接受 allowed-user bot mention）
+及所有 non-deleted persisted Conversation Threads。每轮先捕获 channel
+`last_message_id` barrier，再从 durable cursor 以 `oldest_first=True`、100 条/page读取；
+每条消息复用同一个 `_handle_message/_ingest_message` ACL、routing、attachment 与 Turn
+入口，不维护第二套解析。
+
+Discovery 建立时先关闭一个短暂 setup gate，并为每个目标 channel 标记 scanning。
+scan 期间 live `MESSAGE_CREATE` 按整数 snowflake 暂存在该 channel 的 barrier state；
+history完成并原子提交 checkpoint 后，再按 ID 升序释放 buffer。锁仅限单 channel，
+其他 Conversation、outbox 与 provider EventPump 不被全局锁阻塞。live event 不直接推进
+cursor；Gateway replay、REST重复页与 crash重扫由 ingress unique key收敛为 exactly-once
+local Turn。每 channel 单轮最多500条、live buffer最多1,000条；未追平时保留 page cursor
+并在短延迟 continuation中 round-robin续扫，避免大 backlog饿死其他 channel。
+
+ready/rejected/pending 的已知 ingress 在 backfill 中按持久 scope跳过，不因后来编辑产生
+hash conflict；scope不一致会 block checkpoint并写 security incident。Backfilled parent
+mention 使用 `discovery_kind=backfill`：若 crash发生在 thread creation 与 initial preflight
+之间，新 boot 会重新 REST fetch原 message并复验 acceptance hash；live initial ingress仍
+维持原有 boot fence，绝不自动 replay。已原子 enqueue、但尚未触及 provider 的 queued
+backfill Turn 可由 mailbox 在新 boot恢复；live queued 及任何 starting/running Turn仍按
+原安全合同 interrupt，不猜测 provider outcome。403/404 block单 channel，transient REST/attachment
+错误保留 in-progress barrier进入 retry，不推进完成 cursor。
+
+Health 与 `/status` 区分 `catching_up`、retry、blocked、last success 与 oldest cursor lag。
+Backfill无法恢复 scan前已删除消息、不可读 history、slash/modal/component interaction或
+reactions；这些输入没有可伪造的 channel-history替代品。
 
 ### 11.3 通用命令响应
 
@@ -4951,6 +4995,7 @@ Discord gateway watchdog 只负责：
 - 请求 Discord library reconnect；
 - 重建 Discord client；
 - 更新 health。
+- 在 ready/RESUMED 后触发 durable inbound reconciliation；
 
 禁止：
 

@@ -65,6 +65,9 @@ class HealthReporter:
     async def write(self) -> None:
         await asyncio.to_thread(self.repository.heartbeat_daemon_lease, self.boot_id)
         counts = await asyncio.to_thread(self.repository.health_counts)
+        inbound = await asyncio.to_thread(
+            self.repository.ingress_reconciliation_counts
+        )
         runtime = await self.runtime_status()
         now = utc_now_ms()
         payload: dict[str, Any] = {
@@ -105,6 +108,7 @@ class HealthReporter:
             },
             "unknown_provider_events": counts["unknown_provider_events"],
             "discord_reconnect_count": self.discord_reconnect_count,
+            "inbound_reconciliation": inbound,
             "database_size_bytes": (
                 self.repository.store.path.stat().st_size
                 if self.repository.store.path.exists()
