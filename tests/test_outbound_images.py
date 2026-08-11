@@ -247,7 +247,7 @@ async def test_publish_image_normalizes_registers_and_replays(
 
     assert first == replay
     assert _result(conflict)["code"] == "call_identity_conflict"
-    assert first["success"] is True
+    assert first["success"] is True, _result(first)
     result = _result(first)
     assert result["status"] == "registered_for_final_delivery"
     assert result["display_name"] == "host-start-flow.png"
@@ -349,7 +349,7 @@ async def test_final_delivery_merges_images_and_suppresses_visualize_marker(
     response = await _broker(storage_context).handle(
         _call(turn, generation, source)
     )
-    assert response["success"] is True
+    assert response["success"] is True, _result(response)
     second_source = storage_context.root / "delivery-second.png"
     _image(second_source, color="maroon", metadata=False)
     second = await _broker(storage_context).handle(
@@ -492,9 +492,10 @@ async def test_image_upload_rejection_produces_visible_fallback_and_incident(
     turn, generation = _active_turn(storage_context)
     source = storage_context.root / "rejected-upload.png"
     _image(source, metadata=False)
-    assert (
-        await _broker(storage_context).handle(_call(turn, generation, source))
-    )["success"] is True
+    publish_result = await _broker(storage_context).handle(
+        _call(turn, generation, source)
+    )
+    assert publish_result["success"] is True, _result(publish_result)
     renderer = DiscordRenderPlanner(
         media_worker=MediaWorker(),
         table_limits=TableLimits(),
@@ -561,9 +562,10 @@ async def test_outbound_image_retention_removes_registered_file_with_render_plan
     turn, generation = _active_turn(storage_context)
     source = storage_context.root / "retained-image.png"
     _image(source, metadata=False)
-    assert (
-        await _broker(storage_context).handle(_call(turn, generation, source))
-    )["success"] is True
+    publish_result = await _broker(storage_context).handle(
+        _call(turn, generation, source)
+    )
+    assert publish_result["success"] is True, _result(publish_result)
     record = OutboundImageRepository(storage_context.store).registered_for_turn(
         turn.id
     )[0]
