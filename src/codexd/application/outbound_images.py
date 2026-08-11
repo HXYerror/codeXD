@@ -422,7 +422,7 @@ def _validate_source(
             "image_size_limit",
             "The image exceeds the publication byte limit.",
         )
-    if os.name != "nt" and metadata.st_uid != os.getuid():
+    if os.name != "nt" and metadata.st_uid != int(cast(Any, os).getuid()):
         raise _PublishValidationError(
             "source_owner_mismatch",
             "The image is owned by another local user.",
