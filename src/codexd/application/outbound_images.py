@@ -455,7 +455,11 @@ def _snapshot_source(source: Path, target: Path, *, max_bytes: int) -> None:
         before = os.fstat(descriptor)
         target_descriptor = os.open(
             target,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_BINARY", 0),
             0o600,
         )
         copied = 0
