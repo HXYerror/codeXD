@@ -120,7 +120,7 @@ flowchart LR
 | 最低 Python | 官方包要求 Python 3.10+；codexD 设计基线为 Python 3.12+ |
 | 执行模型 | SDK 启动并控制匹配版本的本地 Codex CLI/app-server runtime |
 | 会话模型 | `thread / turn / item` |
-| 主要接口 | thread start/list/read/resume/fork/archive/unarchive/name/compact，Turn stream/steer/interrupt，text/image/skill/mention input，model/reasoning/personality/service tier、output schema、Sandbox/ApprovalMode、account/login |
+| 主要接口 | thread start/list/read/resume/fork/archive/unarchive/name/compact，Turn stream/steer/interrupt，text/image/skill/mention input，model/reasoning/personality/service tier、output schema、Sandbox/ApprovalMode、account/login；0.144.4 的 public low-level `CodexClient` 还提供 server-request handler，配套 experimental schema 支持 `thread/start.dynamicTools` 与 `item/tool/call` |
 | 持久化 | Codex 本地 rollout JSONL 与 SQLite metadata，通常位于 `$CODEX_HOME` |
 | 版本关系 | SDK 与配套 CLI binary 强绑定，不能假设任意系统 Codex CLI 都兼容 |
 | 成熟度 | 官方 Learn 页面与仓库对 beta/stable 的表述不完全一致，必须维护兼容范围、测试矩阵和契约测试 |
@@ -553,6 +553,8 @@ codexD 是单用户本机服务，但不能把“单用户”理解为“无边�
 | `mention.input` | 受控 ordinary file 的 `MentionInput` | 文件 Turn 在 provider start 前以 `file_input_unsupported` 失败；文字/图片 Turn 不受影响 |
 | `mcp.item` | 已配置 MCP 的自动工具卡 | 不影响无 MCP 的 Turn |
 | `dynamic_tool.item` | dynamic tool card | safe generic metadata |
+| `dynamic_tool.call` | 注册并响应 client-executed dynamic tool | 仅保留 `/schedule`；不向 Agent 描述不可调用工具 |
+| `codexd.schedule_create_tool` | 自然语言请求生成 Schedule 草稿与 Discord 确认卡 | 提示 owner 使用 `/schedule create` |
 | `collab.item` | `collabAgentToolCall` / `subAgentActivity` TaskCardBlock | 不展示 agent card，不猜测 |
 | `image_generation.item` | 生成图片附件 | safe metadata fallback |
 | `account.read` | `/status` auth 摘要 | 显示 unknown，要求本机 doctor |
@@ -853,8 +855,10 @@ mailbox 把 queued Turn 转为 `starting` 前，还要用幂等
 
 `CodexRuntimeAdapter` 是 codexD 唯一接触 `openai_codex` 的模块。它负责：
 
-- 以 `AsyncCodex(CodexConfig(experimental_api=False, ...))` 创建和关闭 SDK
-  client；
+- 普通能力以 `AsyncCodex(CodexConfig(experimental_api=False, ...))` 创建和关闭
+  SDK client；只有版本矩阵验证通过并启用 `codexd.schedule_create_tool` 时，改用围绕
+  public low-level `CodexClient(config, approval_handler=...)` 的 async compatibility
+  facade，并显式设置 `experimental_api=True`；
 - 将 domain request 转换为 SDK 参数；
 - 将 SDK thread/turn/item 转换为 normalized event；
 - 将受信任的 `TurnFile` 映射为 public `MentionInput`，不读取文件内容或生成替代 prompt；
@@ -886,7 +890,7 @@ codexD 不下沉到私有 router 修补。
 - Turn 状态投影；
 - 自动重试用户 turn；
 - CLI fallback；
-- app-server 私有 JSON-RPC；
+- 任意或未经过 schema/version gate 的 app-server JSON-RPC；
 - 解释 TUI slash command。
 
 ### 7.2 Domain Port
@@ -1224,6 +1228,8 @@ Manifest 是 adapter 的显式输出，不通过 `hasattr` 散落判断：
     "mention.input": true,
     "mcp.item": "supported_not_observed",
     "dynamic_tool.item": "supported_not_observed",
+    "dynamic_tool.call": true,
+    "codexd.schedule_create_tool": true,
     "collab.item": "supported_not_observed",
     "image_generation.item": "supported_not_observed",
     "account.read": true,
@@ -1236,6 +1242,14 @@ Manifest 由 adapter、受支持版本矩阵和 contract tests 共同定义。�
 真实、计费的 Agent turn 作为 daemon 每次启动的 capability probe。布尔型
 callable capability 与 `supported|unsupported|supported_not_observed` 事件
 capability 分开表示。
+
+`dynamic_tool.call` 与 `codexd.schedule_create_tool` 是不同门禁：前者只证明当前
+SDK/runtime pair 的 public `CodexClient` handler、experimental opt-in、request
+routing 和 response schema 通过 contract；后者还要求 actor persistence、owner
+gate、Schedule draft/outbox transaction 与 Discord card contract 全部接线完成。
+当前只对 SDK/runtime `0.144.4/0.144.4` 报告为 true，范围内未验证 patch 保持
+false。自定义 handler 对 command/file approval 继续返回既有 `auto_review`
+decision；未知 server request 返回空结果，绝不按 Schedule 调用处理。
 
 `thread.compact=true` 不是单纯 `hasattr(Thread, "compact")`：它还要求 §12.4
 定义的 provider busy/idle serialization contract 通过。只确认 start callable
@@ -1650,6 +1664,28 @@ due -> blocked
 
 `materialized` 表示已原子创建关联 queued Turn，不代表 Codex 执行成功。Turn 的
 terminal state 不反写成另一套 Schedule execution state。
+
+### 8.9.1 `codexd.schedule_create` dynamic tool
+
+新建 provider Thread 时注册 namespace tool `codexd.schedule_create`。参数只包含
+`name/kind/expression/timezone/misfire_policy/prompt`；Conversation、Discord identity、
+project path、sandbox 与 approval 全部从可信 host context 推导，schema 拒绝额外字段。
+升级前已存在的 rollout 不会被重建或静默丢弃上下文；该 Thread 没有工具时，用户需
+执行 `/session new` 才获得能力。
+
+每次 `item/tool/call` 重新核对 runtime generation、provider thread/turn/call、active
+Revision、Discord Turn source 与该消息的 `requested_by_user_id`。只有配置的 Discord
+owner 可以生成草稿；Schedule/background Turn 与 allowed non-owner 均返回安全错误且
+没有 draft/outbox side effect。同一 call identity + argument hash 重放返回原结果；
+同 identity 不同参数 fail closed。
+
+合法调用在同一 SQLite transaction 中提交 invocation、pending draft 与普通 Thread
+message outbox，立即向 Agent 返回 `confirmation_required`，绝不在 app-server reader
+路径等待用户或调用 Discord REST。确认卡是 Conversation 中所有参与者可见的普通消息
+（不同于 `/schedule create` 的 ephemeral preview），包含醒目的 `FULL ACCESS /
+unattended` 提示和 10 分钟有效的 signed Confirm/Cancel。只有 owner 点击原始、已绑定
+message 才能激活；Confirm/Cancel 再投递 durable terminal edit 并移除按钮。初始卡永久
+投递失败会使草稿 expired 并生成 incident，不会激活 Schedule 或阻塞整个 Conversation。
 
 ### 8.10 Outbox 状态机
 
@@ -2252,6 +2288,7 @@ ChannelBinding 只是未来 Conversation 的可选路由 override。删除 bindi
 | `thread_config_json` | validated non-secret ThreadConfig snapshot；切回 revision 时恢复为 Conversation active config |
 | `requested_resume_id` | mismatch diagnostics |
 | `provider_version` | 创建时版本 |
+| `dynamic_tools_enabled` | 该 rollout 是否从新建时注册了 codexD dynamic tools；旧 Revision 默认 false，首次继续使用时只提示一次 `/session new` |
 | `created_at`, `activated_at`, `archived_at` | UTC ms |
 
 #### `runtime_leases`
@@ -2285,6 +2322,7 @@ ChannelBinding 只是未来 Conversation 的可选路由 override。删除 bindi
 | `provider_turn_id` | nullable, unique where present |
 | `source_kind` | discord/schedule |
 | `input_message_id` | Discord source ID；仅 discord Turn 非空且 unique |
+| `requested_by_user_id` | nullable actor；普通 Discord ingress/Turn 保存真实 message author，Schedule/system Turn 为 null |
 | `schedule_fire_id` | 仅 schedule Turn 非空且 unique |
 | `state` | queued/starting/running/cancelling/completed/failed/cancelled/interrupted |
 | `interrupt_origin` | nullable user/shutdown/runtime |
@@ -2358,11 +2396,21 @@ Schedule modal submit 只创建 durable preview draft，不直接 mutation：
 | `payload_json`, `occurrences_json` | validated preview snapshot |
 | `state` | pending/confirmed/cancelled/expired |
 | `component_nonce_hash` | signed component nonce hash |
+| `confirmation_message_id` | nullable；durable card ack 后绑定，防止复制 component 到其他 message |
+| `confirmation_outbox_id` | nullable immutable FK；dynamic-tool draft 的初始 card outbox |
 | `expires_at`, `created_at`, `updated_at` | UTC ms |
 
 Confirm/Cancel 必须重新验证 signature、owner、guild、thread channel、nonce、expiry
 和 update version；daemon restart 后从该记录恢复，重复同一 interaction 返回已持久化
 结果，不重复 mutation。
+
+#### `dynamic_tool_invocations`
+
+记录 local Turn、runtime generation、provider thread/turn/call、namespace/tool、canonical
+argument hash、安全 result JSON，以及可选 draft/outbox correlation。四元 provider
+identity 唯一；成功记录必须同时关联 draft 与 outbox，失败记录两者都为空。该记录、
+草稿和确认卡 outbox 使用同一 transaction，因此 response 前崩溃与 request replay 都不
+会产生重复卡片或 Schedule。
 
 #### `schedule_fires`
 

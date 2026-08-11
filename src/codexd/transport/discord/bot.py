@@ -66,6 +66,7 @@ from codexd.transport.discord.presentation import (
     TABLE_COPY_CUSTOM_ID,
     format_usage,
     notice_embed,
+    schedule_draft_embed,
     session_status_embed,
 )
 
@@ -539,6 +540,11 @@ class CodexDBot(discord.Client):
                     "draft_id": action.draft_id,
                     "action": action.action,
                     "component_hash": sha256_text(custom_id),
+                    "message_id": (
+                        str(interaction.message.id)
+                        if interaction.message is not None
+                        else None
+                    ),
                 },
                 action=lambda staged: self._apply_schedule_draft_action(
                     staged,
@@ -640,6 +646,32 @@ class CodexDBot(discord.Client):
         await self._defer_owner(interaction)
         if interaction.guild_id is None or interaction.channel_id is None:
             raise SecurityError("Schedule draft interaction has no Discord scope")
+        if interaction.message is None:
+            raise SecurityError("Schedule draft interaction has no source message")
+        message_id = str(interaction.message.id)
+        draft = await asyncio.to_thread(
+            self.schedule_repository.get_draft,
+            draft_id,
+        )
+        was_pending = draft.state == "pending"
+        draft_payload = json.loads(draft.payload_json)
+        draft_occurrences = json.loads(draft.occurrences_json)
+        if not isinstance(draft_payload, dict) or not isinstance(
+            draft_occurrences, list
+        ):
+            raise InvariantError("Schedule draft card payload is invalid")
+        card_payload: dict[str, object] = {
+            "kind": "schedule_draft_card",
+            "draft_id": draft.id,
+            "action": draft.action,
+            "name": draft_payload.get("name"),
+            "schedule_kind": draft_payload.get("kind"),
+            "expression": draft_payload.get("expression"),
+            "timezone": draft_payload.get("timezone"),
+            "misfire_policy": draft_payload.get("misfire_policy"),
+            "prompt_text": draft_payload.get("prompt_text"),
+            "occurrences": draft_occurrences,
+        }
         if action == "confirm":
             schedule = await self.schedules.confirm_draft(
                 draft_id=draft_id,
@@ -647,8 +679,20 @@ class CodexDBot(discord.Client):
                 owner_user_id=interaction.user.id,
                 guild_id=interaction.guild_id,
                 channel_id=interaction.channel_id,
+                message_id=message_id,
                 audit=_schedule_audit_context(interaction),
             )
+            card_payload.update(
+                state="confirmed",
+                schedule_ref=schedule.id[:8],
+                next_due_at=schedule.next_due_at,
+            )
+            if was_pending:
+                with suppress(discord.HTTPException):
+                    await interaction.message.edit(
+                        embed=schedule_draft_embed(card_payload),
+                        view=None,
+                    )
             await interaction.followup.send(
                 f"Schedule `{schedule.id[:8]}` confirmed; next "
                 f"<t:{(schedule.next_due_at or 0) // 1000}:F>.",
@@ -661,8 +705,16 @@ class CodexDBot(discord.Client):
             owner_user_id=interaction.user.id,
             guild_id=interaction.guild_id,
             channel_id=interaction.channel_id,
+            message_id=message_id,
             audit=_schedule_audit_context(interaction),
         )
+        card_payload["state"] = "cancelled"
+        if was_pending:
+            with suppress(discord.HTTPException):
+                await interaction.message.edit(
+                    embed=schedule_draft_embed(card_payload),
+                    view=None,
+                )
         await interaction.followup.send("Schedule draft cancelled.", ephemeral=True)
 
     async def _on_command_error(
@@ -1278,6 +1330,7 @@ class CodexDBot(discord.Client):
                 conversation_id=conversation.id,
                 discord_guild_id=conversation.discord_guild_id,
                 discord_channel_id=message.channel.id,
+                requested_by_user_id=message.author.id,
                 boot_id=self.boot_id,
             )
             if not claimed:
@@ -1296,6 +1349,7 @@ class CodexDBot(discord.Client):
                 ),
                 input_message_id=str(message.id),
                 ingress_message_id=str(message.id),
+                requested_by_user_id=message.author.id,
             )
         except BaseException as exc:
             ingress = await asyncio.to_thread(

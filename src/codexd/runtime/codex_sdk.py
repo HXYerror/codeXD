@@ -40,7 +40,9 @@ from openai_codex import (
     is_retryable_error,
 )
 from openai_codex.api import AsyncThread, AsyncTurnHandle
+from openai_codex.client import CodexClient
 from openai_codex.generated.v2_all import (
+    DynamicToolSpec,
     ReasoningSummaryPartAddedNotification,
     TurnCompletedNotification,
     TurnStartedNotification,
@@ -77,6 +79,11 @@ from codexd.domain.models import (
 )
 from codexd.domain.turns import TurnFile, TurnIdentity, TurnInput
 from codexd.errors import AttachmentIntegrityError, InvariantError, NotFoundError
+from codexd.runtime.app_server import (
+    DynamicAsyncCodex,
+    DynamicAsyncThread,
+    DynamicAsyncTurnHandle,
+)
 from codexd.runtime.errors import (
     AdapterError,
     AdapterFailure,
@@ -91,6 +98,7 @@ from codexd.runtime.errors import (
 )
 from codexd.runtime.port import (
     CompactStartResult,
+    DynamicToolHandler,
     RuntimeSlotConfig,
     StartedTurn,
     TurnStream,
@@ -110,6 +118,7 @@ _ARCHIVE_DIRECT_HANDLE_CONTRACT_VERIFIED = False
 _MIN_SDK_VERSION = (0, 144, 4)
 _MAX_SDK_VERSION = (0, 145, 0)
 _MENTION_INPUT_VERIFIED_SDK_VERSIONS = frozenset({"0.144.4"})
+_DYNAMIC_TOOL_VERIFIED_VERSION_PAIRS = frozenset({("0.144.4", "0.144.4")})
 try:
     _FCNTL: Any | None = importlib.import_module("fcntl")
 except ImportError:
@@ -160,7 +169,7 @@ class _FileInputLeases:
 
 
 def _schedule_cancelled_startup_cleanup(
-    client: AsyncCodex,
+    client: AsyncCodex | DynamicAsyncCodex,
     enter_task: asyncio.Task[Any],
 ) -> None:
     cleanup = asyncio.create_task(
@@ -177,7 +186,7 @@ async def _wait_for_cancelled_startup_cleanups() -> None:
 
 
 async def _finish_cancelled_startup(
-    client: AsyncCodex,
+    client: AsyncCodex | DynamicAsyncCodex,
     enter_task: asyncio.Task[Any],
 ) -> None:
     process = _app_server_process(client)
@@ -210,14 +219,17 @@ async def _cancel_startup_entry(enter_task: asyncio.Task[Any]) -> None:
         logger.exception("Cancelled Codex runtime startup task failed during cleanup")
 
 
-def _app_server_process(client: AsyncCodex) -> Any | None:
+def _app_server_process(client: AsyncCodex | DynamicAsyncCodex) -> Any | None:
+    process = getattr(client, "process", None)
+    if process is not None:
+        return process
     async_client = getattr(client, "_client", None)
     sync_client = getattr(async_client, "_sync", None)
     return getattr(sync_client, "_proc", None)
 
 
 def _force_terminate_app_server(
-    client: AsyncCodex,
+    client: AsyncCodex | DynamicAsyncCodex,
     *,
     process: Any | None = None,
 ) -> bool:
@@ -268,7 +280,7 @@ def _confirm_app_server_exit(process: Any | None) -> bool:
 
 
 def _force_terminate_cancelled_startup_process(
-    client: AsyncCodex,
+    client: AsyncCodex | DynamicAsyncCodex,
     *,
     process: Any | None = None,
 ) -> None:
@@ -294,7 +306,7 @@ class CodexSDKRuntime:
     def __init__(
         self,
         *,
-        client: AsyncCodex,
+        client: AsyncCodex | DynamicAsyncCodex,
         slot: RuntimeSlotConfig,
         generation: int,
         manifest: CapabilityManifest,
@@ -303,8 +315,10 @@ class CodexSDKRuntime:
         self._client = client
         self._slot = slot
         self._manifest = manifest
-        self._threads: dict[str, AsyncThread] = {}
-        self._turn_handles: dict[str, AsyncTurnHandle] = {}
+        self._threads: dict[str, AsyncThread | DynamicAsyncThread] = {}
+        self._turn_handles: dict[
+            str, AsyncTurnHandle | DynamicAsyncTurnHandle
+        ] = {}
         self._file_input_leases: dict[str, _FileInputLeases] = {}
         self._pending_file_input_leases: set[_FileInputLeases] = set()
         self._file_lease_release_blocked = False
@@ -319,11 +333,29 @@ class CodexSDKRuntime:
         *,
         slot: RuntimeSlotConfig,
         generation: int,
+        dynamic_tools: tuple[JsonObject, ...] = (),
+        dynamic_tool_handler: DynamicToolHandler | None = None,
     ) -> CodexSDKRuntime:
         await _wait_for_cancelled_startup_cleanups()
         _verify_public_contract()
-        config = _sdk_config(slot, generation=generation)
-        client = AsyncCodex(config)
+        dynamic_enabled = dynamic_tool_handler is not None
+        if dynamic_enabled and not dynamic_tools:
+            raise InvariantError("dynamic tool handler requires one or more tool specs")
+        config = _sdk_config(
+            slot,
+            generation=generation,
+            experimental_api=dynamic_enabled,
+        )
+        client: AsyncCodex | DynamicAsyncCodex
+        if dynamic_tool_handler is None:
+            client = AsyncCodex(config)
+        else:
+            client = DynamicAsyncCodex(
+                config,
+                generation=generation,
+                dynamic_tools=dynamic_tools,
+                dynamic_tool_handler=dynamic_tool_handler,
+            )
         enter_task = asyncio.create_task(
             client.__aenter__(),
             name=f"codexd-sdk-enter-{generation}",
@@ -332,9 +364,31 @@ class CodexSDKRuntime:
         try:
             await asyncio.shield(enter_task)
             entered = True
-            manifest = capability_manifest(
-                runtime_version=_initialized_runtime_version(client)
+            runtime_version = _initialized_runtime_version(client)
+            manifest = (
+                capability_manifest(
+                    runtime_version=runtime_version,
+                    schedule_tool_enabled=True,
+                )
+                if dynamic_enabled
+                else capability_manifest(runtime_version=runtime_version)
             )
+            if (
+                dynamic_enabled
+                and manifest.optional.get("codexd.schedule_create_tool") is not True
+            ):
+                raise AdapterInvariantError(
+                    AdapterFailure(
+                        code="dynamic_tool_contract_unavailable",
+                        provider_exception="VersionMismatch",
+                        message=(
+                            "The installed SDK/runtime pair has no verified dynamic "
+                            "tool call contract"
+                        ),
+                        retryable=False,
+                        runtime_generation=generation,
+                    )
+                )
             manifest.assert_required()
         except asyncio.CancelledError:
             _schedule_cancelled_startup_cleanup(client, enter_task)
@@ -469,10 +523,14 @@ class CodexSDKRuntime:
                 ),
             ) from exc
         self._threads[thread.id] = thread
-        return await self._identity_after_mutation(
+        identity = await self._identity_after_mutation(
             thread,
             requested_thread_id=None,
             operation="thread.start",
+        )
+        return replace(
+            identity,
+            dynamic_tools_enabled=isinstance(self._client, DynamicAsyncCodex),
         )
 
     async def resume_thread(
@@ -662,18 +720,42 @@ class CodexSDKRuntime:
                 self._pending_file_input_leases.add(leases)
                 self._remember_app_server_process()
             provider_start_attempted = True
-            handle = await handle_thread.turn(
-                wire_input,
-                approval_mode=_approval(config.approval_mode),
-                cwd=str(config.cwd),
-                effort=_effort(config.reasoning_effort),
-                model=config.model,
-                output_schema=dict(config.output_schema) if config.output_schema else None,
-                personality=_personality(config.personality),
-                sandbox=_sandbox(config.sandbox),
-                service_tier=config.service_tier,
-                summary=_summary(config.reasoning_summary),
-            )
+            handle: AsyncTurnHandle | DynamicAsyncTurnHandle
+            if isinstance(handle_thread, DynamicAsyncThread):
+                handle = await handle_thread.turn(
+                    wire_input,
+                    local_turn_id=local_turn_id,
+                    approval_mode=_approval(config.approval_mode),
+                    cwd=str(config.cwd),
+                    effort=_effort(config.reasoning_effort),
+                    model=config.model,
+                    output_schema=(
+                        dict(config.output_schema)
+                        if config.output_schema
+                        else None
+                    ),
+                    personality=_personality(config.personality),
+                    sandbox=_sandbox(config.sandbox),
+                    service_tier=config.service_tier,
+                    summary=_summary(config.reasoning_summary),
+                )
+            else:
+                handle = await handle_thread.turn(
+                    wire_input,
+                    approval_mode=_approval(config.approval_mode),
+                    cwd=str(config.cwd),
+                    effort=_effort(config.reasoning_effort),
+                    model=config.model,
+                    output_schema=(
+                        dict(config.output_schema)
+                        if config.output_schema
+                        else None
+                    ),
+                    personality=_personality(config.personality),
+                    sandbox=_sandbox(config.sandbox),
+                    service_tier=config.service_tier,
+                    summary=_summary(config.reasoning_summary),
+                )
         except BaseException as exc:
             if input.files and provider_start_attempted:
                 close_error = await self._retire_after_uncertain_file_start()
@@ -812,8 +894,14 @@ class CodexSDKRuntime:
         if cached is not None:
             return cached
         try:
+            child_thread: AsyncThread | DynamicAsyncThread
+            child_thread = (
+                DynamicAsyncThread(self._client, agent_thread_id)
+                if isinstance(self._client, DynamicAsyncCodex)
+                else AsyncThread(self._client, agent_thread_id)
+            )
             response = await asyncio.wait_for(
-                AsyncThread(self._client, agent_thread_id).read(include_turns=False),
+                child_thread.read(include_turns=False),
                 timeout=_SUBAGENT_DETAIL_TIMEOUT_SECONDS,
             )
         except (CodexError, TimeoutError) as exc:
@@ -982,7 +1070,7 @@ class CodexSDKRuntime:
 
     async def _identity(
         self,
-        thread: AsyncThread,
+        thread: AsyncThread | DynamicAsyncThread,
         *,
         requested_thread_id: str | None,
     ) -> ThreadIdentity:
@@ -995,7 +1083,7 @@ class CodexSDKRuntime:
 
     async def _identity_after_mutation(
         self,
-        thread: AsyncThread,
+        thread: AsyncThread | DynamicAsyncThread,
         *,
         requested_thread_id: str | None,
         operation: str,
@@ -1022,7 +1110,7 @@ class CodexSDKRuntime:
                 ) from exc
         raise AssertionError("identity reconciliation loop did not return")
 
-    def _thread(self, thread_id: str) -> AsyncThread:
+    def _thread(self, thread_id: str) -> AsyncThread | DynamicAsyncThread:
         self._ensure_open()
         try:
             return self._threads[thread_id]
@@ -1031,7 +1119,9 @@ class CodexSDKRuntime:
                 f"thread {thread_id} is not loaded in runtime generation {self.generation}"
             ) from exc
 
-    def _turn_handle(self, turn: TurnIdentity) -> AsyncTurnHandle:
+    def _turn_handle(
+        self, turn: TurnIdentity
+    ) -> AsyncTurnHandle | DynamicAsyncTurnHandle:
         self._ensure_open()
         if turn.runtime_generation != self.generation or not turn.provider_turn_id:
             raise InvariantError("Turn handle belongs to another runtime generation")
@@ -1067,14 +1157,19 @@ class CodexSDKRuntime:
             raise InvariantError("Codex runtime termination is unconfirmed")
 
 
-def _sdk_config(slot: RuntimeSlotConfig, *, generation: int) -> CodexConfig:
+def _sdk_config(
+    slot: RuntimeSlotConfig,
+    *,
+    generation: int,
+    experimental_api: bool = False,
+) -> CodexConfig:
     return CodexConfig(
         codex_bin=str(slot.codex_bin) if slot.codex_bin is not None else None,
         launch_args_override=None,
         config_overrides=(),
         cwd=str(slot.cwd),
         env=_sdk_environment(slot, generation=generation),
-        experimental_api=False,
+        experimental_api=experimental_api,
     )
 
 
@@ -1131,7 +1226,10 @@ def _configured_provider_requires_openai_auth(
     return requires_auth if isinstance(requires_auth, bool) else None
 
 
-async def _close_after_failed_create(client: AsyncCodex, original: BaseException) -> None:
+async def _close_after_failed_create(
+    client: AsyncCodex | DynamicAsyncCodex,
+    original: BaseException,
+) -> None:
     try:
         await client.close()
     except Exception as close_error:
@@ -1528,7 +1626,54 @@ def _verify_public_contract() -> None:
         raise AdapterInvariantError(failure)
 
 
-def capability_manifest(*, runtime_version: str | None = None) -> CapabilityManifest:
+def _dynamic_tool_contract_supported(
+    sdk_version: str,
+    runtime_version: str,
+) -> bool:
+    if (sdk_version, runtime_version) not in _DYNAMIC_TOOL_VERIFIED_VERSION_PAIRS:
+        return False
+    try:
+        constructor_parameters = set(inspect.signature(CodexClient).parameters)
+        thread_start_parameters = set(
+            inspect.signature(CodexClient.thread_start).parameters
+        )
+        contract_spec: JsonObject = {
+            "type": "namespace",
+            "name": "codexd",
+            "description": "codexD contract probe",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "probe",
+                    "description": "codexD contract probe",
+                    "inputSchema": {
+                        "type": "object",
+                        "additionalProperties": False,
+                    },
+                }
+            ],
+        }
+        validated_spec = DynamicToolSpec.model_validate(contract_spec).model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+        )
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return (
+        {"config", "approval_handler"} <= constructor_parameters
+        and "params" in thread_start_parameters
+        and callable(getattr(CodexClient, "next_turn_notification", None))
+        and callable(getattr(CodexClient, "register_turn_notifications", None))
+        and validated_spec == contract_spec
+    )
+
+
+def capability_manifest(
+    *,
+    runtime_version: str | None = None,
+    schedule_tool_enabled: bool = False,
+) -> CapabilityManifest:
     _verify_public_contract()
     sdk_version = importlib.metadata.version("openai-codex")
     effective_runtime_version = runtime_version or importlib.metadata.version(
@@ -1551,6 +1696,10 @@ def capability_manifest(*, runtime_version: str | None = None) -> CapabilityMani
         matrix_tier = "compatible_patch"
     else:
         matrix_tier = "runtime_override"
+    dynamic_tool_call = _dynamic_tool_contract_supported(
+        sdk_version,
+        effective_runtime_version,
+    )
     return CapabilityManifest(
         adapter="openai_codex",
         sdk_version=sdk_version,
@@ -1616,6 +1765,10 @@ def capability_manifest(*, runtime_version: str | None = None) -> CapabilityMani
             "mention.input": _file_input_supported(sdk_version),
             "mcp.item": EventCapability.SUPPORTED_NOT_OBSERVED,
             "dynamic_tool.item": EventCapability.SUPPORTED_NOT_OBSERVED,
+            "dynamic_tool.call": dynamic_tool_call,
+            "codexd.schedule_create_tool": (
+                dynamic_tool_call and schedule_tool_enabled
+            ),
             "collab.item": EventCapability.SUPPORTED_NOT_OBSERVED,
             "image_generation.item": EventCapability.SUPPORTED_NOT_OBSERVED,
             "account.read": True,
@@ -1625,10 +1778,12 @@ def capability_manifest(*, runtime_version: str | None = None) -> CapabilityMani
 
 
 def _capability_manifest() -> CapabilityManifest:
-    return capability_manifest()
+    return capability_manifest(schedule_tool_enabled=True)
 
 
-def _initialized_runtime_version(client: AsyncCodex) -> str:
+def _initialized_runtime_version(
+    client: AsyncCodex | DynamicAsyncCodex,
+) -> str:
     server_info = client.metadata.serverInfo
     if server_info is None or server_info.version is None or not server_info.version.strip():
         return importlib.metadata.version("openai-codex-cli-bin")

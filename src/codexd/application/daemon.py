@@ -94,7 +94,13 @@ async def _run_daemon(config: AppConfig, bootstrap_token: str | None) -> int:
                 f"integrity={integrity}, foreign_keys={len(foreign_keys)}"
             )
         repository = Repository(store)
-        manifest = capability_manifest()
+        base_manifest = capability_manifest()
+        dynamic_tools_available = (
+            base_manifest.optional.get("dynamic_tool.call") is True
+        )
+        manifest = capability_manifest(
+            schedule_tool_enabled=dynamic_tools_available
+        )
         await asyncio.to_thread(
             repository.acquire_daemon_lease,
             boot_id=boot_id,
@@ -104,16 +110,43 @@ async def _run_daemon(config: AppConfig, bootstrap_token: str | None) -> int:
         )
         await asyncio.to_thread(repository.recover_startup, current_boot_id=boot_id)
         neutral_cwd = config.paths.data_dir / "runtime" / "shared"
-
-        async def runtime_factory(
-            slot: RuntimeSlotConfig, generation: int
-        ) -> CodexRuntime:
-            return await CodexSDKRuntime.create(slot=slot, generation=generation)
-
         home_root = Path.home().resolve(strict=True)
         runtime_allowed_roots = tuple(
             dict.fromkeys((*config.security.allowed_roots, home_root))
         )
+        schedule_repository = ScheduleRepository(
+            store,
+            allowed_roots=runtime_allowed_roots,
+        )
+        from codexd.application.dynamic_tools import (
+            CODEXD_DYNAMIC_TOOLS,
+            DynamicToolDispatcher,
+        )
+
+        assert config.discord.owner_user_id is not None
+        assert config.discord.guild_id is not None
+        dynamic_tool_dispatcher = DynamicToolDispatcher(
+            schedules=schedule_repository,
+            owner_user_id=config.discord.owner_user_id,
+            guild_id=config.discord.guild_id,
+        )
+
+        async def runtime_factory(
+            slot: RuntimeSlotConfig, generation: int
+        ) -> CodexRuntime:
+            return await CodexSDKRuntime.create(
+                slot=slot,
+                generation=generation,
+                dynamic_tools=(
+                    CODEXD_DYNAMIC_TOOLS if dynamic_tools_available else ()
+                ),
+                dynamic_tool_handler=(
+                    dynamic_tool_dispatcher.handle
+                    if dynamic_tools_available
+                    else None
+                ),
+            )
+
         runtimes = RuntimeSupervisor(
             repository=repository,
             factory=runtime_factory,
@@ -174,10 +207,9 @@ async def _run_daemon(config: AppConfig, bootstrap_token: str | None) -> int:
                 session_lifecycle.monitor_provider_barrier
             ),
             skill_input_supported=manifest.optional.get("skill.input") is True,
-        )
-        schedule_repository = ScheduleRepository(
-            store,
-            allowed_roots=runtime_allowed_roots,
+            schedule_tool_supported=(
+                manifest.optional.get("codexd.schedule_create_tool") is True
+            ),
         )
         schedules = ScheduleCoordinator(
             repository=schedule_repository,
