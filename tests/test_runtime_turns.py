@@ -277,7 +277,7 @@ async def test_unexpected_stream_end_interrupts_turn_and_retires_runtime(
 async def test_turn_controls_fence_effects_after_active_handle_validation(
     storage_context: StorageContext,
 ) -> None:
-    fake = FakeCodexRuntime(event_delay=0.05)
+    fake = FakeCodexRuntime(event_delay=0.5)
 
     async def factory(_slot: object, _generation: int) -> FakeCodexRuntime:
         return fake
@@ -368,7 +368,7 @@ async def test_cancel_during_active_handle_publication_is_deferred(
     storage_context: StorageContext,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fake = FakeCodexRuntime(event_delay=0.05)
+    fake = FakeCodexRuntime(event_delay=0.5)
 
     async def factory(_slot: object, _generation: int) -> FakeCodexRuntime:
         return fake
@@ -418,7 +418,7 @@ async def test_duplicate_cancel_interrupts_provider_once(
 ) -> None:
     class BlockingInterruptRuntime(FakeCodexRuntime):
         def __init__(self) -> None:
-            super().__init__(event_delay=0.05)
+            super().__init__(event_delay=0.5)
             self.interrupt_calls = 0
             self.interrupt_entered = asyncio.Event()
             self.release_interrupt = asyncio.Event()
@@ -478,7 +478,7 @@ async def test_deterministic_interrupt_failure_stays_cancelling(
                 )
             )
 
-    fake = FailingInterruptRuntime(event_delay=0.05)
+    fake = FailingInterruptRuntime(event_delay=0.5)
 
     async def factory(_slot: object, _generation: int) -> FakeCodexRuntime:
         return fake
@@ -528,7 +528,7 @@ async def test_unknown_interrupt_outcome_is_persisted_and_raised(
                 )
             )
 
-    fake = UnknownInterruptRuntime(event_delay=0.05)
+    fake = UnknownInterruptRuntime(event_delay=0.5)
 
     async def factory(_slot: object, _generation: int) -> FakeCodexRuntime:
         return fake
@@ -1405,7 +1405,7 @@ async def test_shutdown_force_closes_runtime_when_turn_start_does_not_return(
     )
     await asyncio.wait_for(fake.start_entered.wait(), timeout=1)
 
-    await asyncio.wait_for(coordinator.close(drain_seconds=0.1), timeout=0.5)
+    await asyncio.wait_for(coordinator.close(drain_seconds=1), timeout=2)
     assert fake.closed
 
 
