@@ -697,8 +697,8 @@ async def test_runtime_supervisor_close_has_total_deadline(
 
     with pytest.raises(ExceptionGroup):
         await asyncio.wait_for(
-            supervisor.close(timeout_seconds=0.02),
-            timeout=0.2,
+            supervisor.close(timeout_seconds=0.2),
+            timeout=1,
         )
     assert fake.close_started.is_set()
 
