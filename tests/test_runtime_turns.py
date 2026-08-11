@@ -91,8 +91,7 @@ async def test_fake_runtime_turn_is_durable_end_to_end(
             (turn.id,),
         )
         assert [row["kind"] for row in events] == [
-            "turn.started",
-            "assistant.text.completed",
+            "turn.activity",
             "turn.completed",
         ]
         outbox = storage_context.store.query_one(
@@ -172,8 +171,7 @@ async def test_missing_mention_capability_fails_file_turn_before_runtime_start(
         assert terminal.state is TurnState.FAILED
         assert terminal.terminal_code == "file_input_unsupported"
         assert terminal.error_code == "file_input_unsupported"
-        assert terminal.error_message_redacted is not None
-        assert str(file.canonical_path) not in terminal.error_message_redacted
+        assert terminal.error_message_redacted is None
         assert fake.started_inputs == []
     finally:
         await coordinator.close(drain_seconds=1)
@@ -198,6 +196,7 @@ async def test_changed_file_fails_with_integrity_code_before_provider_turn(
         turn_input=TurnInput(files=(file,)),
         input_message_id="changed-file-before-provider",
     )
+    coordinator.volatile_turns.put_input(turn.id, TurnInput(files=(file,)))
     file.canonical_path.write_bytes(b"x" * file.size_bytes)
     try:
         await coordinator.wake(storage_context.conversation.id)
@@ -207,8 +206,7 @@ async def test_changed_file_fails_with_integrity_code_before_provider_turn(
         assert terminal.terminal_code == "attachment_integrity_failed"
         assert terminal.error_code == "attachment_integrity_failed"
         assert terminal.provider_turn_id is None
-        assert terminal.error_message_redacted is not None
-        assert str(file.canonical_path) not in terminal.error_message_redacted
+        assert terminal.error_message_redacted is None
         assert fake.started_inputs == []
         assert file.canonical_path.exists()
     finally:
@@ -268,6 +266,82 @@ async def test_unexpected_stream_end_interrupts_turn_and_retires_runtime(
             "stream_ended_without_terminal",
         )
         assert len(storage_context.store.query_all("SELECT id FROM turns")) == 1
+    finally:
+        await coordinator.close(drain_seconds=1)
+        await supervisor.close()
+
+
+@pytest.mark.asyncio
+async def test_event_pump_batches_consecutive_stream_deltas(
+    storage_context: StorageContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeCodexRuntime()
+    final_text = "".join(f"part-{index};" for index in range(200))
+    fake.script(
+        (
+            NormalizedEvent(
+                "turn.started",
+                {"provider_turn_id": "batched-provider-turn", "status": "inProgress"},
+            ),
+            *(
+                NormalizedEvent(
+                    "assistant.text.delta",
+                    {"item_id": "answer", "text": f"part-{index};"},
+                )
+                for index in range(200)
+            ),
+            NormalizedEvent(
+                "assistant.message.completed",
+                {"item_id": "answer", "phase": "final_answer", "text": final_text},
+                provider_event_id="batched-answer-completed",
+            ),
+            NormalizedEvent(
+                "turn.completed",
+                {"provider_turn_id": "batched-provider-turn", "status": "completed"},
+                provider_event_id="batched-turn-completed",
+            ),
+        )
+    )
+
+    async def factory(_slot: object, _generation: int) -> FakeCodexRuntime:
+        return fake
+
+    supervisor = _runtime_supervisor(storage_context, factory)
+    sink = ProjectingEventSink(
+        storage_context.store,
+        correlation_key=b"x" * 32,
+        stream_update_ms=1000,
+    )
+    recorded_kinds: list[str] = []
+    original_record = sink.record
+
+    def record(**kwargs: object) -> object:
+        event = kwargs["event"]
+        assert isinstance(event, NormalizedEvent)
+        recorded_kinds.append(event.kind)
+        return original_record(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(sink, "record", record)
+    coordinator = TurnCoordinator(
+        repository=storage_context.repository,
+        runtime_supervisor=supervisor,
+        event_sink=sink,
+    )
+    try:
+        turn = await coordinator.enqueue(
+            conversation_id=storage_context.conversation.id,
+            source=TurnSource.DISCORD,
+            turn_input=TurnInput(text="batch stream deltas"),
+            input_message_id="batch-stream-deltas",
+        )
+        terminal = await _wait_for_terminal(storage_context, turn.id)
+
+        assert terminal.state is TurnState.COMPLETED
+        assert recorded_kinds.count("assistant.text.delta") == 1
+        final = coordinator.volatile_turns.final(turn.id)
+        assert final is not None
+        assert final.final_answer_text == final_text
     finally:
         await coordinator.close(drain_seconds=1)
         await supervisor.close()

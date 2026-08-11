@@ -38,6 +38,7 @@ class RuntimeConfig:
     nonsecret_env_allowlist: tuple[str, ...] = ()
     topology: str = "project_scoped"
     shutdown_drain_seconds: int = 30
+    codex_log_filter: str = "warn,codex_http_client::transport=error"
 
 
 @dataclass(frozen=True)
@@ -71,10 +72,14 @@ class RenderingConfig:
 
 @dataclass(frozen=True)
 class RetentionConfig:
-    events_days: int = 90
+    events_days: int = 14
     input_attachments_days: int = 7
     render_attachments_days: int = 30
-    logs_days: int = 14
+    logs_days: int = 7
+    tool_output_hours: int = 24
+    outbox_content_days: int = 7
+    codex_logs_days: int = 7
+    codex_trace_hours: int = 24
 
 
 @dataclass(frozen=True)
@@ -260,6 +265,7 @@ def _runtime_config(raw: dict[str, Any]) -> RuntimeConfig:
             "nonsecret_env_allowlist",
             "topology",
             "shutdown_drain_seconds",
+            "codex_log_filter",
         },
         "runtime",
     )
@@ -290,6 +296,14 @@ def _runtime_config(raw: dict[str, Any]) -> RuntimeConfig:
         topology=topology,
         shutdown_drain_seconds=_positive_int(
             raw.get("shutdown_drain_seconds", 30), "runtime.shutdown_drain_seconds"
+        ),
+        codex_log_filter=_nonempty_bounded_string(
+            raw.get(
+                "codex_log_filter",
+                "warn,codex_http_client::transport=error",
+            ),
+            "runtime.codex_log_filter",
+            512,
         ),
     )
 
@@ -376,17 +390,38 @@ def _rendering_config(raw: dict[str, Any]) -> RenderingConfig:
 
 
 def _retention_config(raw: dict[str, Any]) -> RetentionConfig:
-    names = {"events_days", "input_attachments_days", "render_attachments_days", "logs_days"}
+    names = {
+        "events_days",
+        "input_attachments_days",
+        "render_attachments_days",
+        "logs_days",
+        "tool_output_hours",
+        "outbox_content_days",
+        "codex_logs_days",
+        "codex_trace_hours",
+    }
     _reject_unknown(raw, names, "retention")
     return RetentionConfig(
-        events_days=_positive_int(raw.get("events_days", 90), "retention.events_days"),
+        events_days=_positive_int(raw.get("events_days", 14), "retention.events_days"),
         input_attachments_days=_positive_int(
             raw.get("input_attachments_days", 7), "retention.input_attachments_days"
         ),
         render_attachments_days=_positive_int(
             raw.get("render_attachments_days", 30), "retention.render_attachments_days"
         ),
-        logs_days=_positive_int(raw.get("logs_days", 14), "retention.logs_days"),
+        logs_days=_positive_int(raw.get("logs_days", 7), "retention.logs_days"),
+        tool_output_hours=_positive_int(
+            raw.get("tool_output_hours", 24), "retention.tool_output_hours"
+        ),
+        outbox_content_days=_positive_int(
+            raw.get("outbox_content_days", 7), "retention.outbox_content_days"
+        ),
+        codex_logs_days=_positive_int(
+            raw.get("codex_logs_days", 7), "retention.codex_logs_days"
+        ),
+        codex_trace_hours=_positive_int(
+            raw.get("codex_trace_hours", 24), "retention.codex_trace_hours"
+        ),
     )
 
 
@@ -425,6 +460,15 @@ def _string(value: object, name: str) -> str:
     if not isinstance(value, str) or not value:
         raise ConfigurationError(f"{name} must be a non-empty string")
     return value
+
+
+def _nonempty_bounded_string(value: object, name: str, limit: int) -> str:
+    text = _string(value, name).strip()
+    if not text or len(text) > limit or "\x00" in text or "\n" in text or "\r" in text:
+        raise ConfigurationError(
+            f"{name} must be a single-line string of at most {limit} characters"
+        )
+    return text
 
 
 def _executable_path(value: object, name: str) -> Path:

@@ -7,6 +7,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 
 from codexd.application.conversation_locks import ConversationLocks
+from codexd.application.volatile_turns import VolatileTurnStore
 from codexd.domain.conversations import (
     ApprovalPolicy,
     ThreadConfig,
@@ -71,6 +72,7 @@ class TurnCoordinator:
         self._repository = repository
         self._runtime_supervisor = runtime_supervisor
         self._event_pump = EventPump(repository=repository, sink=event_sink)
+        self._volatile_turns = event_sink.volatile_turns
         self._conversation_locks = conversation_locks or ConversationLocks()
         self._critical_failure = critical_failure or (lambda _exc: None)
         self._provider_barrier_observer = provider_barrier_observer or (
@@ -155,8 +157,13 @@ class TurnCoordinator:
                 ingress_message_id=ingress_message_id,
                 requested_by_user_id=requested_by_user_id,
             )
+            self._volatile_turns.put_input(turn.id, turn_input)
         await self._mailboxes.wake(conversation_id)
         return turn
+
+    @property
+    def volatile_turns(self) -> VolatileTurnStore:
+        return self._volatile_turns
 
     async def _assert_image_model(self, conversation_id: str) -> None:
         conversation = await asyncio.to_thread(
@@ -584,9 +591,21 @@ class TurnCoordinator:
             runtime_generation=lease.generation,
         )
         try:
-            turn_input = await asyncio.to_thread(
-                self._repository.load_turn_input, claimed.id
-            )
+            if claimed.source_kind is TurnSource.DISCORD:
+                volatile_input = self._volatile_turns.input(claimed.id)
+                if volatile_input is None:
+                    raise ConflictError("volatile Turn input is unavailable")
+                turn_input = await asyncio.to_thread(
+                    self._repository.load_turn_input,
+                    claimed.id,
+                    volatile_text=volatile_input.text,
+                    use_volatile_text=True,
+                )
+            else:
+                turn_input = await asyncio.to_thread(
+                    self._repository.load_turn_input,
+                    claimed.id,
+                )
             await self._validate_turn_catalog(
                 runtime,
                 turn=claimed,
@@ -601,6 +620,7 @@ class TurnCoordinator:
                 input=turn_input,
                 config=_turn_config(claimed, project),
             )
+            self._volatile_turns.drop_input(claimed.id)
         except RuntimeUnavailable as exc:
             await asyncio.to_thread(
                 self._repository.terminal_turn,
@@ -1036,6 +1056,7 @@ class TurnCoordinator:
         return descriptor
 
     async def _terminal_claimed_for_shutdown(self, turn_id: str) -> None:
+        self._volatile_turns.discard(turn_id)
         await asyncio.to_thread(
             self._repository.request_cancel,
             turn_id,
@@ -1051,6 +1072,7 @@ class TurnCoordinator:
     async def _terminal_before_provider(
         self, turn: TurnRecord, project: ProjectRecord, code: str
     ) -> None:
+        self._volatile_turns.discard(turn.id)
         await asyncio.to_thread(
             self._repository.terminal_turn,
             turn.id,

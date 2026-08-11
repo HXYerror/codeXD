@@ -13,6 +13,7 @@ from PIL import Image, PngImagePlugin
 
 from codexd.application.dynamic_tools import DynamicToolDispatcher
 from codexd.application.outbound_images import OutboundImageBroker
+from codexd.application.volatile_turns import VolatileTurnStore
 from codexd.config import RetentionConfig
 from codexd.domain.conversations import SandboxProfile, ThreadConfig, ThreadIdentity
 from codexd.domain.ids import canonical_json, sha256_text, utc_now_ms
@@ -385,13 +386,20 @@ async def test_final_delivery_merges_images_and_suppresses_visualize_marker(
     client = Mock(spec=discord.Client)
     client.user = Mock(id=999)
     client.get_channel.return_value = thread
+    marker = '\ue200visualize\ue202{"path":"secret.html"}\ue201'
+    volatile_turns = VolatileTurnStore()
+    volatile_turns.put_final(
+        turn.id,
+        visible_text=f"Here is the flow chart.\n\n{marker}",
+        final_answer_text=f"Here is the flow chart.\n\n{marker}",
+    )
     transport = DiscordOutboxTransport(
         client=client,
         repository=storage_context.repository,
         renderer=renderer,
         signer=ComponentSigner(b"k" * 32),
+        volatile_turns=volatile_turns,
     )
-    marker = '\ue200visualize\ue202{"path":"secret.html"}\ue201'
     record = OutboxRecord(
         id="image-final",
         destination_key="thread:300",
@@ -421,11 +429,7 @@ async def test_final_delivery_merges_images_and_suppresses_visualize_marker(
         "second-flow.png",
     ]
     plan = storage_context.repository.render_plan(turn.id)
-    assert plan is not None
-    payload = json.loads(plan.plan_json)
-    assert len(payload["attachments"]) == 2
-    assert payload["attachments"][0]["kind"] == "image"
-    assert all("\ue200visualize" not in message for message in payload["messages"])
+    assert plan is None
 
 
 @pytest.mark.asyncio
@@ -452,13 +456,20 @@ async def test_visualize_marker_without_registered_image_becomes_visible_failure
     client = Mock(spec=discord.Client)
     client.user = Mock(id=999)
     client.get_channel.return_value = thread
+    marker = "\ue200visualize\ue202{}\ue201"
+    volatile_turns = VolatileTurnStore()
+    volatile_turns.put_final(
+        turn.id,
+        visible_text=marker,
+        final_answer_text=marker,
+    )
     transport = DiscordOutboxTransport(
         client=client,
         repository=storage_context.repository,
         renderer=renderer,
         signer=ComponentSigner(b"k" * 32),
+        volatile_turns=volatile_turns,
     )
-    marker = "\ue200visualize\ue202{}\ue201"
 
     await transport.deliver(
         OutboxRecord(

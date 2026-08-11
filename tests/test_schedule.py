@@ -146,7 +146,9 @@ async def test_run_now_is_idempotent_by_interaction(
         storage_context.repository.get_turn(first).effective_reasoning_summary
         == "detailed"
     )
-    assert storage_context.repository.get_turn(first).input_summary == "inspect repository"
+    assert storage_context.repository.get_turn(first).input_summary == (
+        "[content not retained; 18 bytes]"
+    )
     assert wakeups == [
         storage_context.conversation.id,
         storage_context.conversation.id,

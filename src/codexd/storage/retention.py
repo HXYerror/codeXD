@@ -58,7 +58,7 @@ class RetentionWorker:
         store: SQLiteStore,
         paths: AppPaths,
         config: RetentionConfig,
-        poll_seconds: float = 6 * 60 * 60,
+        poll_seconds: float = 15 * 60,
     ) -> None:
         self._store = store
         self._paths = paths
@@ -193,23 +193,73 @@ def run_retention(
                 )
             )
         event_cutoff = now - config.events_days * 24 * 60 * 60 * 1000
-        tool_output_cutoff = now - 30 * 24 * 60 * 60 * 1000
-        content_cutoff = now - 180 * 24 * 60 * 60 * 1000
+        tool_output_cutoff = now - config.tool_output_hours * 60 * 60 * 1000
+        content_cutoff = now - config.outbox_content_days * 24 * 60 * 60 * 1000
         outbox_payloads = connection.execute(
             """
             UPDATE discord_outbox
             SET event_sequence = NULL,
                 payload_json = json_object(
                     'kind', 'retained_tombstone',
-                    'original_kind', json_extract(payload_json, '$.kind')
+                    'original_kind', COALESCE(
+                        json_extract(payload_json, '$.kind'),
+                        'unknown'
+                    )
                 ),
                 updated_at = ?
-            WHERE state IN ('sent', 'dead_letter', 'superseded')
-              AND updated_at < ?
-              AND json_extract(payload_json, '$.kind') IN (
-                  'turn_final', 'turn_progress', 'task_card',
-                  'schedule_draft_card'
-              )
+            WHERE id IN (
+                SELECT id FROM discord_outbox
+                WHERE state = 'superseded'
+                  AND json_extract(payload_json, '$.kind') IS NOT 'retained_tombstone'
+                ORDER BY enqueue_sequence
+                LIMIT 5000
+            )
+            """,
+            (now,),
+        ).rowcount
+        outbox_payloads += connection.execute(
+            """
+            UPDATE discord_outbox
+            SET event_sequence = NULL,
+                payload_json = CASE json_extract(payload_json, '$.kind')
+                    WHEN 'turn_final' THEN json_object(
+                        'kind', 'turn_final',
+                        'turn_id', json_extract(payload_json, '$.turn_id'),
+                        'state', json_extract(payload_json, '$.state'),
+                        'terminal_code', json_extract(
+                            payload_json,
+                            '$.terminal_code'
+                        ),
+                        'compacted', 1
+                    )
+                    WHEN 'task_card' THEN json_object(
+                        'kind', 'task_card',
+                        'view_id', json_extract(payload_json, '$.view_id'),
+                        'compacted', 1
+                    )
+                    WHEN 'schedule_draft_card' THEN json_object(
+                        'kind', 'schedule_draft_card',
+                        'draft_id', json_extract(payload_json, '$.draft_id'),
+                        'compacted', 1
+                    )
+                    ELSE json_object(
+                        'kind', 'retained_tombstone',
+                        'original_kind', json_extract(payload_json, '$.kind')
+                    )
+                END,
+                updated_at = ?
+            WHERE id IN (
+                SELECT id FROM discord_outbox
+                WHERE state IN ('sent', 'dead_letter', 'superseded')
+                  AND updated_at < ?
+                  AND json_extract(payload_json, '$.kind') IN (
+                      'turn_final', 'turn_progress', 'task_card',
+                      'schedule_draft_card'
+                  )
+                  AND json_extract(payload_json, '$.compacted') IS NOT 1
+                ORDER BY updated_at, enqueue_sequence
+                LIMIT 5000
+            )
             """,
             (now, content_cutoff),
         ).rowcount
@@ -229,6 +279,15 @@ def run_retention(
             """,
             (content_cutoff,),
         ).rowcount
+        detail_kinds = (
+            "assistant.text.delta",
+            "plan.delta",
+            "reasoning.summary",
+            "reasoning.hidden_delta_discarded",
+            "command.output.delta",
+            "file_change.output.delta",
+        )
+        detail_placeholders = _placeholders(detail_kinds)
         connection.execute(
             f"""
             UPDATE tool_projections
@@ -242,54 +301,101 @@ def run_retention(
                 SELECT e.sequence
                 FROM events e
                 JOIN turns t ON t.id = e.turn_id
-                WHERE e.kind LIKE '%.output.delta'
+                WHERE e.kind IN ({detail_placeholders})
                   AND e.recorded_at < ?
                   AND t.state IN ({_placeholders(_TERMINAL_TURNS)})
             )
             """,
-            (tool_output_cutoff, *_TERMINAL_TURNS),
+            (*detail_kinds, tool_output_cutoff, *_TERMINAL_TURNS),
         )
+        compacted_detail_events = connection.execute(
+            f"""
+            DELETE FROM events
+            WHERE sequence IN (
+                SELECT e.sequence
+                FROM events e
+                JOIN turns t ON t.id = e.turn_id
+                WHERE e.kind IN ({detail_placeholders})
+                  AND e.recorded_at < ?
+                  AND t.state IN ({_placeholders(_TERMINAL_TURNS)})
+                  AND e.sequence NOT IN (
+                      SELECT event_sequence FROM discord_outbox
+                      WHERE event_sequence IS NOT NULL
+                  )
+                  AND e.sequence NOT IN (
+                      SELECT last_event_sequence FROM message_projections
+                      UNION
+                      SELECT last_event_sequence FROM tool_projections
+                      UNION
+                      SELECT last_event_sequence FROM task_projections
+                  )
+                ORDER BY e.sequence
+                LIMIT 5000
+              )
+            """,
+            (*detail_kinds, tool_output_cutoff, *_TERMINAL_TURNS),
+        ).rowcount
         connection.execute(
             f"""
             UPDATE events
-            SET payload_json = json_object('compacted', 1),
+            SET payload_json = json_object(
+                    'compacted', 1,
+                    'item_id', json_extract(payload_json, '$.item_id')
+                ),
                 raw_type = NULL,
                 raw_hash = NULL,
                 raw_size = NULL
-            WHERE kind LIKE '%.output.delta'
-              AND recorded_at < ?
-              AND turn_id IN (
-                  SELECT id FROM turns
-                  WHERE state IN ({_placeholders(_TERMINAL_TURNS)})
-              )
-              AND sequence IN (
-                  SELECT last_event_sequence FROM tool_projections
+            WHERE sequence IN (
+                SELECT e.sequence
+                FROM events e
+                JOIN turns t ON t.id = e.turn_id
+                WHERE e.kind IN ({detail_placeholders})
+                  AND e.recorded_at < ?
+                  AND t.state IN ({_placeholders(_TERMINAL_TURNS)})
+                  AND e.sequence IN (
+                      SELECT event_sequence FROM discord_outbox
+                      WHERE event_sequence IS NOT NULL
+                      UNION
+                      SELECT last_event_sequence FROM message_projections
+                      UNION
+                      SELECT last_event_sequence FROM tool_projections
+                      UNION
+                      SELECT last_event_sequence FROM task_projections
+                  )
+                  AND json_extract(e.payload_json, '$.compacted') IS NOT 1
+                ORDER BY e.sequence
+                LIMIT 5000
               )
             """,
-            (tool_output_cutoff, *_TERMINAL_TURNS),
+            (*detail_kinds, tool_output_cutoff, *_TERMINAL_TURNS),
         )
-        compacted_tool_events = connection.execute(
-            f"""
+        latest_snapshot_events = connection.execute(
+            """
             DELETE FROM events
-            WHERE kind LIKE '%.output.delta'
-              AND recorded_at < ?
-              AND turn_id IN (
-                  SELECT id FROM turns
-                  WHERE state IN ({_placeholders(_TERMINAL_TURNS)})
+            WHERE sequence IN (
+                SELECT sequence FROM events
+                WHERE kind IN ('diff.updated', 'usage.updated', 'plan.updated')
+                  AND sequence NOT IN (
+                      SELECT MAX(sequence)
+                      FROM events
+                      WHERE kind IN ('diff.updated', 'usage.updated', 'plan.updated')
+                      GROUP BY turn_id, kind
+                  )
+                  AND sequence NOT IN (
+                      SELECT event_sequence FROM discord_outbox
+                      WHERE event_sequence IS NOT NULL
+                  )
+                  AND sequence NOT IN (
+                      SELECT last_event_sequence FROM message_projections
+                      UNION
+                      SELECT last_event_sequence FROM tool_projections
+                      UNION
+                      SELECT last_event_sequence FROM task_projections
+                  )
+                ORDER BY sequence
+                LIMIT 2000
               )
-              AND sequence NOT IN (
-                  SELECT event_sequence FROM discord_outbox
-                  WHERE event_sequence IS NOT NULL
-              )
-              AND sequence NOT IN (
-                  SELECT last_event_sequence FROM message_projections
-                  UNION
-                  SELECT last_event_sequence FROM tool_projections
-                  UNION
-                  SELECT last_event_sequence FROM task_projections
-              )
-            """,
-            (tool_output_cutoff, *_TERMINAL_TURNS),
+            """
         ).rowcount
         connection.execute(
             f"""
@@ -393,7 +499,7 @@ def run_retention(
               )
             """,
             (event_cutoff, *_TERMINAL_TURNS),
-        ).rowcount + compacted_tool_events
+        ).rowcount + compacted_detail_events + latest_snapshot_events
         event_tombstones = connection.execute(
             f"""
             UPDATE events
@@ -547,11 +653,11 @@ def run_retention(
             DELETE FROM incidents
             WHERE resolved_at IS NOT NULL AND resolved_at < ?
             """,
-            (content_cutoff,),
+            (intent_cutoff,),
         ).rowcount
         audit_entries = connection.execute(
             "DELETE FROM audit_log WHERE occurred_at < ?",
-            (content_cutoff,),
+            (intent_cutoff,),
         ).rowcount
     removed_attachment_ids = tuple(
         attachment_id

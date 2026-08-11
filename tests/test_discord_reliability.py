@@ -18,6 +18,7 @@ from conftest import StorageContext
 from discord import app_commands
 
 from codexd.application.session_coordinator import ResolvedProject, SessionCoordinator
+from codexd.application.volatile_turns import VolatileTurnStore
 from codexd.config import AppConfig, DiscordConfig, SecurityConfig, load_config
 from codexd.domain.conversations import SandboxProfile, ThreadConfig, ThreadIdentity
 from codexd.domain.ids import canonical_json, sha256_text
@@ -28,6 +29,8 @@ from codexd.rendering.discord import (
     AttachmentKind,
     DurableDiscordRenderPlan,
     DurableRenderedAttachment,
+    RenderedAttachment,
+    RenderedDiscordContent,
 )
 from codexd.runtime.codex_sdk import capability_manifest
 from codexd.security.signing import ComponentSigner
@@ -53,6 +56,41 @@ from codexd.transport.discord.outbox import (
     _message_has_delivery_marker,
 )
 from codexd.transport.discord.presentation import TABLE_COPY_CUSTOM_ID, task_card_embed
+
+
+def _volatile_final(
+    turn_id: str,
+    visible_text: str,
+    *,
+    final_answer_text: str | None = None,
+) -> VolatileTurnStore:
+    store = VolatileTurnStore()
+    store.put_final(
+        turn_id,
+        visible_text=visible_text,
+        final_answer_text=final_answer_text,
+    )
+    return store
+
+
+def _volatile_preview(turn_id: str, text: str) -> VolatileTurnStore:
+    store = VolatileTurnStore()
+    store.save_content_ast(
+        turn_id,
+        {
+            "schema_version": 1,
+            "blocks": [
+                {
+                    "kind": "text",
+                    "item_id": "preview",
+                    "text": text,
+                    "phase": "commentary",
+                    "completed": False,
+                }
+            ],
+        },
+    )
+    return store
 
 
 @pytest.mark.asyncio
@@ -365,32 +403,29 @@ async def test_final_outbox_delivers_all_attachment_batches(tmp_path: Path) -> N
     thread.send = AsyncMock(side_effect=sent)
     client = Mock(spec=discord.Client)
     client.get_channel.return_value = thread
-    attachments: list[DurableRenderedAttachment] = []
+    attachments: list[RenderedAttachment] = []
     for index in range(25):
         content = str(index).encode()
         path = tmp_path / f"table-{index}.txt"
         path.write_bytes(content)
         attachments.append(
-            DurableRenderedAttachment(
+            RenderedAttachment(
                 filename=path.name,
-                path=path,
+                content=content,
                 description=f"attachment {index}",
-                sha256=hashlib.sha256(content).hexdigest(),
-                size_bytes=len(content),
             )
         )
-    plan = DurableDiscordRenderPlan(("Final response",), tuple(attachments))
+    plan = RenderedDiscordContent(("Final response",), tuple(attachments))
     renderer = Mock()
     renderer.artifact_root = tmp_path
     renderer.retention_days = 30
-    renderer.create_durable_plan = AsyncMock(return_value=plan)
-    renderer.load_durable_plan.return_value = plan
+    renderer.render_markdown = AsyncMock(return_value=plan)
     repository = Mock()
     repository.render_plan.return_value = None
     repository.persist_render_plan.return_value = RenderPlanRecord(
         turn_id="turn-final",
         source_sha256=sha256_text("ignored"),
-        plan_json=canonical_json(plan.to_payload(tmp_path)),
+        plan_json="{}",
         retention_until=1,
     )
     transport = DiscordOutboxTransport(
@@ -398,6 +433,7 @@ async def test_final_outbox_delivers_all_attachment_batches(tmp_path: Path) -> N
         repository=repository,
         renderer=renderer,
         signer=Mock(),
+        volatile_turns=_volatile_final("turn-final", "Final response"),
     )
     record = OutboxRecord(
         id="final",
@@ -454,19 +490,18 @@ async def test_final_outbox_renders_visible_transcript_not_only_canonical_final(
     tmp_path: Path,
 ) -> None:
     visible_text = "Commentary one\n\nCommentary two\n\nCanonical final"
-    plan = DurableDiscordRenderPlan((visible_text,), ())
+    plan = RenderedDiscordContent((visible_text,), ())
     renderer = Mock(
         artifact_root=tmp_path,
         retention_days=30,
-        create_durable_plan=AsyncMock(return_value=plan),
+        render_markdown=AsyncMock(return_value=plan),
     )
-    renderer.load_durable_plan.return_value = plan
     repository = Mock()
     repository.render_plan.return_value = None
     repository.persist_render_plan.return_value = RenderPlanRecord(
         turn_id="turn-visible",
         source_sha256=sha256_text(visible_text),
-        plan_json=canonical_json(plan.to_payload(tmp_path)),
+        plan_json="{}",
         retention_until=1,
     )
     thread = Mock(spec=discord.Thread)
@@ -481,6 +516,11 @@ async def test_final_outbox_renders_visible_transcript_not_only_canonical_final(
         repository=repository,
         renderer=renderer,
         signer=Mock(),
+        volatile_turns=_volatile_final(
+            "turn-visible",
+            visible_text,
+            final_answer_text="Canonical final",
+        ),
     )
 
     await transport.deliver(
@@ -504,14 +544,61 @@ async def test_final_outbox_renders_visible_transcript_not_only_canonical_final(
         )
     )
 
-    renderer.create_durable_plan.assert_awaited_once_with(
-        turn_id="turn-visible",
-        source=visible_text,
-    )
-    assert repository.persist_render_plan.call_args.kwargs["source_sha256"] == (
-        sha256_text(visible_text)
-    )
+    renderer.render_markdown.assert_awaited_once_with(visible_text)
+    repository.persist_render_plan.assert_not_called()
     assert thread.send.await_args_list[0].args[0].startswith(visible_text)
+
+
+@pytest.mark.asyncio
+async def test_final_delivery_after_restart_reports_that_content_was_not_retained(
+    tmp_path: Path,
+) -> None:
+    renderer = Mock(artifact_root=tmp_path)
+
+    async def render(source: str) -> RenderedDiscordContent:
+        return RenderedDiscordContent((source,), ())
+
+    renderer.render_markdown = AsyncMock(side_effect=render)
+    repository = Mock()
+    thread = Mock(spec=discord.Thread)
+    thread.id = 300
+    thread.archived = False
+    thread.locked = False
+    thread.send = AsyncMock(side_effect=[Mock(id=1), Mock(id=2)])
+    client = Mock(spec=discord.Client)
+    client.get_channel.return_value = thread
+    transport = DiscordOutboxTransport(
+        client=client,
+        repository=repository,
+        renderer=renderer,
+        signer=Mock(),
+        volatile_turns=VolatileTurnStore(),
+    )
+
+    await transport.deliver(
+        OutboxRecord(
+            id="restart-final",
+            destination_key="thread:300",
+            operation="send",
+            payload_json=canonical_json(
+                {
+                    "kind": "turn_final",
+                    "turn_id": "turn-after-restart",
+                    "state": "completed",
+                    "terminal_code": "provider_completed",
+                    "content_storage": "volatile",
+                }
+            ),
+            delivery_marker="restart-final",
+            state="pending",
+            attempts=1,
+            lease_owner="worker",
+        )
+    )
+
+    rendered_source = renderer.render_markdown.await_args.args[0]
+    assert "not retained in SQLite" in rendered_source
+    repository.render_plan.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -574,9 +661,12 @@ async def test_outbox_worker_waits_for_full_final_retry_before_progress_cleanup(
     renderer = Mock(
         artifact_root=tmp_path,
         retention_days=30,
-        create_durable_plan=AsyncMock(return_value=plan),
+        render_markdown=AsyncMock(return_value=plan),
     )
-    renderer.load_durable_plan.return_value = plan
+    volatile_turns = _volatile_final(
+        turn.id,
+        "Final part one\n\nFinal part two",
+    )
 
     bot_user = Mock(id=999)
     delivered_messages: list[Mock] = []
@@ -624,6 +714,7 @@ async def test_outbox_worker_waits_for_full_final_retry_before_progress_cleanup(
             repository=repository,
             renderer=renderer,
             signer=Mock(),
+            volatile_turns=volatile_turns,
         ),
         worker_id="final-retry-worker",
     )
@@ -671,7 +762,7 @@ async def test_outbox_worker_waits_for_full_final_retry_before_progress_cleanup(
     assert sent_final is not None
     assert dict(sent_final) == {"state": "sent", "attempts": 2}
     assert thread.send.await_count == 5
-    assert renderer.create_durable_plan.await_count == 1
+    assert renderer.render_markdown.await_count == 2
 
     assert await worker.drain_once()
 
@@ -811,9 +902,8 @@ async def test_progress_fallback_send_reconciles_before_terminal_cleanup(
     renderer = Mock(
         artifact_root=tmp_path,
         retention_days=30,
-        create_durable_plan=AsyncMock(return_value=plan),
+        render_markdown=AsyncMock(return_value=plan),
     )
-    renderer.load_durable_plan.return_value = plan
     transport = DiscordOutboxTransport(
         client=client,
         repository=repository,
@@ -927,9 +1017,8 @@ async def test_final_outbox_renders_table_embed_with_markdown_copy(
     renderer = Mock(
         artifact_root=tmp_path,
         retention_days=30,
-        create_durable_plan=AsyncMock(return_value=plan),
+        render_markdown=AsyncMock(return_value=plan),
     )
-    renderer.load_durable_plan.return_value = plan
     repository = Mock()
     repository.render_plan.return_value = None
     repository.persist_render_plan.return_value = RenderPlanRecord(
@@ -950,6 +1039,7 @@ async def test_final_outbox_renders_table_embed_with_markdown_copy(
         repository=repository,
         renderer=renderer,
         signer=Mock(),
+        volatile_turns=_volatile_final("turn-final", "ignored"),
     )
 
     result = await transport.deliver(
@@ -1302,6 +1392,7 @@ async def test_turn_progress_uses_one_editable_rich_embed() -> None:
         repository=repository,
         renderer=Mock(),
         signer=Mock(),
+        volatile_turns=_volatile_preview("turn-rich", "Ordinary assistant text"),
     )
     created = await transport.deliver(
         OutboxRecord(
@@ -2533,7 +2624,7 @@ async def test_mention_creates_conversation_and_exactly_one_durable_turn(
     assert conversation is not None
     assert conversation.project_id == storage_context.project.id
     turn = storage_context.repository.get_turn(ingress.turn_id)
-    assert turn.input_summary == "inspect the project"
+    assert turn.input_summary == "[content not retained; 19 bytes]"
     assert turn.input_message_id == "903"
     assert bot.turns.enqueue.await_count == 1
     message.create_thread.assert_awaited_once()
@@ -2691,9 +2782,10 @@ async def test_thread_creation_outbox_reconciles_existing_remote_thread(
     record = storage_context.repository.claim_outbox(worker_id="worker")
     assert record is not None
     ingress = storage_context.repository.get_ingress_message("302")
-    assert json.loads(record.payload_json)["name"] == (
-        f"reconcile existing thread · {ingress.id[:4]}"
-    )
+    payload = json.loads(record.payload_json)
+    assert payload["name_strategy"] == "starter_message"
+    assert payload["name_suffix"] == ingress.id[:4]
+    assert "reconcile existing thread" not in record.payload_json
     channel = Mock(spec=discord.TextChannel)
     channel.id = 200
     starter = Mock(spec=discord.Message)
@@ -3756,8 +3848,7 @@ async def test_ready_preflight_publishes_sanitized_codex_auth_state(
         repository=repository,
         codex_auth_status=auth_states.append,
     )
-    runtime = Mock()
-    runtime.account_status = AsyncMock(
+    bot.runtimes.account_status_if_loaded = AsyncMock(
         return_value=SimpleNamespace(
             auth_required=False,
             account_type="chatgpt",
@@ -3765,15 +3856,39 @@ async def test_ready_preflight_publishes_sanitized_codex_auth_state(
             email="must-not-be-published@example.com",
         )
     )
-    bot.runtimes.ensure = AsyncMock(
-        return_value=(runtime, SimpleNamespace())
-    )
     bot.session_lifecycle.restore_provider_barriers = AsyncMock()
     bot.turns.restore = AsyncMock()
 
     await bot.on_ready()
 
     assert auth_states == ["authenticated"]
+
+
+@pytest.mark.asyncio
+async def test_ready_preflight_does_not_start_unloaded_project_runtimes(
+    tmp_path: Path,
+) -> None:
+    auth_states: list[str] = []
+    repository = Mock()
+    repository.list_enabled_projects.return_value = [
+        SimpleNamespace(id=f"project-{index}") for index in range(20)
+    ]
+    bot = _test_bot(
+        tmp_path,
+        repository=repository,
+        codex_auth_status=auth_states.append,
+    )
+    bot.runtimes.account_status_if_loaded = AsyncMock(return_value=None)
+    bot.runtimes.ensure = AsyncMock()
+    bot.session_lifecycle.restore_provider_barriers = AsyncMock()
+    bot.turns.restore = AsyncMock()
+
+    await bot.on_ready()
+
+    assert bot._startup_preflight_complete
+    assert auth_states == ["unknown"]
+    bot.runtimes.ensure.assert_not_awaited()
+    assert bot.runtimes.account_status_if_loaded.await_count == 20
 
 
 @pytest.mark.asyncio
@@ -3813,14 +3928,10 @@ async def test_ready_preflight_keeps_runtime_degraded_until_runtime_retry(
     bot = _test_bot(tmp_path, repository=repository)
     bot._gateway_ready = True
     bot._startup_recovery_retry_seconds = 0.01
-    runtime = Mock()
-    runtime.account_status = AsyncMock(
-        return_value=SimpleNamespace(auth_required=False)
-    )
-    bot.runtimes.ensure = AsyncMock(
+    bot.runtimes.account_status_if_loaded = AsyncMock(
         side_effect=[
             RuntimeError("temporary runtime failure"),
-            (runtime, SimpleNamespace()),
+            SimpleNamespace(auth_required=False),
         ]
     )
     bot.session_lifecycle.restore_provider_barriers = AsyncMock()
@@ -3837,7 +3948,7 @@ async def test_ready_preflight_keeps_runtime_degraded_until_runtime_retry(
 
     assert bot._startup_preflight_complete
     assert not bot._ready_preflight_degraded
-    assert bot.runtimes.ensure.await_count == 2
+    assert bot.runtimes.account_status_if_loaded.await_count == 2
     bot.turns.restore.assert_awaited_once()
 
 
@@ -3858,9 +3969,8 @@ async def test_final_attachment_failure_falls_back_to_actual_content(
     renderer = Mock(
         artifact_root=tmp_path,
         retention_days=30,
-        create_durable_plan=AsyncMock(return_value=plan),
+        render_markdown=AsyncMock(return_value=plan),
     )
-    renderer.load_durable_plan.return_value = plan
     repository = Mock()
     repository.render_plan.return_value = None
     repository.persist_render_plan.return_value = RenderPlanRecord(
@@ -3889,6 +3999,7 @@ async def test_final_attachment_failure_falls_back_to_actual_content(
         repository=repository,
         renderer=renderer,
         signer=Mock(),
+        volatile_turns=_volatile_final("turn-final", "Final response"),
     )
     record = OutboxRecord(
         id="final",
@@ -3978,9 +4089,8 @@ async def test_parent_source_link_does_not_overflow_full_final_chunk(
     renderer = Mock(
         artifact_root=tmp_path,
         retention_days=30,
-        create_durable_plan=AsyncMock(return_value=plan),
+        render_markdown=AsyncMock(return_value=plan),
     )
-    renderer.load_durable_plan.return_value = plan
     repository = Mock()
     repository.render_plan.return_value = None
     repository.persist_render_plan.return_value = RenderPlanRecord(
@@ -4004,6 +4114,7 @@ async def test_parent_source_link_does_not_overflow_full_final_chunk(
         repository=repository,
         renderer=renderer,
         signer=Mock(),
+        volatile_turns=_volatile_final("turn-long-parent", source),
     )
     record = OutboxRecord(
         id="long-parent",
@@ -4036,21 +4147,18 @@ async def test_parent_source_link_does_not_overflow_full_final_chunk(
 
 
 @pytest.mark.asyncio
-async def test_corrupt_render_plan_uses_bounded_plain_text_fallback(
+async def test_in_memory_render_failure_uses_bounded_plain_text_fallback(
     tmp_path: Path,
 ) -> None:
     plain_text = "The durable answer remains available."
-    renderer = Mock(artifact_root=tmp_path, retention_days=30)
-    renderer.load_durable_plan.side_effect = InvariantError(
-        "render plan attachment changed or is missing"
+    renderer = Mock(
+        artifact_root=tmp_path,
+        retention_days=30,
+        render_markdown=AsyncMock(
+            side_effect=InvariantError("in-memory render failed")
+        ),
     )
     repository = Mock()
-    repository.render_plan.return_value = RenderPlanRecord(
-        turn_id="turn-corrupt",
-        source_sha256=sha256_text(plain_text),
-        plan_json='{"version":2,"messages":[],"attachments":[]}',
-        retention_until=1,
-    )
     thread = Mock(spec=discord.Thread)
     thread.archived = False
     thread.locked = False
@@ -4062,6 +4170,7 @@ async def test_corrupt_render_plan_uses_bounded_plain_text_fallback(
         repository=repository,
         renderer=renderer,
         signer=Mock(),
+        volatile_turns=_volatile_final("turn-corrupt", plain_text),
     )
 
     result = await transport.deliver(
@@ -4094,42 +4203,19 @@ async def test_corrupt_render_plan_uses_bounded_plain_text_fallback(
     repository.record_incident.assert_called_once_with(
         severity="error",
         code="discord_render_fallback",
-        summary="Discord rich rendering failed; bounded plain text was used",
+        summary="Discord in-memory rich rendering failed; bounded text was used",
         turn_id="turn-corrupt",
-        details={"stable_code": "render_plan_invalid"},
+        details={"stable_code": "volatile_render_failed"},
     )
 
 
-@pytest.mark.asyncio
-async def test_render_fallback_attaches_short_output_split_into_five_chunks(
-    tmp_path: Path,
-) -> None:
+def test_render_fallback_for_five_chunks_is_bounded_in_memory() -> None:
     source = "\n".join("x" * 600 for _ in range(10))
-    expected = DurableDiscordRenderPlan(("Complete source attached.",), ())
-    renderer = Mock(
-        artifact_root=tmp_path,
-        retention_days=30,
-        create_plain_text_fallback_plan=AsyncMock(return_value=expected),
-    )
-    repository = Mock()
-    transport = DiscordOutboxTransport(
-        client=Mock(spec=discord.Client),
-        repository=repository,
-        renderer=renderer,
-        signer=Mock(),
-    )
+    chunks = _bounded_plain_text_fallback(source)
 
-    plan = await transport._render_fallback_plan(
-        turn_id="turn-five-chunks",
-        plain_text=source,
-        stable_code="render_plan_invalid",
-    )
-
-    assert plan is expected
-    renderer.create_plain_text_fallback_plan.assert_awaited_once_with(
-        turn_id="turn-five-chunks",
-        source=source,
-    )
+    assert len(chunks) == 4
+    assert all(len(chunk) <= 1900 for chunk in chunks)
+    assert "fallback truncated" in chunks[-1]
 
 
 def test_plain_text_render_fallback_is_bounded_when_attachment_storage_fails() -> None:

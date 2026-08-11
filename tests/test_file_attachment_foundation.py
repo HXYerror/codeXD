@@ -250,7 +250,11 @@ def test_repository_accepts_pre_file_snapshot_hashes_for_upgrade_compatibility(
             (legacy_hash, turn.id),
         )
 
-    assert storage_context.repository.load_turn_input(turn.id) == turn_input
+    assert storage_context.repository.load_turn_input(
+        turn.id,
+        volatile_text=turn_input.text,
+        use_volatile_text=True,
+    ) == turn_input
     duplicate = storage_context.repository.enqueue_turn(
         conversation_id=storage_context.conversation.id,
         source=TurnSource.DISCORD,
@@ -484,7 +488,7 @@ def test_input_file_migration_preserves_images_and_enforces_shared_ordinals(
         )
 
         monkeypatch.setattr(sqlite_module, "_load_migrations", lambda: migrations)
-        assert store.migrate() == 20
+        assert store.migrate() == 22
         assert store.integrity_check() == "ok"
         assert store.foreign_key_check() == ()
         assert repository.load_turn_input(image_turn.id).images[0].attachment_id == "legacy-image"
@@ -543,7 +547,7 @@ def test_file_snapshot_survives_database_reopen(tmp_path: Path) -> None:
         )
 
     with SQLiteStore(database) as reopened:
-        assert reopened.migrate() == 20
+        assert reopened.migrate() == 22
         restored = Repository(reopened).load_turn_input(turn.id)
     assert restored.files == (file,)
 

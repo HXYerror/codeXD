@@ -22,7 +22,16 @@ def supersede_coalesced_outbox(
     connection.execute(
         f"""
         UPDATE discord_outbox
-        SET state = 'superseded', updated_at = ?
+        SET state = 'superseded',
+            event_sequence = NULL,
+            payload_json = json_object(
+                'kind', 'retained_tombstone',
+                'original_kind', COALESCE(
+                    json_extract(payload_json, '$.kind'),
+                    'unknown'
+                )
+            ),
+            updated_at = ?
         WHERE coalesce_key = ?
           AND state IN ({placeholders})
         """,
@@ -69,7 +78,6 @@ def insert_initial_progress(
                         "Queued · waiting for Codex · "
                         f"{sandbox_profile.upper()}"
                     ),
-                    "plain_text": "",
                 }
             ),
             f"turn:{turn_id}:progress:1",
@@ -165,7 +173,6 @@ def insert_progress_update(
     turn_id: str,
     state: str,
     content: str | None,
-    plain_text: str | None = None,
     now: int,
     event_sequence: int | None = None,
     min_interval_ms: int = 0,
@@ -191,7 +198,7 @@ def insert_progress_update(
     next_attempt_at = now
     previous = connection.execute(
         """
-        SELECT state, next_attempt_at, updated_at, payload_json
+        SELECT id, operation, state, next_attempt_at, updated_at, payload_json
         FROM discord_outbox
         WHERE coalesce_key = ? AND state <> 'superseded'
         ORDER BY enqueue_sequence DESC
@@ -200,7 +207,6 @@ def insert_progress_update(
         (coalesce_key,),
     ).fetchone()
     previous_content = "Running · Codex is working"
-    previous_plain_text = ""
     if previous is not None:
         try:
             previous_payload = json.loads(str(previous["payload_json"]))
@@ -209,23 +215,12 @@ def insert_progress_update(
         if not isinstance(previous_payload, dict):
             raise ValueError("progress outbox payload must be an object")
         stored_content = previous_payload.get("content")
-        stored_plain_text = previous_payload.get("plain_text", "")
         if not isinstance(stored_content, str) or not stored_content:
             raise ValueError("progress outbox content is invalid")
-        if not isinstance(stored_plain_text, str):
-            raise ValueError("progress outbox plain text is invalid")
         previous_content = stored_content
-        previous_plain_text = stored_plain_text
     resolved_content = content if content is not None else previous_content
     if not resolved_content:
         raise ValueError("progress content cannot be empty")
-    resolved_plain_text = (
-        ""
-        if state == "terminal"
-        else plain_text
-        if plain_text is not None
-        else previous_plain_text
-    )
     if state != "terminal" and min_interval_ms and previous is not None:
         previous_state = str(previous["state"])
         if previous_state == "sent":
@@ -240,6 +235,38 @@ def insert_progress_update(
                 now + min_interval_ms,
                 int(previous["next_attempt_at"]),
             )
+    payload_json = canonical_json(
+        {
+            "kind": "turn_progress",
+            "turn_id": turn_id,
+            "revision": revision,
+            "state": state,
+            "content": resolved_content[:1900],
+        }
+    )
+    dedupe_key = f"turn:{turn_id}:progress:{revision}"
+    delivery_marker = f"turn-{turn_id[:8]}-progress-{revision}"
+    if previous is not None and str(previous["state"]) == "pending":
+        outbox_id = str(previous["id"])
+        changed = connection.execute(
+            """
+            UPDATE discord_outbox
+            SET event_sequence = ?, payload_json = ?, dedupe_key = ?,
+                delivery_marker = ?, next_attempt_at = ?, updated_at = ?
+            WHERE id = ? AND state = 'pending'
+            """,
+            (
+                event_sequence,
+                payload_json,
+                dedupe_key,
+                delivery_marker,
+                next_attempt_at,
+                now,
+                outbox_id,
+            ),
+        ).rowcount
+        if changed == 1:
+            return outbox_id
     supersede_coalesced_outbox(
         connection,
         coalesce_key=coalesce_key,
@@ -259,19 +286,10 @@ def insert_progress_update(
             outbox_id,
             event_sequence,
             view["destination_key"],
-            canonical_json(
-                {
-                    "kind": "turn_progress",
-                    "turn_id": turn_id,
-                    "revision": revision,
-                    "state": state,
-                    "content": resolved_content[:1900],
-                    "plain_text": resolved_plain_text[:1800],
-                }
-            ),
-            f"turn:{turn_id}:progress:{revision}",
+            payload_json,
+            dedupe_key,
             coalesce_key,
-            f"turn-{turn_id[:8]}-progress-{revision}",
+            delivery_marker,
             next_attempt_at,
             now,
             now,

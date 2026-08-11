@@ -677,6 +677,8 @@ flowchart TB
 Phase 0 contract 通过时，v1 首选每个 project 一个 Runtime Slot：
 
 - 首次使用时 lazy start；
+- Discord ready/account preflight 只检查已经加载的 slot，绝不遍历 enabled Project
+  调用 `ensure()`；未加载时 auth projection 为 `unknown`，由首次真实操作解析；
 - 启动后默认保留到 daemon 关闭；
 - 同一 project 的多个 Conversation 复用 SDK client；
 - project-scoped Runtime Slot 崩溃只中断该 project 的 active Turn；shared
@@ -711,10 +713,10 @@ allowed-root 校验。
 | `RuntimeSupervisor` | Runtime Slot lifecycle、generation、health、restart backoff | 不推断业务完成 |
 | `CodexRuntimeAdapter` | 唯一 SDK adapter、event normalization、capability manifest | 不返回 SDK 类型到 core |
 | `EventPump` | 单消费者读取一个 Turn 的 stream | 不直接发 Discord |
-| `EventJournal` | append-only provider/domain events | 不做 UI 逻辑 |
-| `Projector` | 更新 Turn、message、tool、usage projection | 不调用 provider |
+| `EventJournal` | 每 Turn 一个无正文 activity anchor，加 terminal/error/policy metadata 白名单 | 不保存正文、普通成功事件或做 UI 逻辑 |
+| `Projector` | 更新 Turn、tool/task 状态与 usage metadata | 不调用 provider，不持久化 transcript |
 | `DiscordOutbox` | 持久化 send/edit/delete 操作和 retry | 不重跑 Agent |
-| `ContentAssembler` | stream delta -> ContentBlock AST | 不知道 Discord message ID |
+| `ContentAssembler` | stream delta -> 进程内 ContentBlock AST | 不知道 Discord message ID，不写磁盘 |
 | `DiscordRenderer` | AST -> Discord messages/files/embeds | 不读取 SDK event |
 | `MediaWorker` | 隔离执行 untrusted image decode 与 table PNG render | 无 SDK/Discord secret、不接收 project path |
 | `ServiceSupervisor` | 安装、启动、停止、status、heartbeat | 不把 transport 断线当 daemon 死亡 |
@@ -1310,6 +1312,10 @@ clear/mutate 全局 environment。
 userinfo/query credential。`CodexConfig.env` 只可再次叠加同一 validated
 non-secret mapping。bootstrap 后若
 process environment 出现 allowlist 外 key，Runtime Slot creation fail closed。
+`CODEX_SQLITE_HOME` 与 `CODEX_HOME` 同属允许的非 secret location metadata；
+codexD 为 child 显式设置受配置约束的 `RUST_LOG`，默认只保留 WARN/ERROR，
+并把 `codex_http_client::transport` 降到 ERROR，避免完整 HTTP/SSE
+正文和依赖 TRACE 写入 Codex feedback SQLite。Discord 输入不能覆盖该 filter。
 AWS/Azure/GCP/API-key credential environment variables 不在 allowlist；若某种
 provider account 只能依赖这类 inherited secret，v1 明确报
 `environmental_auth_unsupported`，不能为兼容而把它泄露给 agent command child。
@@ -1962,19 +1968,19 @@ Domain event kind 使用稳定命名，不直接复用 SDK class name：
 | `thread.started` | actual thread ID | 持久化 identity |
 | `thread.resumed` | requested/actual ID | mismatch check |
 | `turn.started` | provider turn ID | 幂等确认 handle ID/running；mismatch incident |
-| `assistant.text.delta` | item ID, text | 合并到文本 block |
+| `assistant.text.delta` | item ID, text | 仅在进程内合并到文本 block |
 | `assistant.text.completed` | item ID, `phase` | `final_answer` 参与 canonical final 选择；`commentary` 同时用于进度与 terminal visible transcript；若 provider 为同一流使用不同 delta/completed item ID，则只按末尾未完成同 phase 文本前缀安全合并 |
 | `reasoning.summary` | safe visible summary only | 可选状态，不展示隐藏推理 |
 | `command.started` | command label, cwd | tool card |
-| `command.output.delta` | stream, text | 节流更新 |
+| `command.output.delta` | stream, text | 仅进程内消费，不写 event/tool projection |
 | `command.completed` | exit/status | finalize tool card |
 | `file_change.proposed` | paths, patch summary | file card |
 | `file_change.completed` | status | finalize file card |
-| `diff.updated` | aggregated unified diff | `/diff` projection + optional card |
+| `diff.updated` | aggregated unified diff | active Turn 内存态；正文不进入 event journal |
 | `mcp.started/completed` | server/tool/status | generic integration card |
 | `dynamic_tool.started/completed` | namespace/tool/status | generic integration card |
 | `web_search.started/completed` | query/action/status | web search card |
-| `plan.updated` | structured steps if public | plan card |
+| `plan.updated` | structured steps if public | active Turn 内存态，不持久化步骤正文 |
 | `collaboration.started/progress/completed` | `collabAgentToolCall` / `subAgentActivity`、sender/receiver/status | capability-gated TaskCardBlock；连续 `wait` 仅作内部轮询，不单独刷卡 |
 | `hook.started/completed` | item/turn/status only | audit/progress；不显示 prompt fragments |
 | `approval_review.started/completed` | risk/status only | auto-review progress；不是 Discord approval |
@@ -1982,30 +1988,31 @@ Domain event kind 使用稳定命名，不直接复用 SDK class name：
 | `turn.moderation` | typed safe status | warning；不展示 raw moderation metadata |
 | `terminal.interaction` | command item/status | tool card metadata；不创建独立 shell |
 | `context_compaction.started/completed` | `contextCompaction` Item 或 routed `thread/compacted` | compact activity notice |
-| `usage.updated` | provider `last`/`total` breakdown、context window | `/usage` projection，绝不改写 scope |
+| `usage.updated` | provider `last`/`total` breakdown、context window | 内存保留 latest，terminal 时只写数值 metadata |
 | `turn.completed` | final success status | Turn completed |
 | `turn.failed` | stable error | Turn failed |
 | `turn.interrupted` | SDK completed status `interrupted` | 结合 interrupt intent 投影 |
-| `provider.error` | code/message | error card |
+| `provider.error` | code/message | 只持久化 code、hash、byte length；不保存 message |
 | `provider.unknown` | raw type/hash | incident + safe fallback |
 
 实际 SDK 事件名可随版本变化；只有 adapter fixture 需要知道映射。
 
-terminal projection 明确区分两个文本语义：
+进程内 terminal assembler 明确区分两个文本语义：
 
 - canonical final answer 与 SDK collector 保持一致但不调用 collector：从 completed
   `agentMessage` 倒序选择最后一个 `phase=final_answer`；若没有，则兼容最后一个
   `phase=None`；`phase=commentary` 永不冒充 canonical final；
-- visible assistant transcript 从持久 `content_ast_json` 按事件顺序保留所有非空、
+- visible assistant transcript 从 `VolatileTurnStore` 的 AST 按事件顺序保留所有非空、
   completed 的 `commentary`、`final_answer` 与 legacy `phase=None` 文本，block 间使用
   稳定空行，并把选中的 canonical final block 精确放在末尾一次。incomplete、未知
   phase、plan、reasoning、tool/raw payload 均不进入 terminal transcript。
 
 没有 canonical final 时，completed Turn 在 commentary 后追加
 `completed_without_final_response` fallback；failed/cancelled/interrupted 追加相应
-terminal fallback。`turn_final.visible_text` 驱动 durable render plan，
-`final_answer_text` 单独保存 canonical 语义；transport 仍兼容升级前只含
-`plain_text` 的 pending outbox。progress 的 1,800 字 preview 从不作为 terminal 来源。
+terminal fallback。`turn_final` outbox 只保存 Turn ID/state/model/usage 等 metadata；
+transport 在同一进程内从 `VolatileTurnStore` 读取正文并渲染，成功 ACK 后立即丢弃。
+daemon 若在投递前重启，正文允许丢失，Discord 只收到“正文未持久化”的稳定说明，
+绝不尝试从 SQLite 恢复。progress preview 同样只从内存读取。
 
 当前 `TurnHandle.stream()` 可按 turn ID 路由的 typed notification family
 包括：
@@ -2403,8 +2410,8 @@ ChannelBinding 只是未来 Conversation 的可选路由 override。删除 bindi
 | `interrupt_origin` | nullable user/shutdown/runtime |
 | `interrupt_reason` | nullable stable code |
 | `input_hash` | audit，不替代原文权限 |
-| `input_summary` | redacted/truncated prompt summary；供 `/turn list` 投影 |
-| `queued_input_text` | nullable sensitive payload；尚未进入 provider 的 queued Discord/Schedule Turn 保留 |
+| `input_summary` | 固定 `[content not retained; N bytes]`，不含 prompt 摘要 |
+| `queued_input_text` | 始终 null；legacy migration 主动清空 |
 | `queued_skill_inputs_json` | nullable immutable name/canonical path/content hash；provider start/terminal 后清除 |
 | `effective_skill_names_json` | nullable audit；不保留 path |
 | `effective_model`, `effective_reasoning_effort` | provider-start audit |
@@ -2414,14 +2421,15 @@ ChannelBinding 只是未来 Conversation 的可选路由 override。删除 bindi
 | `effective_sandbox`, `effective_approval_mode` | start audit |
 | `queued_at`, `started_at`, `ended_at` | UTC ms |
 | `terminal_code` | nullable |
-| `error_code`, `error_message_redacted` | nullable |
+| `error_code`, `error_message_redacted` | 只保留 `error_code`；message 始终 null |
 | `usage_scope` | nullable |
 
 约束要求 `discord` source 只关联 `input_message_id`，`schedule` source 只关联
 `schedule_fire_id`。两种入口最终共享同一 Turn 状态机、mailbox、EventPump 和
-renderer。Discord attachment preflight 完成时复制 accepted canonical text；
-Schedule Fire materialize 时复制当时的 `prompt_text`。mailbox 只能使用这个
-immutable snapshot，不能在执行时重新抓 Discord message 或读取 Schedule 当前值。
+renderer。Discord canonical text 只在 `VolatileTurnStore` 中跨 queue/provider-start
+传递，daemon 重启后明确 interrupt，不 replay。Schedule prompt 属于 durable Schedule
+配置，但不会复制到 Turn row；provider-start 从关联 Schedule 读取并用 Turn
+`input_hash` 校验，配置已变化时明确 interrupt，不能静默使用新 prompt。
 若预登记 SkillInput 被识别，其 name/path/content-hash 也在 materialize 时进入
 queued snapshot；重启后 path/hash 不再匹配时 Schedule Turn 明确失败，不能重新按
 当前 registry 解释旧 prompt。
@@ -2553,15 +2561,15 @@ UNIQUE(turn_id, local_event_index)
 UNIQUE(turn_id, provider_event_id) WHERE provider_event_id IS NOT NULL
 ```
 
-#### `message_projections`
+#### `message_projections`（legacy compatibility）
 
 | 字段 | 说明 |
 |---|---|
 | `id` | PK UUID |
 | `turn_id` | FK |
 | `content_revision` | projector revision |
-| `content_ast_json` | versioned ContentBlock AST |
-| `plain_text` | 当前 visible assistant text；terminal 后为完整 completed visible transcript + 必要 fallback，用于 search/`/turn show`/diagnostics/render fallback |
+| `content_ast_json` | legacy schema column；新版本不写，migration/compaction 清空所有 row |
+| `plain_text` | legacy schema column；新版本不写 |
 | `is_final` | bool |
 | `last_event_sequence` | idempotent projection cursor |
 
@@ -2573,9 +2581,9 @@ UNIQUE(turn_id, provider_event_id) WHERE provider_event_id IS NOT NULL
 | `turn_id` | FK |
 | `provider_item_id` | nullable |
 | `kind` | command/file/mcp/etc. |
-| `label` | redacted display label |
+| `label` | 固定 tool kind/name，不保存 command/query |
 | `state` | started/completed/failed |
-| `summary_json` | renderer-safe |
+| `summary_json` | 仅状态、ID、hash、byte length、duration/exit code 等 metadata |
 | `last_event_sequence` | cursor |
 
 #### `task_projections`
@@ -2863,25 +2871,37 @@ Schedule recovery 随后：
 |---|---|
 | Conversation/thread metadata | 直到显式删除 |
 | Command intent/result | 90 天；unknown/incident 引用时按 incident retention |
-| Turn/event | 90 天 |
-| final message projection | 180 天 |
-| tool output delta | 30 天，之后做 storage compaction，仅保留 summary |
+| Turn/event | 14 天；普通成功 lifecycle/delta 不进入 event journal |
+| conversation prompt/assistant transcript | 0 天；从不进入 SQLite |
+| tool output delta | 0 天；不进入 event journal/tool projection |
 | table source/PNG | 30 天 |
 | input image / ordinary file | 7 天 |
 | Schedule definition | active definition 到显式删除；delete 立即清除 prompt，只保留 tombstone/audit metadata |
 | Schedule Fire | 与关联 Turn 同期；无 Turn 的 fire 90 天 |
-| logs | 14 天滚动 |
-| incidents/audit | 180 天 |
+| codexD logs | 7 天滚动 |
+| Codex feedback logs | 7 天；普通 TRACE/DEBUG 仅 24 小时，HTTP transport TRACE 不保留 |
+| incidents/audit | 90 天 |
 
 清理规则：
 
 - 只删除 terminal Turn 的可压缩 detail；
+- EventPump 可按 `stream_update_ms` 合并连续 delta，但 assistant/plan/reasoning/tool-output/
+  diff/usage 的连续更新只触达内存（以及只读 generation 校验），不打开 SQLite 写事务；
+  只有 terminal、provider error/unknown、policy notice 和 final file-change metadata
+  进入 durable event 白名单，payload 仍只含 ID/hash/size/state/code；
+- 未 claim 的 progress outbox 原地更新；新 revision ack 后立即删除无依赖旧 progress，
+  其他 superseded payload 立即 tombstone；
 - 不删除 current thread revision metadata；
 - input_image/input_file 只有在 Turn terminal 且 deadline 到期后才删除；
   queued/starting/running/cancelling 引用一律保留；
 - orphan sweep 同时把两个 input kind 的相对路径视为引用，且绝不沿 symlink 删除；
 - attachment 必须先确认无 projection/outbox 引用；
 - DB backup 前执行 WAL checkpoint；
+- `codexd db compact --yes` 只可在 daemon 停止并取得 exclusive instance lock 后执行：
+  默认先做 verified backup，再清理旧式重复 delta/diff/progress，最后 VACUUM 与
+  integrity/foreign-key check；
+- `codexd db trim-codex-logs --yes` 还要求所有 Codex/ChatGPT app-server 都已关闭；
+  检测到任何进程仍打开 `logs_2.sqlite` 时 fail closed，不在线删除共享日志库；
 - 备份不包含 Codex 自己的 `$CODEX_HOME`，两者分别处理；
 - restore 后若 Codex rollout 不存在，Conversation 进入 `blocked`，不能静默
   start 新 thread。
@@ -3716,6 +3736,9 @@ v1 使用 typed `turn/diff/updated` 与 completed `fileChange` Item：
 - 完整绝对路径；
 - raw reasoning。
 
+`--include-content` 仅为 CLI 向后兼容保留，并写出
+`content_persistence=disabled` 标记；它不会查询或导出 transcript/event 正文。
+
 ### 12.17 `/capabilities`
 
 按标签显示：
@@ -3782,13 +3805,13 @@ Excluded
 ### 13.1 Renderer 原则
 
 1. provider event 不直接变 Discord message；
-2. 先构建 `ContentBlock` AST；
+2. 先在进程内构建 `ContentBlock` AST；
 3. 一个 block 只有一个 canonical render；
 4. streaming update 与 final render 共用同一 AST；
 5. Discord 限制在最后一层处理；
 6. 渲染失败降级，不改变 Turn 状态；
 7. 原始可复制内容不能只存在图片；
-8. renderer 重启可从 projection 重建。
+8. renderer 不把正文或 render plan 写入 SQLite；重启前未投递正文允许丢失并显示稳定说明。
 
 ### 13.2 ContentBlock
 
@@ -4493,6 +4516,7 @@ message_max_bytes = 52428800
 sdk_version_policy = "compatible_range"
 codex_bin = "/absolute/path/to/codex" # optional; defaults to the SDK-pinned runtime
 nonsecret_env_allowlist = ["JAVA_HOME", "DEVELOPER_DIR"]
+codex_log_filter = "warn,codex_http_client::transport=error"
 
 [codex]
 web_search_mode = "cached"
@@ -4511,10 +4535,14 @@ table_max_rows_png = 200
 table_memory_mib = 128
 
 [retention]
-events_days = 90
+events_days = 14
 input_attachments_days = 7
 render_attachments_days = 30
-logs_days = 14
+logs_days = 7
+tool_output_hours = 24
+outbox_content_days = 7
+codex_logs_days = 7
+codex_trace_hours = 24
 ```
 
 Windows path 使用合法 TOML string，不允许以字符串拼接生成。
@@ -4697,9 +4725,9 @@ v1：
 - database backup 权限不宽于原 DB；
 - instance lock 防止第二 daemon 同时写。
 
-v1 不宣称 SQLite application-level encryption：Schedule prompt、尚未进入
-provider 的 queued Discord prompt、message projection 和部分 redacted tool
-output 仍是本地敏感内容。部署文档要求启用
+v1 不宣称 SQLite application-level encryption：Schedule prompt 作为用户显式创建的
+durable automation 配置仍是本地敏感内容；Discord prompt、assistant transcript、
+render plan 与 tool output 正文均不写 SQLite。部署文档仍要求启用
 FileVault/BitLocker；真正 credential/signing key 继续只放 OS secret store，
 不能因为磁盘已加密就写入 DB。
 
@@ -4758,6 +4786,9 @@ codexd service status
 codexd service logs
 codexd service uninstall
 codexd db check
+codexd db backup
+codexd db compact --yes
+codexd db trim-codex-logs --yes
 codexd diagnostics export
 ```
 

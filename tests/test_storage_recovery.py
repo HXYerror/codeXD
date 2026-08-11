@@ -21,7 +21,7 @@ from codexd.domain.conversations import (
     WebSearchMode,
 )
 from codexd.domain.events import NormalizedEvent
-from codexd.domain.ids import canonical_json
+from codexd.domain.ids import canonical_json, sha256_text
 from codexd.domain.schedules import MisfirePolicy, ScheduleKind, ScheduleState
 from codexd.domain.turns import (
     InterruptOrigin,
@@ -364,17 +364,12 @@ def test_tool_progress_updates_are_durably_throttled_and_terminal_is_immediate(
         """,
         (f"turn:{turn.id}:progress",),
     )
-    first_stream = json.loads(str(rows[-3]["payload_json"]))
-    second_stream = json.loads(str(rows[-2]["payload_json"]))
+    assert len(rows) == 2
     terminal = json.loads(str(rows[-1]["payload_json"]))
-    assert int(rows[-3]["next_attempt_at"]) == 11_000
-    assert int(rows[-2]["next_attempt_at"]) == 11_000
-    assert rows[-2]["state"] == "superseded"
+    assert rows[0]["state"] == "sent"
     assert int(rows[-1]["next_attempt_at"]) == 10_030
-    assert first_stream["content"].endswith("`first`")
-    assert second_stream["content"].endswith("`first second`")
     assert terminal["state"] == "terminal"
-    assert terminal["plain_text"] == ""
+    assert "plain_text" not in terminal
 
 
 def test_assistant_text_stays_plain_and_does_not_replace_tool_progress(
@@ -421,8 +416,9 @@ def test_assistant_text_stays_plain_and_does_not_replace_tool_progress(
     )
     assert after_answer is not None
     answer_payload = json.loads(str(after_answer["payload_json"]))
-    assert answer_payload["content"] == "Running · command: `pytest -q`"
-    assert answer_payload["plain_text"] == "Normal Markdown response"
+    assert answer_payload["content"] == "Running · Codex command"
+    assert "plain_text" not in answer_payload
+    assert sink.volatile_turns.preview(turn.id) == "Normal Markdown response"
     assert "Normal Markdown response" not in answer_payload["content"]
 
     sink.record(
@@ -447,7 +443,221 @@ def test_assistant_text_stays_plain_and_does_not_replace_tool_progress(
     assert after_tool is not None
     tool_payload = json.loads(str(after_tool["payload_json"]))
     assert tool_payload["content"] == "Running · applying Codex file changes"
-    assert tool_payload["plain_text"] == "Normal Markdown response"
+    assert "plain_text" not in tool_payload
+
+
+def test_high_volume_stream_detail_is_projection_only(
+    storage_context: StorageContext,
+) -> None:
+    turn, lease = _running_turn(storage_context, "bounded-stream-detail")
+    sink = ProjectingEventSink(
+        storage_context.store,
+        correlation_key=b"z" * 32,
+        stream_update_ms=1000,
+    )
+    assistant_text = "".join(f"chunk-{index:04d};" for index in range(500))
+    for index in range(500):
+        sink.record(
+            turn_id=turn.id,
+            runtime_generation=lease.generation,
+            event=NormalizedEvent(
+                "assistant.text.delta",
+                {"item_id": "assistant-1", "text": f"chunk-{index:04d};"},
+            ),
+        )
+    for index in range(100):
+        sink.record(
+            turn_id=turn.id,
+            runtime_generation=lease.generation,
+            event=NormalizedEvent(
+                "command.output.delta",
+                {"item_id": "command-1", "text": (f"secret-{index};" * 200)},
+            ),
+        )
+        sink.record(
+            turn_id=turn.id,
+            runtime_generation=lease.generation,
+            event=NormalizedEvent(
+                "diff.updated",
+                {"diff": f"diff-version-{index}\n" + ("x" * 4096)},
+            ),
+        )
+
+    counts = {
+        str(row["kind"]): int(row["count"])
+        for row in storage_context.store.query_all(
+            """
+            SELECT kind, COUNT(*) AS count
+            FROM events WHERE turn_id = ?
+            GROUP BY kind
+            """,
+            (turn.id,),
+        )
+    }
+    assert counts == {}
+    persisted = storage_context.store.query_all(
+        """
+        SELECT kind, payload_json FROM events
+        WHERE turn_id = ?
+        """,
+        (turn.id,),
+    )
+    assert all("secret-" not in str(row["payload_json"]) for row in persisted)
+
+    sink.record(
+        turn_id=turn.id,
+        runtime_generation=lease.generation,
+        event=NormalizedEvent(
+            "assistant.message.completed",
+            {
+                "item_id": "assistant-1",
+                "phase": "final_answer",
+                "text": assistant_text,
+            },
+            provider_event_id="assistant-1-completed",
+        ),
+    )
+    sink.record(
+        turn_id=turn.id,
+        runtime_generation=lease.generation,
+        event=NormalizedEvent(
+            "command.completed",
+            {
+                "item_id": "command-1",
+                "command": "bounded command",
+                "status": "completed",
+                "exit_code": 0,
+                "output": "bounded final output",
+            },
+            provider_event_id="command-1-completed",
+        ),
+    )
+    sink.record(
+        turn_id=turn.id,
+        runtime_generation=lease.generation,
+        event=NormalizedEvent(
+            "turn.completed",
+            {"provider_turn_id": "bounded-provider", "status": "completed"},
+            provider_event_id="bounded-turn-completed",
+        ),
+    )
+
+    final_content = sink.volatile_turns.final(turn.id)
+    assert final_content is not None
+    assert final_content.final_answer_text == assistant_text
+    journal = storage_context.store.query_all(
+        """
+        SELECT kind FROM events
+        WHERE turn_id = ?
+        ORDER BY sequence
+        """,
+        (turn.id,),
+    )
+    assert [row["kind"] for row in journal] == [
+        "turn.activity",
+        "turn.completed",
+    ]
+    progress_rows = storage_context.store.query_all(
+        "SELECT id FROM discord_outbox WHERE coalesce_key = ?",
+        (f"turn:{turn.id}:progress",),
+    )
+    assert len(progress_rows) == 1
+    assert (
+        storage_context.repository.latest_event_payload_for_turn(
+            turn.id,
+            "diff.updated",
+        )
+        is None
+    )
+
+
+def test_prompt_and_assistant_sentinels_never_appear_anywhere_in_sqlite(
+    storage_context: StorageContext,
+) -> None:
+    prompt = "PROMPT_SENTINEL_7f51a932_DO_NOT_PERSIST"
+    assistant = "ASSISTANT_SENTINEL_a81c47de_DO_NOT_PERSIST"
+    _activate_schedule_target(storage_context, "privacy-boundary")
+    turn = storage_context.repository.enqueue_turn(
+        conversation_id=storage_context.conversation.id,
+        source=TurnSource.DISCORD,
+        turn_input=TurnInput(text=prompt),
+        input_message_id="privacy-boundary-message",
+    )
+    lease = storage_context.repository.create_runtime_lease(
+        scope_kind="project",
+        scope_key=storage_context.project.id,
+        project_id=storage_context.project.id,
+        environment_hash="privacy-boundary-environment",
+    )
+    storage_context.repository.mark_runtime_ready(
+        lease.id,
+        sdk_version="sdk",
+        runtime_version="runtime",
+        capability_hash="privacy-boundary-capabilities",
+    )
+    storage_context.repository.claim_turn(
+        turn.id,
+        runtime_lease_id=lease.id,
+        runtime_generation=lease.generation,
+    )
+    storage_context.repository.mark_turn_running(turn.id, "privacy-provider-turn")
+    sink = ProjectingEventSink(storage_context.store, correlation_key=b"q" * 32)
+    sink.record(
+        turn_id=turn.id,
+        runtime_generation=lease.generation,
+        event=NormalizedEvent(
+            "assistant.text.completed",
+            {
+                "item_id": "privacy-answer",
+                "phase": "final_answer",
+                "text": assistant,
+            },
+            provider_event_id="privacy-answer-completed",
+        ),
+    )
+    sink.record(
+        turn_id=turn.id,
+        runtime_generation=lease.generation,
+        event=NormalizedEvent(
+            "command.completed",
+            {
+                "item_id": "privacy-command",
+                "command": assistant,
+                "output": assistant,
+                "status": "completed",
+                "exit_code": 0,
+            },
+            provider_event_id="privacy-command-completed",
+        ),
+    )
+    sink.record(
+        turn_id=turn.id,
+        runtime_generation=lease.generation,
+        event=NormalizedEvent(
+            "turn.completed",
+            {"provider_turn_id": "privacy-provider-turn", "status": "completed"},
+            provider_event_id="privacy-turn-completed",
+        ),
+    )
+    created, _outbox_id = storage_context.repository.request_thread_creation(
+        discord_message_id="987654321",
+        content_hash=sha256_text(prompt),
+        attachment_manifest_hash=sha256_text("[]"),
+        first_request_text=prompt,
+        has_image_attachment=False,
+        project_id=storage_context.project.id,
+        discord_guild_id=100,
+        discord_channel_id=200,
+        owner_user_id=400,
+        boot_id="privacy-boundary",
+    )
+
+    final = sink.volatile_turns.final(turn.id)
+    assert created
+    assert final is not None and final.visible_text == assistant
+    dump = "\n".join(storage_context.store.connection.iterdump())
+    assert prompt not in dump
+    assert assistant not in dump
 
 
 def test_completed_assistant_item_coalesces_matching_delta_item(
@@ -492,12 +702,7 @@ def test_completed_assistant_item_coalesces_matching_delta_item(
         ),
     )
 
-    projection = storage_context.store.query_one(
-        "SELECT content_ast_json, plain_text FROM message_projections WHERE turn_id = ?",
-        (turn.id,),
-    )
-    assert projection is not None
-    ast = json.loads(str(projection["content_ast_json"]))
+    ast = sink.volatile_turns.content_ast(turn.id)
     text_blocks = [block for block in ast["blocks"] if block["kind"] == "text"]
     assert text_blocks == [
         {
@@ -508,7 +713,7 @@ def test_completed_assistant_item_coalesces_matching_delta_item(
             "completed": True,
         }
     ]
-    assert projection["plain_text"] == text
+    assert sink.volatile_turns.preview(turn.id) == text
     latest_progress = storage_context.store.query_one(
         """
         SELECT payload_json
@@ -520,7 +725,10 @@ def test_completed_assistant_item_coalesces_matching_delta_item(
         (f"turn:{turn.id}:progress",),
     )
     assert latest_progress is not None
-    assert json.loads(str(latest_progress["payload_json"]))["plain_text"] == text
+    assert "plain_text" not in json.loads(str(latest_progress["payload_json"]))
+    assert storage_context.store.query_one(
+        "SELECT 1 FROM message_projections WHERE turn_id = ?", (turn.id,)
+    ) is None
 
 
 def test_independent_completed_assistant_items_keep_repeated_text(
@@ -543,22 +751,17 @@ def test_independent_completed_assistant_items_keep_repeated_text(
             ),
         )
 
-    projection = storage_context.store.query_one(
-        "SELECT content_ast_json, plain_text FROM message_projections WHERE turn_id = ?",
-        (turn.id,),
-    )
-    assert projection is not None
-    ast = json.loads(str(projection["content_ast_json"]))
+    ast = sink.volatile_turns.content_ast(turn.id)
     assert [block["item_id"] for block in ast["blocks"]] == [
         "first-item",
         "second-item",
     ]
-    assert projection["plain_text"] == (
+    assert sink.volatile_turns.preview(turn.id) == (
         "Intentionally repeated.\n\nIntentionally repeated."
     )
 
 
-def test_terminal_projection_persists_full_visible_assistant_transcript(
+def test_terminal_transcript_remains_volatile_and_outbox_is_metadata_only(
     storage_context: StorageContext,
 ) -> None:
     turn, lease = _running_turn(storage_context, "visible-transcript")
@@ -607,18 +810,15 @@ def test_terminal_projection_persists_full_visible_assistant_transcript(
 
     expected = "\n\n".join((*commentary, final_answer))
     assert len(expected) > 2_386
-    projection = storage_context.store.query_one(
-        "SELECT content_ast_json, plain_text, is_final FROM message_projections "
-        "WHERE turn_id = ?",
-        (turn.id,),
-    )
-    assert projection is not None
-    assert projection["plain_text"] == expected
-    assert projection["is_final"] == 1
-    ast = json.loads(str(projection["content_ast_json"]))
-    assert len(ast["blocks"]) == 17
-    assert storage_context.repository.turn_output(turn.id) == expected
-    assert storage_context.repository.turn_final_answer(turn.id) == final_answer
+    volatile = sink.volatile_turns.final(turn.id)
+    assert volatile is not None
+    assert volatile.visible_text == expected
+    assert volatile.final_answer_text == final_answer
+    assert storage_context.repository.turn_output(turn.id) is None
+    assert storage_context.repository.turn_final_answer(turn.id) is None
+    assert storage_context.store.query_one(
+        "SELECT 1 FROM message_projections WHERE turn_id = ?", (turn.id,)
+    ) is None
 
     final = storage_context.store.query_one(
         "SELECT payload_json FROM discord_outbox WHERE dedupe_key = ?",
@@ -626,9 +826,10 @@ def test_terminal_projection_persists_full_visible_assistant_transcript(
     )
     assert final is not None
     payload = json.loads(str(final["payload_json"]))
-    assert payload["visible_text"] == expected
-    assert payload["final_answer_text"] == final_answer
-    assert "plain_text" not in payload
+    assert payload["content_storage"] == "volatile"
+    assert "visible_text" not in payload
+    assert "final_answer_text" not in payload
+    assert expected not in str(final["payload_json"])
 
 
 def test_terminal_transcript_filters_partial_and_keeps_canonical_final_last(
@@ -682,11 +883,10 @@ def test_terminal_transcript_filters_partial_and_keeps_canonical_final_last(
             "Canonical final block",
         )
     )
-    assert storage_context.repository.turn_output(turn.id) == expected
-    assert (
-        storage_context.repository.turn_final_answer(turn.id)
-        == "Canonical final block"
-    )
+    volatile = sink.volatile_turns.final(turn.id)
+    assert volatile is not None
+    assert volatile.visible_text == expected
+    assert volatile.final_answer_text == "Canonical final block"
     assert "HIDDEN REASONING" not in expected
     assert "INCOMPLETE CONTENT" not in expected
     assert "Turn failed." not in expected
@@ -753,10 +953,12 @@ def test_terminal_transcript_appends_fallback_without_promoting_commentary(
         ),
     )
 
-    assert storage_context.repository.turn_output(turn.id) == (
+    volatile = sink.volatile_turns.final(turn.id)
+    assert volatile is not None
+    assert volatile.visible_text == (
         f"Visible work summary\n\n{expected_fallback}"
     )
-    assert storage_context.repository.turn_final_answer(turn.id) is None
+    assert volatile.final_answer_text is None
 
 
 def test_legacy_phase_less_final_is_kept_once_and_moved_last(
@@ -791,15 +993,14 @@ def test_legacy_phase_less_final_is_kept_once_and_moved_last(
     expected = (
         "Older legacy message\n\nCommentary after legacy\n\nSelected legacy final"
     )
-    assert storage_context.repository.turn_output(turn.id) == expected
-    assert (
-        storage_context.repository.turn_final_answer(turn.id)
-        == "Selected legacy final"
-    )
+    volatile = sink.volatile_turns.final(turn.id)
+    assert volatile is not None
+    assert volatile.visible_text == expected
+    assert volatile.final_answer_text == "Selected legacy final"
     assert expected.count("Selected legacy final") == 1
 
 
-def test_local_terminal_preserves_completed_commentary_and_excludes_partial(
+def test_local_terminal_does_not_recover_volatile_assistant_content(
     storage_context: StorageContext,
 ) -> None:
     turn, lease = _running_turn(storage_context, "local-visible-transcript")
@@ -832,11 +1033,7 @@ def test_local_terminal_preserves_completed_commentary_and_excludes_partial(
         failure_code="runtime_crashed",
     ) == (turn.id,)
 
-    expected = (
-        "Durable commentary before runtime loss\n\n"
-        "Turn interrupted: `runtime_lost`."
-    )
-    assert storage_context.repository.turn_output(turn.id) == expected
+    assert storage_context.repository.turn_output(turn.id) is None
     assert storage_context.repository.turn_final_answer(turn.id) is None
     final = storage_context.store.query_one(
         "SELECT payload_json FROM discord_outbox WHERE dedupe_key = ?",
@@ -844,12 +1041,13 @@ def test_local_terminal_preserves_completed_commentary_and_excludes_partial(
     )
     assert final is not None
     payload = json.loads(str(final["payload_json"]))
-    assert payload["visible_text"] == expected
-    assert payload["final_answer_text"] is None
-    assert "partial after commentary" not in payload["visible_text"]
+    assert payload["content_storage"] == "none"
+    assert "visible_text" not in payload
+    assert "final_answer_text" not in payload
+    assert "partial after commentary" not in str(final["payload_json"])
 
 
-def test_streaming_projection_survives_every_delta_boundary_and_restart(
+def test_streaming_content_is_process_local_and_does_not_survive_store_replacement(
     storage_context: StorageContext,
 ) -> None:
     turn, lease = _running_turn(storage_context, "stream-restart")
@@ -857,13 +1055,14 @@ def test_streaming_projection_survives_every_delta_boundary_and_restart(
         "Before\n\n```python\nprint('x')\n```\n\n"
         "| A | B |\n| --- | --- |\n| 中， | 😀 |\n"  # noqa: RUF001
     )
+    sink = ProjectingEventSink(
+        storage_context.store,
+        correlation_key=b"d" * 32,
+        stream_update_ms=1500,
+    )
     prefix = ""
     for index, character in enumerate(source):
-        ProjectingEventSink(
-            storage_context.store,
-            correlation_key=b"d" * 32,
-            stream_update_ms=1500,
-        ).record(
+        sink.record(
             turn_id=turn.id,
             runtime_generation=lease.generation,
             event=NormalizedEvent(
@@ -873,17 +1072,13 @@ def test_streaming_projection_survives_every_delta_boundary_and_restart(
             ),
         )
         prefix += character
-        projection = storage_context.store.query_one(
-            "SELECT plain_text FROM message_projections WHERE turn_id = ?",
-            (turn.id,),
-        )
-        assert projection is not None
-        assert projection["plain_text"] == prefix
-    sink = ProjectingEventSink(
+        assert sink.volatile_turns.preview(turn.id) == prefix
+    replacement = ProjectingEventSink(
         storage_context.store,
         correlation_key=b"d" * 32,
         stream_update_ms=1500,
     )
+    assert replacement.volatile_turns.preview(turn.id) == ""
     sink.record(
         turn_id=turn.id,
         runtime_generation=lease.generation,
@@ -906,14 +1101,10 @@ def test_streaming_projection_survives_every_delta_boundary_and_restart(
         ),
     )
 
-    projection = storage_context.store.query_one(
-        "SELECT plain_text, is_final FROM message_projections WHERE turn_id = ?",
-        (turn.id,),
-    )
-    assert projection is not None
-    assert projection["plain_text"] == source
-    assert projection["is_final"] == 1
-    blocks = MarkdownContentParser().parse(str(projection["plain_text"]))
+    volatile = sink.volatile_turns.final(turn.id)
+    assert volatile is not None
+    assert volatile.visible_text == source
+    blocks = MarkdownContentParser().parse(volatile.visible_text)
     assert any(isinstance(block, CodeBlock) for block in blocks)
     assert any(isinstance(block, TableBlock) for block in blocks)
 
@@ -1012,7 +1203,8 @@ def test_optional_provider_item_families_project_without_unknown_fallback(
     )
     assert tool is not None
     assert (tool["kind"], tool["state"]) == ("image_generation", "completed")
-    assert "<project>/generated.png" in str(tool["summary_json"])
+    assert "<project>/generated.png" not in str(tool["summary_json"])
+    assert json.loads(str(tool["summary_json"]))["has_saved_path"] is True
     incident = storage_context.store.query_one(
         """
         SELECT code FROM incidents
@@ -1196,9 +1388,12 @@ def test_routed_event_families_project_without_unknown_fallback(
         (str(row["kind"]), str(row["provider_item_id"])): row for row in tools
     }
     command = indexed[("command", "command")]
-    assert (command["label"], command["state"]) == ("printf ok", "completed")
+    assert (command["label"], command["state"]) == ("command", "completed")
     command_summary = json.loads(str(command["summary_json"]))
-    assert command_summary["command"] == "printf ok"
+    assert command_summary["command_hash"] == hashlib.sha256(
+        b"printf ok"
+    ).hexdigest()
+    assert command_summary["command_size"] == len(b"printf ok")
     assert command_summary["stdin_hash"] == "b" * 64
     assert indexed[("file_change", "patch")]["state"] == "started"
     assert indexed[("mcp", "mcp")]["label"] == "tool"
@@ -1272,7 +1467,7 @@ def test_channel_binding_migration_preserves_legacy_conversation_identity(
             )
 
         monkeypatch.setattr(sqlite_module, "_load_migrations", lambda: migrations)
-        assert store.migrate() == 20
+        assert store.migrate() == 22
         assert store.foreign_key_check() == ()
         repository = Repository(store)
         project = repository.get_project("legacy-project")
@@ -1403,7 +1598,7 @@ def test_terminal_progress_cleanup_migration_preserves_rollout_boundary(
         )
 
         monkeypatch.setattr(sqlite_module, "_load_migrations", lambda: migrations)
-        assert store.migrate() == 20
+        assert store.migrate() == 22
         active_row = store.query_one(
             """
             SELECT discord_message_id, cleanup_state, deleted_at
@@ -1577,7 +1772,7 @@ def test_component_scope_migrations_expire_and_guard_legacy_pending_drafts(
             )
 
         monkeypatch.setattr(sqlite_module, "_load_migrations", lambda: migrations)
-        assert store.migrate() == 20
+        assert store.migrate() == 22
         row = store.query_one(
             """
             SELECT state, discord_guild_id, discord_channel_id
@@ -1701,7 +1896,7 @@ def test_turn_enqueue_sequence_migration_backfills_existing_turns(
                 )
 
         monkeypatch.setattr(sqlite_module, "_load_migrations", lambda: migrations)
-        assert store.migrate() == 20
+        assert store.migrate() == 22
         repository = Repository(store)
         third = repository.enqueue_turn(
             conversation_id="upgrade-conversation",
@@ -1808,7 +2003,7 @@ def test_schedule_fire_turn_fk_upgrade_preserves_pairs(
             )
 
         monkeypatch.setattr(sqlite_module, "_load_migrations", lambda: migrations)
-        assert store.migrate() == 20
+        assert store.migrate() == 22
         assert store.foreign_key_check() == ()
         fire_fks = store.query_all("PRAGMA foreign_key_list(schedule_fires)")
         assert any(
@@ -1937,7 +2132,7 @@ def test_startup_never_replays_provider_or_discord_turns(
         assert storage_context.store.query_one(
             "SELECT 1 FROM message_projections WHERE turn_id = ? AND is_final = 1",
             (turn_id,),
-        )
+        ) is None
         assert storage_context.store.query_one(
             "SELECT 1 FROM discord_outbox WHERE dedupe_key = ?",
             (f"turn:{turn_id}:final",),
@@ -2196,10 +2391,15 @@ def test_ingress_completion_is_atomic_with_turn_enqueue(
         """,
         (f"turn:{turn.id}:prompt-reaction",),
     )
-    assert [
-        (row["state"], json.loads(str(row["payload_json"]))["state"])
-        for row in terminal_reactions
-    ] == [("superseded", "waiting"), ("pending", "failed")]
+    assert [row["state"] for row in terminal_reactions] == [
+        "superseded",
+        "pending",
+    ]
+    assert json.loads(str(terminal_reactions[0]["payload_json"])) == {
+        "kind": "retained_tombstone",
+        "original_kind": "prompt_reaction",
+    }
+    assert json.loads(str(terminal_reactions[1]["payload_json"]))["state"] == "failed"
 
 
 def test_starter_prompt_reaction_targets_parent_channel(
@@ -2336,7 +2536,7 @@ def test_discord_thread_delete_tombstones_pending_work(
         WHERE turn_id = ? AND is_final = 1
         """,
         (turn.id,),
-    )
+    ) is None
     assert storage_context.store.query_one(
         "SELECT 1 FROM discord_outbox WHERE dedupe_key = ?",
         (f"turn:{turn.id}:final",),
@@ -2468,13 +2668,15 @@ def test_thread_creation_intent_is_durable_and_idempotent(
     assert set(payload) == {
         "expected_thread_id",
         "kind",
-        "name",
+        "name_strategy",
+        "name_suffix",
         "owner_user_id",
         "project_id",
         "starter_message_id",
     }
-    assert payload["name"] == f"inspect durable storage · {ingress.id[:4]}"
-    assert 1 <= len(payload["name"]) <= 100
+    assert payload["name_strategy"] == "starter_message"
+    assert payload["name_suffix"] == ingress.id[:4]
+    assert "inspect durable storage" not in outbox.payload_json
 
     conversation = repository.finalize_thread_creation(
         discord_message_id="301",
@@ -2538,7 +2740,8 @@ def test_fresh_image_only_thread_creation_uses_image_title(
     outbox = repository.claim_outbox(worker_id="worker")
     assert outbox is not None
     payload = json.loads(outbox.payload_json)
-    assert payload["name"] == f"图片任务 · {ingress.id[:4]}"
+    assert payload["name_strategy"] == "starter_message"
+    assert payload["name_suffix"] == ingress.id[:4]
 
 
 def test_thread_creation_title_is_redacted_bounded_and_only_persists_safe_name(
@@ -2570,19 +2773,17 @@ def test_thread_creation_title_is_redacted_bounded_and_only_persists_safe_name(
     outbox = repository.claim_outbox(worker_id="worker")
     assert outbox is not None
     payload = json.loads(outbox.payload_json)
-    summary, suffix = payload["name"].rsplit(" · ", 1)
-    assert suffix == ingress.id[:4]
-    assert 1 <= len(summary) <= 72
-    assert len(payload["name"]) <= 100
+    assert payload["name_strategy"] == "starter_message"
+    assert payload["name_suffix"] == ingress.id[:4]
     assert raw_request not in outbox.payload_json
     assert str(storage_context.root) not in outbox.payload_json
     assert secret not in outbox.payload_json
     assert github_pat not in outbox.payload_json
-    assert "<redacted>" in payload["name"]
     assert set(payload) == {
         "expected_thread_id",
         "kind",
-        "name",
+        "name_strategy",
+        "name_suffix",
         "owner_user_id",
         "project_id",
         "starter_message_id",
@@ -2624,13 +2825,9 @@ def test_thread_creation_title_redacts_security_detection_bypasses(
     outbox = storage_context.repository.claim_outbox(worker_id="worker")
     assert outbox is not None
     payload = json.loads(outbox.payload_json)
-    summary, _ = payload["name"].rsplit(" · ", 1)
-    assert summary == (
-        "API_KEY=<redacted> API_KEY+=<redacted> "
-        "<redacted> <project> <home>"
-    )
+    assert payload["name_strategy"] == "starter_message"
     assert all(
-        value not in payload["name"]
+        value not in outbox.payload_json
         for value in (
             line_secret,
             tab_secret,
@@ -2671,12 +2868,7 @@ def test_thread_creation_title_redacts_credentials_next_to_chinese_prose(
     outbox = storage_context.repository.claim_outbox(worker_id="worker")
     assert outbox is not None
     payload = json.loads(outbox.payload_json)
-    summary, _ = payload["name"].rsplit(" · ", 1)
-    assert summary == (
-        "请轮换<redacted>密钥 "
-        "请用Bearer <redacted> "
-        "检查<home>/private"
-    )
+    assert payload["name_strategy"] == "starter_message"
     assert all(value not in outbox.payload_json for value in (token, auth, home))
     assert raw_request not in outbox.payload_json
 
@@ -2743,9 +2935,13 @@ def test_local_terminal_projection_is_complete_and_unblocked_by_dead_progress(
         (f"turn:{turn.id}:final",),
     )
     assert event is not None and event["kind"] == "runtime.local_terminal"
-    assert projection is not None and projection["is_final"] == 1
-    assert "cancelled_before_start" in projection["plain_text"]
+    assert projection is None
     assert final is not None and final["depends_on_outbox_id"] is not None
+    final_payload = storage_context.store.query_one(
+        "SELECT payload_json FROM discord_outbox WHERE id = ?", (final["id"],)
+    )
+    assert final_payload is not None
+    assert json.loads(str(final_payload["payload_json"]))["content_storage"] == "none"
 
     progress = repository.claim_outbox(worker_id="worker")
     assert progress is not None
@@ -3347,8 +3543,7 @@ def test_terminal_progress_reconciles_running_send_before_terminal_revision(
         "SELECT state FROM discord_outbox WHERE id = ?",
         (running.id,),
     )
-    assert sent is not None
-    assert sent["state"] == "sent"
+    assert sent is None
 
 
 def test_permanent_discord_failure_blocks_conversation_and_records_incident(
@@ -3491,13 +3686,10 @@ def test_runtime_loss_and_shutdown_create_terminal_projections(
         terminal = repository.get_turn(turn_id)
         assert terminal.state is TurnState.INTERRUPTED
         assert terminal.terminal_code == code
-        projection = storage_context.store.query_one(
-            "SELECT plain_text, is_final FROM message_projections WHERE turn_id = ?",
+        assert storage_context.store.query_one(
+            "SELECT 1 FROM message_projections WHERE turn_id = ?",
             (turn_id,),
-        )
-        assert projection is not None
-        assert projection["is_final"] == 1
-        assert code in projection["plain_text"]
+        ) is None
         assert storage_context.store.query_one(
             "SELECT 1 FROM discord_outbox WHERE dedupe_key = ?",
             (f"turn:{turn_id}:final",),
@@ -3549,10 +3741,10 @@ def test_runtime_claim_and_events_are_fenced_after_lease_invalidation(
     )
     repository.mark_runtime_unhealthy(lease.id, failure_code="runtime_crashed")
     before = storage_context.store.query_one(
-        "SELECT plain_text, content_revision FROM message_projections WHERE turn_id = ?",
+        "SELECT 1 FROM message_projections WHERE turn_id = ?",
         (turn.id,),
     )
-    assert before is not None
+    assert before is None
 
     recorded = ProjectingEventSink(
         storage_context.store,
@@ -3568,12 +3760,11 @@ def test_runtime_claim_and_events_are_fenced_after_lease_invalidation(
     )
 
     after = storage_context.store.query_one(
-        "SELECT plain_text, content_revision FROM message_projections WHERE turn_id = ?",
+        "SELECT 1 FROM message_projections WHERE turn_id = ?",
         (turn.id,),
     )
     assert recorded.sequence is None
-    assert after is not None
-    assert dict(after) == dict(before)
+    assert after is None
     assert storage_context.store.query_one(
         """
         SELECT 1 FROM events
@@ -3581,13 +3772,6 @@ def test_runtime_claim_and_events_are_fenced_after_lease_invalidation(
         """,
         (turn.id,),
     ) is None
-    assert storage_context.store.query_one(
-        """
-        SELECT 1 FROM incidents
-        WHERE turn_id = ? AND code = 'late_terminal_runtime_event'
-        """,
-        (turn.id,),
-    )
     queued = repository.enqueue_turn(
         conversation_id=storage_context.conversation.id,
         source=TurnSource.DISCORD,
@@ -3707,10 +3891,10 @@ def test_adapter_redaction_reaches_projection_and_outbox(
     )
     assert completed.terminal == (TurnState.COMPLETED, "provider_completed")
     assert secret not in persisted
-    assert "<redacted>" in persisted
+    assert "answer" not in persisted
 
 
-def test_turn_input_summary_is_redacted_and_bounded(
+def test_turn_input_summary_contains_only_byte_length(
     storage_context: StorageContext,
 ) -> None:
     secret = "sk-0123456789abcdef0123456789abcdef"
@@ -3729,15 +3913,12 @@ def test_turn_input_summary_is_redacted_and_bounded(
 
     assert secret not in turn.input_summary
     assert str(storage_context.root) not in turn.input_summary
-    assert "<project>" in turn.input_summary
-    assert "Authorization:" in turn.input_summary
-    assert "<redacted>" in turn.input_summary
-    assert "\n" not in turn.input_summary
-    assert len(turn.input_summary) <= 180
-    assert turn.input_summary.endswith("...")
+    assert turn.input_summary == (
+        f"[content not retained; {len(prompt.strip().encode())} bytes]"
+    )
 
 
-def test_turn_recorded_diff_falls_back_to_completed_file_changes(
+def test_turn_diff_content_is_not_recoverable_from_the_event_journal(
     storage_context: StorageContext,
 ) -> None:
     repository = storage_context.repository
@@ -3803,9 +3984,7 @@ def test_turn_recorded_diff_falls_back_to_completed_file_changes(
         ),
     )
 
-    assert repository.turn_recorded_diff(turn.id) == (
-        "# update: src/example.py\n@@ -1 +1 @@\n-old\n+new"
-    )
+    assert repository.turn_recorded_diff(turn.id) is None
 
     repository.append_event(
         project_id=storage_context.project.id,
@@ -3818,9 +3997,15 @@ def test_turn_recorded_diff_falls_back_to_completed_file_changes(
             payload={"diff": "diff --git a/src/example.py b/src/example.py\n+aggregate"},
         ),
     )
-    assert repository.turn_recorded_diff(turn.id) == (
-        "diff --git a/src/example.py b/src/example.py\n+aggregate"
+    assert repository.turn_recorded_diff(turn.id) is None
+    payloads = "\n".join(
+        str(row["payload_json"])
+        for row in storage_context.store.query_all(
+            "SELECT payload_json FROM events WHERE turn_id = ?", (turn.id,)
+        )
     )
+    assert "src/example.py" not in payloads
+    assert "+aggregate" not in payloads
 
 
 def test_projection_key_change_fails_closed(
@@ -4227,10 +4412,10 @@ def test_activity_only_subagents_create_and_finalize_task_cards(
             "source_type": "subagent_activity",
             "state": "running",
             "display_title": f"Codex subagent · agent-{ordinal}",
-            "safe_status_summary": f"started · role-{ordinal} · Task {ordinal}",
+            "safe_status_summary": "subagent · started",
             "agent_label": f"agent-{ordinal}",
             "agent_state": "running",
-            "safe_message": f"role-{ordinal} · Task {ordinal}",
+            "safe_message": None,
         }
         for ordinal in range(1, 4)
     ]
@@ -4270,8 +4455,8 @@ def test_activity_only_subagents_create_and_finalize_task_cards(
     )
     assert updated is not None
     assert dict(updated) == {
-        "safe_status_summary": "interacted · role-2 · Updated task 2",
-        "safe_message": "role-2 · Updated task 2",
+        "safe_status_summary": "subagent · interacted",
+        "safe_message": None,
     }
 
     sink.record(
@@ -4468,7 +4653,7 @@ def test_task_card_scope_and_terminal_revision_are_durable(
         "provider_agent_thread_hash_version": 1,
         "agent_label": "agent-1",
         "state": "running",
-        "safe_message": "Running focused checks",
+        "safe_message": None,
     }
     repository.set_task_card_message(view_id, "501")
 
@@ -4583,13 +4768,13 @@ def test_task_card_scope_and_terminal_revision_are_durable(
             "agent_label": "agent-1",
             "provider_agent_thread_hash": expected_agent_hash,
             "state": "completed",
-            "safe_message": "Focused checks complete",
+            "safe_message": None,
         },
         {
             "agent_label": "agent-2",
             "provider_agent_thread_hash": expected_agent_a_hash,
             "state": "running",
-            "safe_message": "Running new checks",
+            "safe_message": None,
         },
     ]
 
@@ -4681,9 +4866,9 @@ def test_task_card_scope_and_terminal_revision_are_durable(
         (f"task-card:{task_id}",),
     )
     assert [dict(row) for row in task_outbox] == [
-        {"state": "superseded", "revision": 1},
-        {"state": "superseded", "revision": 2},
-        {"state": "superseded", "revision": 3},
+        {"state": "superseded", "revision": None},
+        {"state": "superseded", "revision": None},
+        {"state": "superseded", "revision": None},
         {"state": "pending", "revision": terminal_revision},
     ]
 

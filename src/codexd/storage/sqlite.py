@@ -193,6 +193,22 @@ class SQLiteStore:
             raise StorageError("database WAL checkpoint returned no result")
         return int(row[0]), int(row[1]), int(row[2])
 
+    def vacuum(self) -> None:
+        with self._lock:
+            try:
+                checkpoint = self.checkpoint("TRUNCATE")
+                if checkpoint[0] != 0:
+                    raise StorageError("database WAL checkpoint is busy")
+                self.connection.execute("VACUUM")
+                self.connection.execute("PRAGMA optimize")
+                checkpoint = self.checkpoint("TRUNCATE")
+                if checkpoint[0] != 0:
+                    raise StorageError("database WAL checkpoint is busy after vacuum")
+            except StorageError:
+                raise
+            except sqlite3.Error as exc:
+                raise StorageError(f"database vacuum failed: {exc}") from exc
+
     def backup(self, destination: Path) -> Path:
         source = self.path.resolve()
         target_path = destination.expanduser().resolve()

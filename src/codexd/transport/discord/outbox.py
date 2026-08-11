@@ -14,19 +14,20 @@ from typing import Any, Literal, Protocol, overload
 
 import discord
 
-from codexd.domain.ids import canonical_json, sha256_text, utc_now_ms
+from codexd.application.volatile_turns import VolatileTurnStore
+from codexd.domain.ids import sha256_text, utc_now_ms
 from codexd.errors import CodexDError, InvariantError, NotFoundError
 from codexd.rendering.discord import (
     DISCORD_ATTACHMENT_LIMIT_BYTES,
     AttachmentKind,
     DiscordRenderPlanner,
-    DurableDiscordRenderPlan,
     DurableRenderedAttachment,
     RenderedAttachment,
     split_discord_code,
     split_discord_text,
     suppress_visualization_markers,
 )
+from codexd.security.redaction import safe_thread_title_summary
 from codexd.security.signing import ComponentSigner
 from codexd.storage.records import OutboundImageInvocationRecord, OutboxRecord
 from codexd.storage.repository import Repository
@@ -91,6 +92,7 @@ class OutboxWorker:
         lease_ms: int = 30_000,
         lease_renew_seconds: float = 10.0,
         initial_ingress_ready: Callable[[str], Awaitable[None]] | None = None,
+        acknowledged: Callable[[OutboxRecord], None] | None = None,
     ) -> None:
         if poll_seconds <= 0:
             raise ValueError("outbox poll interval must be positive")
@@ -110,6 +112,7 @@ class OutboxWorker:
         self._lease_ms = lease_ms
         self._lease_renew_seconds = lease_renew_seconds
         self._initial_ingress_ready = initial_ingress_ready
+        self._acknowledged = acknowledged
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
 
@@ -247,6 +250,8 @@ class OutboxWorker:
             turn_progress_id=result.turn_progress_id,
             schedule_draft_id=result.schedule_draft_id,
         )
+        if self._acknowledged is not None:
+            self._acknowledged(record)
         if (
             result.initial_ingress_message_id is not None
             and self._initial_ingress_ready is not None
@@ -354,11 +359,23 @@ class DiscordOutboxTransport:
         repository: Repository,
         renderer: DiscordRenderPlanner,
         signer: ComponentSigner,
+        volatile_turns: VolatileTurnStore | None = None,
     ) -> None:
         self._client = client
         self._repository = repository
         self._renderer = renderer
         self._signer = signer
+        self._volatile_turns = volatile_turns or VolatileTurnStore()
+
+    def acknowledged(self, record: OutboxRecord) -> None:
+        try:
+            payload = json.loads(record.payload_json)
+        except json.JSONDecodeError:
+            return
+        if isinstance(payload, dict) and payload.get("kind") == "turn_final":
+            turn_id = payload.get("turn_id")
+            if isinstance(turn_id, str):
+                self._volatile_turns.discard(turn_id)
 
     async def deliver(self, record: OutboxRecord) -> DeliveryResult:
         try:
@@ -520,14 +537,36 @@ class DiscordOutboxTransport:
         if starter_id != expected_id:
             raise DeliveryError("thread_create_identity_invalid", permanent=True)
         owner_user_id = _snowflake(payload.get("owner_user_id"), "owner_user_id")
-        name = payload.get("name")
-        if not isinstance(name, str) or not name or len(name) > 100:
+        legacy_name = payload.get("name")
+        name_strategy = payload.get("name_strategy")
+        name_suffix = payload.get("name_suffix")
+        if not (
+            isinstance(legacy_name, str)
+            and legacy_name
+            and len(legacy_name) <= 100
+        ) and not (
+            name_strategy == "starter_message"
+            and isinstance(name_suffix, str)
+            and 1 <= len(name_suffix) <= 12
+            and name_suffix.isalnum()
+        ):
             raise DeliveryError("thread_create_name_invalid", permanent=True)
         thread = await self._existing_thread(expected_id)
         if thread is None:
             message = await channel.fetch_message(starter_id)
             thread = message.thread
             if thread is None:
+                name = legacy_name
+                if name_strategy == "starter_message":
+                    title = safe_thread_title_summary(
+                        message.content,
+                        has_image_attachment=any(
+                            (attachment.content_type or "").startswith("image/")
+                            for attachment in message.attachments
+                        ),
+                    )
+                    name = f"{title} · {name_suffix}"
+                assert isinstance(name, str)
                 try:
                     thread = await message.create_thread(
                         name=name,
@@ -648,17 +687,17 @@ class DiscordOutboxTransport:
         record_state: str,
     ) -> DeliveryResult:
         turn_id = payload.get("turn_id")
-        visible_text = payload.get("visible_text", payload.get("plain_text"))
-        final_answer_text = payload.get("final_answer_text")
-        if (
-            not isinstance(turn_id, str)
-            or not isinstance(visible_text, str)
-            or (
-                final_answer_text is not None
-                and not isinstance(final_answer_text, str)
-            )
-        ):
+        if not isinstance(turn_id, str):
             raise DeliveryError("turn_final_payload_invalid", permanent=True)
+        volatile = self._volatile_turns.final(turn_id)
+        visible_text = (
+            volatile.visible_text
+            if volatile is not None
+            else _volatile_final_unavailable(
+                str(payload.get("state", "interrupted")),
+                was_volatile=payload.get("content_storage") == "volatile",
+            )
+        )
         raw_outbound_records = await asyncio.to_thread(
             self._repository.registered_outbound_images,
             turn_id,
@@ -690,70 +729,32 @@ class DiscordOutboxTransport:
             visible_text,
             has_registered_images=bool(outbound_attachments),
         )
-        source_sha256 = (
-            sha256_text(
-                canonical_json(
-                    {
-                        "visible_text": visible_text,
-                        "outbound_images": [
-                            {
-                                "sha256": attachment.sha256,
-                                "filename": attachment.filename,
-                                "description": attachment.description,
-                            }
-                            for attachment in outbound_attachments
-                        ],
-                    }
-                )
+        try:
+            rendered = await self._renderer.render_markdown(visible_text)
+        except (CodexDError, OSError, ValueError):
+            await asyncio.to_thread(
+                self._repository.record_incident,
+                severity="error",
+                code="discord_render_fallback",
+                summary="Discord in-memory rich rendering failed; bounded text was used",
+                turn_id=turn_id,
+                details={"stable_code": "volatile_render_failed"},
             )
-            if outbound_attachments
-            else sha256_text(visible_text)
-        )
-        stored = await asyncio.to_thread(self._repository.render_plan, turn_id)
-        rendered: DurableDiscordRenderPlan
-        if stored is None:
-            try:
-                generated = await self._renderer.create_durable_plan(
+            messages = list(_bounded_plain_text_fallback(visible_text))
+            attachments: list[RenderedAttachment | DurableRenderedAttachment] = list(
+                outbound_attachments
+            )
+        else:
+            messages = list(rendered.messages)
+            attachments = [*rendered.attachments, *outbound_attachments]
+            for code in dict.fromkeys((*rendered.incident_codes, *marker_incidents)):
+                await asyncio.to_thread(
+                    self._repository.record_incident,
+                    severity="warning",
+                    code=code,
+                    summary="Discord in-memory rendering used a bounded fallback",
                     turn_id=turn_id,
-                    source=visible_text,
                 )
-                generated = DurableDiscordRenderPlan(
-                    messages=generated.messages,
-                    attachments=(*generated.attachments, *outbound_attachments),
-                    incident_codes=tuple(
-                        dict.fromkeys((*generated.incident_codes, *marker_incidents))
-                    ),
-                )
-                plan_payload = generated.to_payload(self._renderer.artifact_root)
-            except (CodexDError, OSError, ValueError):
-                rendered = await self._render_fallback_plan(
-                    turn_id=turn_id,
-                    plain_text=visible_text,
-                    stable_code="render_plan_creation_failed",
-                )
-            else:
-                stored = await asyncio.to_thread(
-                    self._repository.persist_render_plan,
-                    turn_id=turn_id,
-                    source_sha256=source_sha256,
-                    plan=plan_payload,
-                    retention_until=utc_now_ms()
-                    + self._renderer.retention_days * 24 * 60 * 60 * 1000,
-                    incident_codes=generated.incident_codes,
-                )
-        if stored is not None:
-            if stored.source_sha256 != source_sha256:
-                raise DeliveryError("turn_final_source_changed", permanent=True)
-            try:
-                rendered = self._renderer.load_durable_plan(stored.plan_json)
-            except (CodexDError, OSError, ValueError):
-                rendered = await self._render_fallback_plan(
-                    turn_id=turn_id,
-                    plain_text=visible_text,
-                    stable_code="render_plan_invalid",
-                )
-        messages = list(rendered.messages)
-        attachments = list(rendered.attachments)
         if not messages and not attachments:
             state = str(payload.get("state", "completed"))
             messages = [
@@ -854,42 +855,12 @@ class DiscordOutboxTransport:
         first = first or footer
         return DeliveryResult(str(first.id) if first else None)
 
-    async def _render_fallback_plan(
-        self,
-        *,
-        turn_id: str,
-        plain_text: str,
-        stable_code: str,
-    ) -> DurableDiscordRenderPlan:
-        await asyncio.to_thread(
-            self._repository.record_incident,
-            severity="error",
-            code="discord_render_fallback",
-            summary="Discord rich rendering failed; bounded plain text was used",
-            turn_id=turn_id,
-            details={"stable_code": stable_code},
-        )
-        if len(_plain_text_fallback_chunks(plain_text)) > 4:
-            try:
-                return await self._renderer.create_plain_text_fallback_plan(
-                    turn_id=turn_id,
-                    source=plain_text,
-                )
-            except (CodexDError, OSError, ValueError):
-                logger.exception(
-                    "Could not persist complete rich-rendering fallback attachment"
-                )
-        return DurableDiscordRenderPlan(
-            messages=_bounded_plain_text_fallback(plain_text),
-            attachments=(),
-        )
-
     async def _deliver_table_attachments(
         self,
         channel: discord.TextChannel | discord.Thread,
         *,
-        source: DurableRenderedAttachment,
-        images: list[DurableRenderedAttachment],
+        source: RenderedAttachment | DurableRenderedAttachment,
+        images: list[RenderedAttachment | DurableRenderedAttachment],
         marker: str,
         record_state: str,
     ) -> discord.Message | None:
@@ -909,7 +880,7 @@ class DiscordOutboxTransport:
                     continue
             include_source = (
                 not source_delivered
-                and image.size_bytes + source.size_bytes
+                and _attachment_size(image) + _attachment_size(source)
                 <= DISCORD_ATTACHMENT_LIMIT_BYTES
             )
             files = [image, source] if include_source else [image]
@@ -959,7 +930,7 @@ class DiscordOutboxTransport:
         self,
         channel: discord.TextChannel | discord.Thread,
         *,
-        source: DurableRenderedAttachment,
+        source: RenderedAttachment | DurableRenderedAttachment,
         marker: str,
         record_state: str,
         reason: str,
@@ -1358,9 +1329,7 @@ class DiscordOutboxTransport:
         content = payload.get("content")
         if not turn_id or not isinstance(content, str) or not content:
             raise DeliveryError("turn_progress_payload_invalid", permanent=True)
-        plain_text = payload.get("plain_text")
-        if plain_text is not None and not isinstance(plain_text, str):
-            raise DeliveryError("turn_progress_payload_invalid", permanent=True)
+        plain_text = self._volatile_turns.preview(turn_id)
         embed = progress_embed(content)
         if operation == "edit":
             message_id = await asyncio.to_thread(
@@ -1373,14 +1342,8 @@ class DiscordOutboxTransport:
                 except discord.NotFound:
                     pass
                 else:
-                    visible_text = (
-                        plain_text
-                        if isinstance(plain_text, str)
-                        else _without_hidden_marker(
-                            message.content
-                            if isinstance(message.content, str)
-                            else ""
-                        )
+                    visible_text = plain_text or _without_hidden_marker(
+                        message.content if isinstance(message.content, str) else ""
                     )
                     await message.edit(
                         content=_with_marker(visible_text, marker),
@@ -1392,7 +1355,7 @@ class DiscordOutboxTransport:
                         str(message.id),
                         turn_progress_id=turn_id,
                     )
-        rendered = _with_marker(plain_text or "", marker)
+        rendered = _with_marker(plain_text, marker)
         if record_state != "pending":
             existing = await self._find_marker(channel, marker)
             if existing is not None:
@@ -1474,14 +1437,19 @@ class DiscordOutboxTransport:
 
 
 def _partition_table_attachments(
-    attachments: list[DurableRenderedAttachment],
+    attachments: list[RenderedAttachment | DurableRenderedAttachment],
 ) -> tuple[
-    list[tuple[DurableRenderedAttachment, list[DurableRenderedAttachment]]],
-    list[DurableRenderedAttachment],
+    list[
+        tuple[
+            RenderedAttachment | DurableRenderedAttachment,
+            list[RenderedAttachment | DurableRenderedAttachment],
+        ]
+    ],
+    list[RenderedAttachment | DurableRenderedAttachment],
 ]:
-    sources: dict[str, DurableRenderedAttachment] = {}
-    images: dict[str, list[DurableRenderedAttachment]] = {}
-    generic: list[DurableRenderedAttachment] = []
+    sources: dict[str, RenderedAttachment | DurableRenderedAttachment] = {}
+    images: dict[str, list[RenderedAttachment | DurableRenderedAttachment]] = {}
+    generic: list[RenderedAttachment | DurableRenderedAttachment] = []
     order: list[str] = []
     for attachment in attachments:
         group_id = attachment.group_id
@@ -1496,7 +1464,10 @@ def _partition_table_attachments(
         else:
             generic.append(attachment)
     groups: list[
-        tuple[DurableRenderedAttachment, list[DurableRenderedAttachment]]
+        tuple[
+            RenderedAttachment | DurableRenderedAttachment,
+            list[RenderedAttachment | DurableRenderedAttachment],
+        ]
     ] = []
     for group_id in order:
         groups.append((sources[group_id], images.pop(group_id, [])))
@@ -1505,7 +1476,7 @@ def _partition_table_attachments(
     return groups, generic
 
 
-def _table_summary(source: DurableRenderedAttachment) -> str:
+def _table_summary(source: RenderedAttachment | DurableRenderedAttachment) -> str:
     prefix = "Markdown source for "
     if source.description.startswith(prefix):
         return source.description.removeprefix(prefix)
@@ -1579,17 +1550,41 @@ def _sha256_path(path: Path) -> str:
 
 
 def _attachment_parts(
-    attachments: list[DurableRenderedAttachment],
+    attachments: list[RenderedAttachment | DurableRenderedAttachment],
 ) -> Iterator[
     tuple[str, RenderedAttachment | DurableRenderedAttachment]
 ]:
     for attachment_index, attachment in enumerate(attachments):
-        if attachment.size_bytes <= DISCORD_ATTACHMENT_LIMIT_BYTES:
+        size_bytes = _attachment_size(attachment)
+        if size_bytes <= DISCORD_ATTACHMENT_LIMIT_BYTES:
             yield str(attachment_index), attachment
             continue
         part_count = (
-            attachment.size_bytes + DISCORD_ATTACHMENT_LIMIT_BYTES - 1
+            size_bytes + DISCORD_ATTACHMENT_LIMIT_BYTES - 1
         ) // DISCORD_ATTACHMENT_LIMIT_BYTES
+        if isinstance(attachment, RenderedAttachment):
+            for part_index in range(part_count):
+                start = part_index * DISCORD_ATTACHMENT_LIMIT_BYTES
+                content = attachment.content[
+                    start : start + DISCORD_ATTACHMENT_LIMIT_BYTES
+                ]
+                yield (
+                    f"{attachment_index}p{part_index}",
+                    RenderedAttachment(
+                        filename=(
+                            f"{attachment.filename[:80]}.part"
+                            f"{part_index + 1:03d}-of-{part_count:03d}"
+                        ),
+                        content=content,
+                        description=(
+                            f"{attachment.description} "
+                            f"(part {part_index + 1}/{part_count})"
+                        ),
+                        kind=attachment.kind,
+                        group_id=attachment.group_id,
+                    ),
+                )
+            continue
         with attachment.path.open("rb") as stream:
             for part_index in range(part_count):
                 content = stream.read(DISCORD_ATTACHMENT_LIMIT_BYTES)
@@ -1705,6 +1700,16 @@ def _attachment_bytes(
     return attachment.content
 
 
+def _attachment_size(
+    attachment: RenderedAttachment | DurableRenderedAttachment,
+) -> int:
+    return (
+        attachment.size_bytes
+        if isinstance(attachment, DurableRenderedAttachment)
+        else len(attachment.content)
+    )
+
+
 def _discord_file(
     attachment: RenderedAttachment | DurableRenderedAttachment,
 ) -> discord.File:
@@ -1785,6 +1790,20 @@ def _bounded_plain_text_fallback(source: str) -> tuple[str, ...]:
         *chunks[1:3],
         chunks[3] + suffix,
     )
+
+
+def _volatile_final_unavailable(state: str, *, was_volatile: bool) -> str:
+    if was_volatile:
+        return (
+            "The final response is no longer available because conversation "
+            "content is kept only in process memory and is not retained in SQLite."
+        )
+    return {
+        "completed": "Codex completed without a final response.",
+        "failed": "Codex failed before producing a final response.",
+        "cancelled": "Codex was cancelled before producing a final response.",
+        "interrupted": "Codex was interrupted before producing a final response.",
+    }.get(state, f"Codex ended in state `{state}` without a final response.")
 
 
 def _discord_http_error(
