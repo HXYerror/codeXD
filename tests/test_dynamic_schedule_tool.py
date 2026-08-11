@@ -59,7 +59,7 @@ def test_existing_thread_gets_one_new_session_tool_notice(
         SELECT payload_json FROM discord_outbox
         WHERE dedupe_key = ?
         """,
-        (f"conversation:{storage_context.conversation.id}:dynamic-tools-upgrade",),
+        (f"conversation:{storage_context.conversation.id}:dynamic-tools-upgrade-v2",),
     )
     assert len(rows) == 1
     payload = json.loads(rows[0]["payload_json"])

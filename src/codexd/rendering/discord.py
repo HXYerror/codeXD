@@ -24,6 +24,7 @@ DISCORD_ATTACHMENT_LIMIT_BYTES = 8 * 1024 * 1024
 
 class AttachmentKind(StrEnum):
     GENERIC = "generic"
+    IMAGE = "image"
     CODE = "code"
     SOURCE = "source"
     TABLE_SOURCE = "table_source"
@@ -413,6 +414,51 @@ class DiscordRenderPlanner:
         if self._artifact_root is None:
             raise InvariantError("render artifact root is not configured")
         return self._artifact_root
+
+
+def suppress_visualization_markers(
+    source: str,
+    *,
+    has_registered_images: bool,
+) -> tuple[str, tuple[str, ...]]:
+    """Remove unsupported private visualize controls without trusting their payload."""
+
+    start_marker = "\ue200"
+    end_marker = "\ue201"
+    cursor = 0
+    output: list[str] = []
+    found = False
+    placeholder_added = False
+    while cursor < len(source):
+        start = source.find(start_marker, cursor)
+        if start < 0:
+            output.append(source[cursor:])
+            break
+        output.append(source[cursor:start])
+        end = source.find(end_marker, start + 1)
+        prefix = source[start + 1 : min(len(source), start + 32)].casefold()
+        if not prefix.startswith("visualize"):
+            cursor = start + 1
+            continue
+        found = True
+        if not has_registered_images and not placeholder_added:
+            output.append(
+                "[This visualization could not be delivered as a Discord image attachment.]"
+            )
+            placeholder_added = True
+        cursor = len(source) if end < 0 else end + 1
+    sanitized = (
+        "".join(output)
+        .replace(start_marker, "")
+        .replace("\ue202", "")
+        .replace(end_marker, "")
+    )
+    incidents = (
+        ("visualization_attachment_missing",)
+        if found and not has_registered_images
+        else ()
+    )
+    return sanitized, incidents
 
 
 def split_discord_text(value: str, limit: int = DISCORD_MESSAGE_LIMIT) -> tuple[str, ...]:

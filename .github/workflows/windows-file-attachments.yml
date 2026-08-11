@@ -30,6 +30,7 @@ jobs:
           tests/test_discord_attachment_ingestor.py
           tests/test_discord_file_integration.py
           tests/test_file_attachment_foundation.py
+          tests/test_outbound_images.py
           tests/test_runtime_turns.py
           tests/test_sdk_contract.py
       - name: Run visible transcript regressions

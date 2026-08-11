@@ -2,17 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import io
 import json
 import logging
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal, Protocol, overload
 
 import discord
 
-from codexd.domain.ids import sha256_text, utc_now_ms
+from codexd.domain.ids import canonical_json, sha256_text, utc_now_ms
 from codexd.errors import CodexDError, InvariantError, NotFoundError
 from codexd.rendering.discord import (
     DISCORD_ATTACHMENT_LIMIT_BYTES,
@@ -23,9 +25,10 @@ from codexd.rendering.discord import (
     RenderedAttachment,
     split_discord_code,
     split_discord_text,
+    suppress_visualization_markers,
 )
 from codexd.security.signing import ComponentSigner
-from codexd.storage.records import OutboxRecord
+from codexd.storage.records import OutboundImageInvocationRecord, OutboxRecord
 from codexd.storage.repository import Repository
 from codexd.transport.discord.presentation import (
     attachment_embed,
@@ -656,7 +659,56 @@ class DiscordOutboxTransport:
             )
         ):
             raise DeliveryError("turn_final_payload_invalid", permanent=True)
-        source_sha256 = sha256_text(visible_text)
+        raw_outbound_records = await asyncio.to_thread(
+            self._repository.registered_outbound_images,
+            turn_id,
+        )
+        outbound_records: Sequence[OutboundImageInvocationRecord] = (
+            raw_outbound_records
+            if isinstance(raw_outbound_records, (tuple, list))
+            else ()
+        )
+        try:
+            outbound_attachments = _registered_image_attachments(
+                outbound_records,
+                artifact_root=self._renderer.artifact_root,
+            )
+        except DeliveryError as exc:
+            await asyncio.to_thread(
+                self._repository.record_incident,
+                severity="error",
+                code="outbound_image_artifact_unavailable",
+                summary="A registered outbound image was unavailable at final delivery",
+                turn_id=turn_id,
+                details={"stable_code": exc.code},
+            )
+            outbound_attachments = ()
+            visible_text += (
+                "\n\n[The generated image could not be loaded for Discord delivery.]"
+            )
+        visible_text, marker_incidents = suppress_visualization_markers(
+            visible_text,
+            has_registered_images=bool(outbound_attachments),
+        )
+        source_sha256 = (
+            sha256_text(
+                canonical_json(
+                    {
+                        "visible_text": visible_text,
+                        "outbound_images": [
+                            {
+                                "sha256": attachment.sha256,
+                                "filename": attachment.filename,
+                                "description": attachment.description,
+                            }
+                            for attachment in outbound_attachments
+                        ],
+                    }
+                )
+            )
+            if outbound_attachments
+            else sha256_text(visible_text)
+        )
         stored = await asyncio.to_thread(self._repository.render_plan, turn_id)
         rendered: DurableDiscordRenderPlan
         if stored is None:
@@ -664,6 +716,13 @@ class DiscordOutboxTransport:
                 generated = await self._renderer.create_durable_plan(
                     turn_id=turn_id,
                     source=visible_text,
+                )
+                generated = DurableDiscordRenderPlan(
+                    messages=generated.messages,
+                    attachments=(*generated.attachments, *outbound_attachments),
+                    incident_codes=tuple(
+                        dict.fromkeys((*generated.incident_codes, *marker_incidents))
+                    ),
                 )
                 plan_payload = generated.to_payload(self._renderer.artifact_root)
             except (CodexDError, OSError, ValueError):
@@ -773,6 +832,7 @@ class DiscordOutboxTransport:
                 fallback = await self._deliver_attachment_fallback(
                     channel,
                     group,
+                    turn_id=turn_id,
                     marker=marker,
                     record_state=record_state,
                 )
@@ -926,6 +986,7 @@ class DiscordOutboxTransport:
             tuple[str, RenderedAttachment | DurableRenderedAttachment]
         ],
         *,
+        turn_id: str,
         marker: str,
         record_state: str,
     ) -> discord.Message | None:
@@ -937,6 +998,32 @@ class DiscordOutboxTransport:
                 if existing is not None:
                     first = first or existing
                     continue
+            if attachment.kind is AttachmentKind.IMAGE:
+                if len(group) > 1:
+                    try:
+                        delivered = await _send_files(
+                            channel,
+                            content=_with_marker_strict(
+                                f"Image attachment: `{attachment.filename[:120]}`",
+                                individual_marker,
+                            ),
+                            attachments=[attachment],
+                        )
+                    except discord.HTTPException as exc:
+                        if exc.status not in {400, 403, 413}:
+                            raise
+                    else:
+                        first = first or delivered
+                        continue
+                delivered = await self._deliver_image_failure_notice(
+                    channel,
+                    attachment,
+                    turn_id=turn_id,
+                    marker=f"{marker}-image-failed-{suffix}",
+                    record_state=record_state,
+                )
+                first = first or delivered
+                continue
             if len(group) == 1:
                 delivered = await self._deliver_attachment_as_text(
                     channel,
@@ -966,6 +1053,54 @@ class DiscordOutboxTransport:
                 )
             first = first or delivered
         return first
+
+    async def _deliver_image_failure_notice(
+        self,
+        channel: discord.TextChannel | discord.Thread,
+        attachment: RenderedAttachment | DurableRenderedAttachment,
+        *,
+        turn_id: str,
+        marker: str,
+        record_state: str,
+    ) -> discord.Message:
+        if record_state != "pending":
+            existing = await self._find_marker(channel, marker)
+            if existing is not None:
+                return existing
+        await asyncio.to_thread(
+            self._repository.record_incident,
+            severity="error",
+            code="outbound_image_delivery_failed",
+            summary="A registered outbound image could not be uploaded to Discord",
+            turn_id=turn_id,
+            details={
+                "filename": attachment.filename[:128],
+                "sha256": (
+                    attachment.sha256
+                    if isinstance(attachment, DurableRenderedAttachment)
+                    else hashlib.sha256(attachment.content).hexdigest()
+                ),
+                "size_bytes": (
+                    attachment.size_bytes
+                    if isinstance(attachment, DurableRenderedAttachment)
+                    else len(attachment.content)
+                ),
+            },
+        )
+        return await channel.send(
+            _with_marker_strict(
+                "The generated image could not be attached to Discord. "
+                "Ask Codex to regenerate it or inspect diagnostics.",
+                marker,
+            ),
+            embed=notice_embed(
+                "The generated image was registered locally, but Discord rejected "
+                "the attachment upload.",
+                level="error",
+                title="Image delivery failed",
+            ),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
 
     async def _deliver_attachment_as_text(
         self,
@@ -1377,6 +1512,70 @@ def _table_summary(source: DurableRenderedAttachment) -> str:
     if source.description == "Markdown source for table rendering fallback":
         return "Table rendering fallback"
     return "Rendered table"
+
+
+def _registered_image_attachments(
+    records: Sequence[OutboundImageInvocationRecord],
+    *,
+    artifact_root: Path,
+) -> tuple[DurableRenderedAttachment, ...]:
+    root = artifact_root.resolve()
+    attachments: list[DurableRenderedAttachment] = []
+    used_names: set[str] = set()
+    for record in records:
+        if (
+            not record.success
+            or record.relative_path is None
+            or record.normalized_sha256 is None
+            or record.size_bytes is None
+            or record.display_name is None
+            or record.description is None
+        ):
+            raise DeliveryError("outbound_image_record_invalid", permanent=True)
+        relative = Path(record.relative_path)
+        path = (root / relative).resolve()
+        if (
+            relative.is_absolute()
+            or ".." in relative.parts
+            or not path.is_relative_to(root)
+            or path.is_symlink()
+            or not path.is_file()
+            or path.stat().st_size != record.size_bytes
+            or _sha256_path(path) != record.normalized_sha256
+        ):
+            raise DeliveryError("outbound_image_changed", permanent=True)
+        filename = _unique_attachment_name(record.display_name, used_names)
+        used_names.add(filename.casefold())
+        attachments.append(
+            DurableRenderedAttachment(
+                filename=filename,
+                path=path,
+                description=record.description,
+                sha256=record.normalized_sha256,
+                size_bytes=record.size_bytes,
+                kind=AttachmentKind.IMAGE,
+            )
+        )
+    return tuple(attachments)
+
+
+def _unique_attachment_name(value: str, used: set[str]) -> str:
+    if value.casefold() not in used:
+        return value
+    path = Path(value)
+    for index in range(2, 1001):
+        candidate = f"{path.stem[:110]}-{index}{path.suffix or '.png'}"
+        if candidate.casefold() not in used:
+            return candidate
+    raise DeliveryError("outbound_image_name_conflict", permanent=True)
+
+
+def _sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _attachment_parts(
