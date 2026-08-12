@@ -21,6 +21,7 @@ _SECRET_NAME = re.compile(
 _BASE_ENV = frozenset(
     {
         "CODEX_HOME",
+        "CODEX_SQLITE_HOME",
         "COMSPEC",
         "HOME",
         "LANG",

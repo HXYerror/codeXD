@@ -46,7 +46,6 @@ from codexd.errors import (
     StorageError,
 )
 from codexd.security import private_files
-from codexd.security.redaction import redacted_summary, safe_thread_title_summary
 from codexd.storage.progress import (
     insert_initial_progress,
     insert_progress_update,
@@ -68,10 +67,6 @@ from codexd.storage.records import (
     TurnRecord,
 )
 from codexd.storage.sqlite import SQLiteStore
-from codexd.storage.transcript import (
-    canonical_final_answer,
-    terminal_assistant_transcript,
-)
 from codexd.storage.usage import latest_usage_payload
 
 
@@ -954,6 +949,7 @@ class Repository:
     ) -> tuple[bool, str]:
         if discovery_kind not in {"live", "backfill"}:
             raise InvariantError("invalid Discord ingress discovery kind")
+        del first_request_text, has_image_attachment
         now = utc_now_ms()
         with self.store.transaction() as connection:
             project = connection.execute(
@@ -987,21 +983,14 @@ class Repository:
                 return False, str(outbox_id)
             ingress_id = new_id()
             outbox_id = new_id()
-            title_summary = safe_thread_title_summary(
-                first_request_text,
-                project_root=Path(str(project["root_path"])),
-                has_image_attachment=has_image_attachment,
-            )
-            thread_name = f"{title_summary} · {ingress_id[:4]}"
-            if not 1 <= len(thread_name) <= 100:
-                raise InvariantError("generated Discord thread name is out of bounds")
             payload = {
                 "kind": "create_thread",
                 "starter_message_id": discord_message_id,
                 "expected_thread_id": discord_message_id,
                 "project_id": project_id,
                 "owner_user_id": owner_user_id,
-                "name": thread_name,
+                "name_strategy": "starter_message",
+                "name_suffix": ingress_id[:4],
             }
             connection.execute(
                 """
@@ -1369,26 +1358,12 @@ class Repository:
         return _turn(rows[0])
 
     def turn_output(self, turn_id: str) -> str | None:
-        row = self.store.query_one(
-            "SELECT plain_text FROM message_projections WHERE turn_id = ?",
-            (turn_id,),
-        )
-        return str(row["plain_text"]) if row is not None else None
+        del turn_id
+        return None
 
     def turn_final_answer(self, turn_id: str) -> str | None:
-        row = self.store.query_one(
-            "SELECT content_ast_json FROM message_projections WHERE turn_id = ?",
-            (turn_id,),
-        )
-        if row is None:
-            return None
-        try:
-            ast = json.loads(str(row["content_ast_json"]))
-        except (json.JSONDecodeError, TypeError, ValueError) as exc:
-            raise StorageError("message projection AST is invalid") from exc
-        if not isinstance(ast, dict):
-            raise StorageError("message projection AST must be an object")
-        return canonical_final_answer(ast)
+        del turn_id
+        return None
 
     def render_plan(self, turn_id: str) -> RenderPlanRecord | None:
         row = self.store.query_one(
@@ -1420,7 +1395,7 @@ class Repository:
         incident_codes: Sequence[str] = (),
     ) -> RenderPlanRecord:
         now = utc_now_ms()
-        plan_json = canonical_json(dict(plan))
+        plan_json = canonical_json(_content_free_render_plan(plan))
         with self.store.transaction() as connection:
             turn_scope = connection.execute(
                 """
@@ -1515,52 +1490,27 @@ class Repository:
         return payload
 
     def turn_recorded_diff(self, turn_id: str) -> str | None:
-        aggregate = self.latest_event_payload_for_turn(turn_id, "diff.updated")
-        if aggregate is not None:
-            diff = aggregate.get("diff")
-            if not isinstance(diff, str):
-                raise StorageError("diff.updated payload is missing its typed diff")
-            return diff or None
+        del turn_id
+        return None
 
-        rows = self.store.query_all(
+    def turn_event_summary(self, turn_id: str) -> dict[str, Any]:
+        projections = self.store.query_one(
             """
-            SELECT payload_json
-            FROM events
-            WHERE turn_id = ? AND kind = 'file_change.completed'
-            ORDER BY sequence
+            SELECT COUNT(*) AS tool_count,
+                   COALESCE(SUM(CASE WHEN kind = 'file_change' THEN 1 ELSE 0 END), 0)
+                       AS file_count
+            FROM tool_projections
+            WHERE turn_id = ?
             """,
             (turn_id,),
         )
-        sections: list[str] = []
-        for row in rows:
-            payload = json.loads(str(row["payload_json"]))
-            if not isinstance(payload, dict) or not isinstance(
-                payload.get("changes"), list
-            ):
-                raise StorageError(
-                    "file_change.completed payload is missing typed changes"
-                )
-            for raw_change in payload["changes"]:
-                if not isinstance(raw_change, dict):
-                    raise StorageError("file change entry is not an object")
-                path = raw_change.get("path")
-                kind = raw_change.get("kind")
-                diff = raw_change.get("diff")
-                if not all(isinstance(value, str) for value in (path, kind, diff)):
-                    raise StorageError("file change entry has an invalid typed schema")
-                if diff:
-                    sections.append(f"# {kind}: {path}\n{diff}")
-        return "\n\n".join(sections) or None
-
-    def turn_event_summary(self, turn_id: str) -> dict[str, Any]:
-        kinds = {
-            str(row["kind"]): int(row["count"])
+        latest = {
+            str(row["kind"])
             for row in self.store.query_all(
                 """
-                SELECT kind, COUNT(*) AS count
-                FROM events
+                SELECT kind FROM events
                 WHERE turn_id = ?
-                GROUP BY kind
+                  AND kind IN ('diff.updated', 'usage.updated')
                 """,
                 (turn_id,),
             )
@@ -1584,27 +1534,22 @@ class Repository:
         )
         delivered = self.store.query_one(
             """
-            SELECT o.discord_message_id
-            FROM discord_outbox AS o
-            JOIN events AS e ON e.sequence = o.event_sequence
-            WHERE e.turn_id = ?
-              AND o.state = 'sent'
-              AND o.discord_message_id IS NOT NULL
-            ORDER BY o.updated_at DESC
+            SELECT discord_message_id
+            FROM discord_outbox
+            WHERE dedupe_key = 'turn:' || ? || ':final'
+              AND state = 'sent'
+              AND discord_message_id IS NOT NULL
             LIMIT 1
             """,
             (turn_id,),
         )
         return {
-            "tool_events": sum(
-                count for kind, count in kinds.items() if kind.startswith("tool.")
+            "tool_events": int(projections["tool_count"]) if projections else 0,
+            "file_events": (
+                (int(projections["file_count"]) if projections else 0)
+                + (1 if "diff.updated" in latest else 0)
             ),
-            "file_events": sum(
-                count
-                for kind, count in kinds.items()
-                if kind.startswith("file_change.") or kind == "diff.updated"
-            ),
-            "usage_observed": "usage.updated" in kinds,
+            "usage_observed": "usage.updated" in latest,
             "incidents": incidents,
             "discord_message_id": (
                 str(delivered["discord_message_id"])
@@ -2850,12 +2795,9 @@ class Repository:
                 ),
                 schedule_fire_id,
                 turn_input.input_hash,
-                redacted_summary(
-                    turn_input.text or "",
-                    project_root=Path(str(conversation["root_path"])),
-                ),
-                turn_input.text,
-                skill_json,
+                _content_not_retained_summary(turn_input.text),
+                None,
+                skill_json if source is TurnSource.DISCORD else None,
                 skill_names_json,
                 model,
                 effort,
@@ -3083,13 +3025,35 @@ class Repository:
         )
         return _turn(row) if row else None
 
-    def load_turn_input(self, turn_id: str) -> TurnInput:
+    def load_turn_input(
+        self,
+        turn_id: str,
+        *,
+        volatile_text: str | None = None,
+        use_volatile_text: bool = False,
+    ) -> TurnInput:
         turn = self.get_turn(turn_id)
         if turn.state not in {TurnState.QUEUED, TurnState.STARTING}:
             raise ConflictError("provider input is available only before a Turn is accepted")
+        queued_text = turn.queued_input_text
+        skill_snapshot_json = turn.queued_skill_inputs_json
+        if turn.source_kind is TurnSource.SCHEDULE:
+            schedule_input = self.store.query_one(
+                """
+                SELECT s.prompt_text, s.skill_inputs_json
+                FROM schedule_fires sf
+                JOIN schedules s ON s.id = sf.schedule_id
+                WHERE sf.id = ?
+                """,
+                (turn.schedule_fire_id,),
+            )
+            if schedule_input is None or not schedule_input["prompt_text"]:
+                raise ConflictError("Schedule Turn input configuration is unavailable")
+            queued_text = str(schedule_input["prompt_text"])
+            skill_snapshot_json = schedule_input["skill_inputs_json"]
         skills_raw = (
-            json.loads(turn.queued_skill_inputs_json)
-            if turn.queued_skill_inputs_json is not None
+            json.loads(str(skill_snapshot_json))
+            if skill_snapshot_json is not None
             else []
         )
         if not isinstance(skills_raw, list):
@@ -3185,7 +3149,7 @@ class Repository:
                 )
             )
         turn_input = TurnInput(
-            text=turn.queued_input_text,
+            text=volatile_text if use_volatile_text else queued_text,
             images=tuple(images),
             files=tuple(files),
             skill_inputs=tuple(skills),
@@ -4043,6 +4007,13 @@ class Repository:
         runtime_generation: int | None,
         event: NormalizedEvent,
     ) -> int:
+        serialized_payload = canonical_json(dict(event.payload))
+        durable_payload = canonical_json(
+            {
+                "payload_hash": sha256_text(serialized_payload),
+                "payload_size": len(serialized_payload.encode()),
+            }
+        )
         with self.store.transaction() as connection:
             local_index: int | None = None
             if turn_id:
@@ -4108,7 +4079,7 @@ class Repository:
                         local_index,
                         event.kind,
                         event.schema_version,
-                        canonical_json(dict(event.payload)),
+                        durable_payload,
                         event.raw_type,
                         event.raw_hash,
                         event.raw_size,
@@ -4143,6 +4114,7 @@ class Repository:
     ) -> TurnRecord:
         if not target.terminal:
             raise InvariantError("terminal_turn requires a terminal target")
+        del error_message_redacted
         now = utc_now_ms()
         with self.store.transaction() as connection:
             row = connection.execute("SELECT * FROM turns WHERE id = ?", (turn_id,)).fetchone()
@@ -4150,6 +4122,10 @@ class Repository:
                 raise NotFoundError(f"Turn not found: {turn_id}")
             current = TurnState(row["state"])
             if current.terminal:
+                connection.execute(
+                    "UPDATE turns SET error_message_redacted = NULL WHERE id = ?",
+                    (turn_id,),
+                )
                 self._project_local_terminal(
                     connection,
                     turn_id=turn_id,
@@ -4157,13 +4133,17 @@ class Repository:
                     terminal_code=str(row["terminal_code"] or terminal_code),
                     now=now,
                 )
-                return _turn(row)
+                updated = connection.execute(
+                    "SELECT * FROM turns WHERE id = ?", (turn_id,)
+                ).fetchone()
+                assert updated is not None
+                return _turn(updated)
             assert_turn_transition(current, target)
             connection.execute(
                 """
                 UPDATE turns
                 SET state = ?, terminal_code = ?, error_code = ?,
-                    error_message_redacted = ?, ended_at = ?,
+                    error_message_redacted = NULL, ended_at = ?,
                     queued_input_text = NULL, queued_skill_inputs_json = NULL
                 WHERE id = ?
                 """,
@@ -4171,7 +4151,6 @@ class Repository:
                     target.value,
                     terminal_code,
                     error_code,
-                    error_message_redacted,
                     now,
                     turn_id,
                 ),
@@ -4349,51 +4328,6 @@ class Repository:
             now=now,
             event_sequence=sequence,
         )
-        note = f"Turn {target.value}: `{terminal_code}`."
-        projection = connection.execute(
-            "SELECT content_ast_json FROM message_projections WHERE turn_id = ?",
-            (turn_id,),
-        ).fetchone()
-        if projection is None:
-            ast: dict[str, Any] = {"schema_version": 1, "blocks": []}
-        else:
-            try:
-                loaded_ast = json.loads(str(projection["content_ast_json"]))
-            except (json.JSONDecodeError, TypeError, ValueError) as exc:
-                raise StorageError("message projection AST is invalid") from exc
-            if not isinstance(loaded_ast, dict):
-                raise StorageError("message projection AST must be an object")
-            ast = loaded_ast
-        transcript = terminal_assistant_transcript(ast, fallback=note)
-        visible_text = transcript.visible_text
-        final_answer_text = transcript.canonical_final_answer
-        if projection is None:
-            connection.execute(
-                """
-                INSERT INTO message_projections(
-                    id, turn_id, content_revision, content_ast_json,
-                    plain_text, is_final, last_event_sequence
-                ) VALUES (?, ?, 1, ?, ?, 1, ?)
-                """,
-                (new_id(), turn_id, canonical_json(ast), visible_text, sequence),
-            )
-        else:
-            connection.execute(
-                """
-                UPDATE message_projections
-                SET content_revision = content_revision + 1,
-                    content_ast_json = ?, plain_text = ?, is_final = 1,
-                    last_event_sequence = ?
-                WHERE turn_id = ? AND is_final = 0
-                """,
-                (canonical_json(ast), visible_text, sequence, turn_id),
-            )
-            final_projection = connection.execute(
-                "SELECT plain_text FROM message_projections WHERE turn_id = ?",
-                (turn_id,),
-            ).fetchone()
-            assert final_projection is not None
-            visible_text = str(final_projection["plain_text"])
         progress_outbox_id = None
         if not progress_already_projected:
             progress_outbox_id = insert_progress_update(
@@ -4458,8 +4392,7 @@ class Repository:
                             turn_id=turn_id,
                             max_sequence=sequence,
                         ),
-                        "visible_text": visible_text,
-                        "final_answer_text": final_answer_text,
+                        "content_storage": "none",
                     }
                 ),
                 f"turn:{turn_id}:final",
@@ -4746,6 +4679,11 @@ class Repository:
                         (now, schedule_draft_id),
                     )
             _apply_progress_cleanup_after_ack(
+                connection,
+                outbox=outbox,
+                now=now,
+            )
+            _compact_acknowledged_outbox(
                 connection,
                 outbox=outbox,
                 now=now,
@@ -6786,6 +6724,108 @@ def _terminal_progress_cleanup_like(
     )
 
 
+def _compact_acknowledged_outbox(
+    connection: sqlite3.Connection,
+    *,
+    outbox: sqlite3.Row,
+    now: int,
+) -> None:
+    try:
+        payload = json.loads(str(outbox["payload_json"]))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return
+    if not isinstance(payload, dict):
+        return
+    kind = payload.get("kind")
+    if kind == "turn_progress":
+        coalesce_key = outbox["coalesce_key"]
+        if isinstance(coalesce_key, str) and coalesce_key:
+            connection.execute(
+                """
+                UPDATE discord_outbox
+                SET state = 'superseded', event_sequence = NULL,
+                    payload_json = json_object(
+                        'kind', 'retained_tombstone',
+                        'original_kind', 'turn_progress'
+                    ),
+                    updated_at = ?
+                WHERE coalesce_key = ? AND id <> ?
+                  AND state IN ('sent', 'dead_letter', 'superseded')
+                """,
+                (now, coalesce_key, outbox["id"]),
+            )
+            connection.execute(
+                """
+                DELETE FROM discord_outbox
+                WHERE coalesce_key = ? AND id <> ? AND state = 'superseded'
+                  AND id NOT IN (
+                      SELECT depends_on_outbox_id
+                      FROM discord_outbox
+                      WHERE depends_on_outbox_id IS NOT NULL
+                      UNION
+                      SELECT thread_creation_outbox_id
+                      FROM ingress_messages
+                      WHERE thread_creation_outbox_id IS NOT NULL
+                      UNION
+                      SELECT progress_outbox_id
+                      FROM ingress_messages
+                      WHERE progress_outbox_id IS NOT NULL
+                      UNION
+                      SELECT confirmation_outbox_id
+                      FROM schedule_drafts
+                      WHERE confirmation_outbox_id IS NOT NULL
+                      UNION
+                      SELECT outbox_id
+                      FROM dynamic_tool_invocations
+                      WHERE outbox_id IS NOT NULL
+                  )
+                """,
+                (coalesce_key, outbox["id"]),
+            )
+        if payload.get("state") == "terminal":
+            connection.execute(
+                """
+                UPDATE discord_outbox
+                SET event_sequence = NULL, payload_json = ?, updated_at = ?
+                WHERE id = ? AND state = 'sent'
+                """,
+                (
+                    canonical_json(
+                        {
+                            "kind": "turn_progress",
+                            "turn_id": payload.get("turn_id"),
+                            "revision": payload.get("revision"),
+                            "state": "terminal",
+                        }
+                    ),
+                    now,
+                    outbox["id"],
+                ),
+            )
+        return
+    if kind == "turn_final":
+        connection.execute(
+            """
+            UPDATE discord_outbox
+            SET event_sequence = NULL, payload_json = ?, updated_at = ?
+            WHERE id = ? AND state = 'sent'
+            """,
+            (
+                canonical_json(
+                    {
+                        "kind": "turn_final",
+                        "turn_id": payload.get("turn_id"),
+                        "state": payload.get("state"),
+                        "terminal_code": payload.get("terminal_code"),
+                        "delivered": True,
+                    }
+                ),
+                now,
+                outbox["id"],
+            ),
+        )
+
+
 def _enqueue_terminal_progress_cleanup(
     connection: sqlite3.Connection,
     *,
@@ -6998,6 +7038,46 @@ def _outbox(
         attempts=int(row["attempts"]),
         lease_owner=str(lease_owner),
     )
+
+
+def _content_not_retained_summary(text: str | None) -> str:
+    return f"[content not retained; {len((text or '').encode('utf-8'))} bytes]"
+
+
+def _content_free_render_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
+    raw_attachments = plan.get("attachments")
+    attachments: list[dict[str, Any]] = []
+    if isinstance(raw_attachments, list):
+        for raw in raw_attachments:
+            if not isinstance(raw, dict):
+                continue
+            attachment = {
+                key: raw[key]
+                for key in (
+                    "filename",
+                    "relative_path",
+                    "sha256",
+                    "size_bytes",
+                    "kind",
+                    "group_id",
+                )
+                if key in raw
+            }
+            attachment["description"] = "Rendered attachment"
+            attachments.append(attachment)
+    raw_incidents = plan.get("incident_codes")
+    incident_codes = (
+        [str(code) for code in raw_incidents if isinstance(code, str)]
+        if isinstance(raw_incidents, list)
+        else []
+    )
+    return {
+        "version": 3,
+        "messages": [],
+        "attachments": attachments,
+        "incident_codes": incident_codes,
+        "content_storage": "volatile",
+    }
 
 
 def _upsert_incident(

@@ -154,40 +154,12 @@ def _database_details(
         repository = Repository(store)
         incidents = list(repository.unresolved_incidents(limit=50))
         if include_content:
-            content = {
-                "messages": [
-                    {
-                        "turn_id": str(row["turn_id"]),
-                        "plain_text": str(row["plain_text"]),
-                    }
-                    for row in store.query_all(
-                        """
-                        SELECT turn_id, plain_text
-                        FROM message_projections
-                        ORDER BY rowid DESC
-                        LIMIT 100
-                        """
-                    )
-                ],
-                "events": [
-                    {
-                        "sequence": int(row["sequence"]),
-                        "kind": str(row["kind"]),
-                        "payload": json.loads(str(row["payload_json"])),
-                    }
-                    for row in store.query_all(
-                        """
-                        SELECT sequence, kind, payload_json
-                        FROM events
-                        ORDER BY sequence DESC
-                        LIMIT 100
-                        """
-                    )
-                ],
-            }
             _write_json(
                 root / "content.json",
-                redact_value(content),
+                {
+                    "content_persistence": "disabled",
+                    "message": "Conversation content is never retained by codexD.",
+                },
             )
     return {"incidents": incidents}
 
@@ -244,6 +216,7 @@ def _redacted_config(config: AppConfig) -> str:
             "",
             "[runtime]",
             f'topology = "{config.runtime.topology}"',
+            f'codex_log_filter = "{config.runtime.codex_log_filter}"',
             "",
             "[security]",
             f'new_conversation_profile = "{config.security.default_sandbox_profile}"',
@@ -254,6 +227,10 @@ def _redacted_config(config: AppConfig) -> str:
             f"input_attachments_days = {config.retention.input_attachments_days}",
             f"render_attachments_days = {config.retention.render_attachments_days}",
             f"logs_days = {config.retention.logs_days}",
+            f"tool_output_hours = {config.retention.tool_output_hours}",
+            f"outbox_content_days = {config.retention.outbox_content_days}",
+            f"codex_logs_days = {config.retention.codex_logs_days}",
+            f"codex_trace_hours = {config.retention.codex_trace_hours}",
             "",
         )
     )

@@ -5,9 +5,11 @@ import hmac
 import json
 import secrets
 import sqlite3
+import threading
 from dataclasses import dataclass
 from typing import Any, cast
 
+from codexd.application.volatile_turns import VolatileTurnStore
 from codexd.domain.events import NormalizedEvent
 from codexd.domain.ids import canonical_json, new_id, sha256_text, utc_now_ms
 from codexd.domain.turns import InterruptOrigin, TurnState, assert_turn_transition
@@ -18,10 +20,6 @@ from codexd.storage.progress import (
     supersede_coalesced_outbox,
 )
 from codexd.storage.sqlite import SQLiteStore
-from codexd.storage.transcript import (
-    terminal_assistant_transcript,
-    visible_assistant_text,
-)
 from codexd.storage.usage import (
     USAGE_SCOPE,
     latest_usage_payload,
@@ -33,6 +31,36 @@ _TASK_TERMINAL_STATES = frozenset(
 )
 _AGENT_TERMINAL_STATES = frozenset(
     {"completed", "errored", "interrupted", "shutdown", "not_found"}
+)
+_DURABLE_EVENT_KINDS = frozenset(
+    {
+        "file_change.completed",
+        "provider.error",
+        "provider.unknown",
+        "provider.item",
+        "model.rerouted",
+        "model.safety",
+        "model.verification",
+        "turn.moderation",
+        "turn.completed",
+        "turn.failed",
+        "turn.interrupted",
+        "turn.terminal_unparseable",
+        "runtime.stream_interrupted",
+    }
+)
+_MAX_PROVIDER_EVENT_IDS_PER_TURN = 4096
+_MAX_TRACKED_PROVIDER_TURNS = 1024
+_VOLATILE_CONTENT_PREFIXES = ("assistant.", "plan.")
+_VOLATILE_METADATA_KINDS = frozenset(
+    {
+        "command.output.delta",
+        "diff.updated",
+        "file_change.output.delta",
+        "reasoning.hidden_delta_discarded",
+        "reasoning.summary",
+        "usage.updated",
+    }
 )
 
 
@@ -49,6 +77,7 @@ class ProjectingEventSink:
         *,
         correlation_key: bytes,
         stream_update_ms: int = 1000,
+        volatile_turns: VolatileTurnStore | None = None,
     ) -> None:
         if len(correlation_key) < 32:
             raise ValueError("projection correlation key must contain at least 32 bytes")
@@ -57,7 +86,18 @@ class ProjectingEventSink:
         self.store = store
         self._correlation_key = correlation_key
         self._stream_update_ms = stream_update_ms
+        self._volatile_turns = volatile_turns or VolatileTurnStore()
+        self._provider_event_fingerprints: dict[str, dict[str, tuple[object, ...]]] = {}
+        self._provider_event_lock = threading.Lock()
         self._prepare_projection_identity()
+
+    @property
+    def stream_update_ms(self) -> int:
+        return self._stream_update_ms
+
+    @property
+    def volatile_turns(self) -> VolatileTurnStore:
+        return self._volatile_turns
 
     def record(
         self,
@@ -68,6 +108,16 @@ class ProjectingEventSink:
         terminal_state: TurnState | None = None,
         terminal_code: str | None = None,
     ) -> EventRecordResult:
+        if terminal_state is None and (
+            event.kind.startswith(_VOLATILE_CONTENT_PREFIXES)
+            or event.kind in _VOLATILE_METADATA_KINDS
+        ):
+            accepted = self._record_volatile_event(
+                turn_id=turn_id,
+                runtime_generation=runtime_generation,
+                event=event,
+            )
+            return EventRecordResult(-1 if accepted else None, None)
         now = utc_now_ms()
         with self.store.transaction() as connection:
             scope = connection.execute(
@@ -137,7 +187,27 @@ class ProjectingEventSink:
                     interrupt_origin=interrupt_origin,
                 )
             )
-            sequence, inserted = self._append_event(connection, scope, event, now)
+            durable = (
+                terminal is not None
+                or event.kind in _DURABLE_EVENT_KINDS
+                or event.kind.startswith("review_mode.")
+            )
+            if (
+                not durable
+                and event.provider_event_id is not None
+                and self._provider_event_seen(str(scope["id"]), event)
+            ):
+                return EventRecordResult(
+                    self._activity_anchor(connection, scope, event, now),
+                    None,
+                )
+            sequence, inserted = self._append_event(
+                connection,
+                scope,
+                event,
+                now,
+                durable=durable,
+            )
             if not inserted:
                 return EventRecordResult(sequence, None)
             self._apply_projection(connection, scope, sequence, event, now)
@@ -150,7 +220,82 @@ class ProjectingEventSink:
                     terminal[1],
                     now,
                 )
-            return EventRecordResult(sequence, terminal)
+                self._forget_provider_events(str(scope["id"]))
+        return EventRecordResult(sequence, terminal)
+
+    def _record_volatile_event(
+        self,
+        *,
+        turn_id: str,
+        runtime_generation: int,
+        event: NormalizedEvent,
+    ) -> bool:
+        scope = self.store.query_one(
+            """
+            SELECT t.state, t.runtime_lease_id, t.runtime_generation,
+                   rl.state AS lease_state, rl.generation AS lease_generation
+            FROM turns t
+            LEFT JOIN runtime_leases rl ON rl.id = t.runtime_lease_id
+            WHERE t.id = ?
+            """,
+            (turn_id,),
+        )
+        if scope is None or TurnState(str(scope["state"])).terminal:
+            return False
+        if (
+            scope["runtime_lease_id"] is None
+            or scope["runtime_generation"] != runtime_generation
+            or scope["lease_generation"] != runtime_generation
+            or scope["lease_state"] != "ready"
+        ):
+            return False
+        if event.provider_event_id is not None and self._provider_event_seen(
+            turn_id, event
+        ):
+            return True
+        if event.kind == "usage.updated":
+            validate_usage_payload(event.payload)
+            self._volatile_turns.save_usage(turn_id, dict(event.payload))
+        elif event.kind.startswith(_VOLATILE_CONTENT_PREFIXES) and event.kind != (
+            "plan.updated"
+        ):
+            self._project_content(turn_id, event)
+        return True
+
+    def _provider_event_seen(self, turn_id: str, event: NormalizedEvent) -> bool:
+        assert event.provider_event_id is not None
+        fingerprint: tuple[object, ...] = (
+            event.kind,
+            event.schema_version,
+            canonical_json(dict(event.payload)),
+            event.raw_type,
+            event.raw_hash,
+            event.raw_size,
+        )
+        with self._provider_event_lock:
+            fingerprints = self._provider_event_fingerprints.get(turn_id)
+            if fingerprints is None:
+                if len(self._provider_event_fingerprints) >= _MAX_TRACKED_PROVIDER_TURNS:
+                    oldest_turn = next(iter(self._provider_event_fingerprints))
+                    self._provider_event_fingerprints.pop(oldest_turn, None)
+                fingerprints = {}
+                self._provider_event_fingerprints[turn_id] = fingerprints
+            existing = fingerprints.get(event.provider_event_id)
+            if existing is not None:
+                if existing != fingerprint:
+                    raise InvariantError(
+                        "provider event ID was reused for different event content"
+                    )
+                return True
+            fingerprints[event.provider_event_id] = fingerprint
+            if len(fingerprints) > _MAX_PROVIDER_EVENT_IDS_PER_TURN:
+                oldest = next(iter(fingerprints))
+                fingerprints.pop(oldest, None)
+            return False
+
+    def _forget_provider_events(self, turn_id: str) -> None:
+        with self._provider_event_lock:
+            self._provider_event_fingerprints.pop(turn_id, None)
 
     def _append_event(
         self,
@@ -158,7 +303,11 @@ class ProjectingEventSink:
         scope: sqlite3.Row,
         event: NormalizedEvent,
         now: int,
+        *,
+        durable: bool,
     ) -> tuple[int, bool]:
+        if not durable:
+            return self._activity_anchor(connection, scope, event, now), True
         if event.provider_event_id:
             existing = connection.execute(
                 """
@@ -174,7 +323,7 @@ class ProjectingEventSink:
                     int(scope["runtime_generation"]),
                     event.kind,
                     event.schema_version,
-                    canonical_json(dict(event.payload)),
+                    canonical_json(_durable_event_payload(event)),
                     event.raw_type,
                     event.raw_hash,
                     event.raw_size,
@@ -219,7 +368,7 @@ class ProjectingEventSink:
                 local_index,
                 event.kind,
                 event.schema_version,
-                canonical_json(dict(event.payload)),
+                canonical_json(_durable_event_payload(event)),
                 event.raw_type,
                 event.raw_hash,
                 event.raw_size,
@@ -230,6 +379,50 @@ class ProjectingEventSink:
         if cursor.lastrowid is None:
             raise StorageError("event insert did not produce a sequence")
         return cursor.lastrowid, True
+
+    @staticmethod
+    def _activity_anchor(
+        connection: sqlite3.Connection,
+        scope: sqlite3.Row,
+        event: NormalizedEvent,
+        now: int,
+    ) -> int:
+        event_id = f"turn-activity:{scope['id']}"
+        existing = connection.execute(
+            "SELECT sequence FROM events WHERE event_id = ?",
+            (event_id,),
+        ).fetchone()
+        if existing is not None:
+            return int(existing["sequence"])
+        row = connection.execute(
+            """
+            SELECT COALESCE(MAX(local_event_index), 0) + 1 AS next
+            FROM events WHERE turn_id = ?
+            """,
+            (scope["id"],),
+        ).fetchone()
+        cursor = connection.execute(
+            """
+            INSERT INTO events(
+                event_id, turn_id, project_id, conversation_id,
+                runtime_generation, local_event_index, kind, schema_version,
+                payload_json, occurred_at, recorded_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'turn.activity', 1, '{}', ?, ?)
+            """,
+            (
+                event_id,
+                scope["id"],
+                scope["project_id"],
+                scope["conversation_id"],
+                scope["runtime_generation"],
+                int(row["next"]),
+                event.occurred_at,
+                now,
+            ),
+        )
+        if cursor.lastrowid is None:
+            raise StorageError("activity anchor insert did not produce a sequence")
+        return int(cursor.lastrowid)
 
     def _apply_projection(
         self,
@@ -248,8 +441,6 @@ class ProjectingEventSink:
                 content=f"Running · Codex accepted Turn `{str(scope['id'])[:8]}`",
                 now=now,
             )
-        if event.kind.startswith(("assistant.", "plan.")):
-            self._project_content(connection, scope, sequence, event, now)
         if event.kind.startswith(
             (
                 "command.",
@@ -263,17 +454,16 @@ class ProjectingEventSink:
                 "hook.",
                 "approval_review.",
             )
-        ):
+        ) and not event.kind.endswith((".delta", ".output.delta")):
             self._project_tool(connection, scope, sequence, event)
-            if not event.kind.endswith((".delta", ".output.delta")):
-                self._project_progress(
-                    connection,
-                    scope,
-                    sequence,
-                    state="running",
-                    content=_tool_progress_content(event),
-                    now=now,
-                )
+            self._project_progress(
+                connection,
+                scope,
+                sequence,
+                state="running",
+                content=_tool_progress_content(event),
+                now=now,
+            )
         if event.kind.startswith("sleep."):
             self._project_progress(
                 connection,
@@ -367,22 +557,8 @@ class ProjectingEventSink:
                 content="Running · coordinating Codex agents",
                 now=now,
             )
-        if event.kind == "usage.updated":
-            self._project_usage(connection, scope, event)
         if event.kind in {"provider.unknown", "provider.item"}:
             self._project_unknown(connection, scope, sequence, event, now)
-
-    @staticmethod
-    def _project_usage(
-        connection: sqlite3.Connection,
-        scope: sqlite3.Row,
-        event: NormalizedEvent,
-    ) -> None:
-        validate_usage_payload(event.payload)
-        connection.execute(
-            "UPDATE turns SET usage_scope = ? WHERE id = ?",
-            (USAGE_SCOPE, scope["id"]),
-        )
 
     def _project_unknown(
         self,
@@ -535,20 +711,10 @@ class ProjectingEventSink:
 
     def _project_content(
         self,
-        connection: sqlite3.Connection,
-        scope: sqlite3.Row,
-        sequence: int,
+        turn_id: str,
         event: NormalizedEvent,
-        now: int,
     ) -> None:
-        row = connection.execute(
-            "SELECT * FROM message_projections WHERE turn_id = ?", (scope["id"],)
-        ).fetchone()
-        ast: dict[str, Any] = (
-            json.loads(row["content_ast_json"])
-            if row
-            else {"schema_version": 1, "blocks": []}
-        )
+        ast = self._volatile_turns.content_ast(turn_id)
         raw_blocks = ast.get("blocks")
         if not isinstance(raw_blocks, list) or not all(
             isinstance(block, dict) for block in raw_blocks
@@ -603,49 +769,7 @@ class ProjectingEventSink:
                 block["text"] = completed_text
             block["phase"] = completed_phase
             block["completed"] = True
-        revision = int(row["content_revision"]) + 1 if row else 1
-        plain = visible_assistant_text(ast, completed_only=False)
-        if row:
-            connection.execute(
-                """
-                UPDATE message_projections
-                SET content_revision = ?, content_ast_json = ?, plain_text = ?,
-                    last_event_sequence = ?
-                WHERE turn_id = ?
-                """,
-                (revision, canonical_json(ast), plain, sequence, scope["id"]),
-            )
-        else:
-            connection.execute(
-                """
-                INSERT INTO message_projections(
-                    id, turn_id, content_revision, content_ast_json,
-                    plain_text, is_final, last_event_sequence
-                ) VALUES (?, ?, ?, ?, ?, 0, ?)
-                """,
-                (new_id(), scope["id"], revision, canonical_json(ast), plain, sequence),
-            )
-        if family == "text":
-            assistant_plain = plain
-            if assistant_plain:
-                self._project_progress(
-                    connection,
-                    scope,
-                    sequence,
-                    state="running",
-                    content=None,
-                    plain_text=_streaming_preview(assistant_plain),
-                    now=now,
-                )
-        elif event.kind.endswith((".delta", ".completed")):
-            self._project_progress(
-                connection,
-                scope,
-                sequence,
-                state="running",
-                content="Running · Codex updated its plan",
-                now=now,
-            )
+        self._volatile_turns.save_content_ast(turn_id, ast)
 
     def _project_tool(
         self,
@@ -676,8 +800,7 @@ class ProjectingEventSink:
         if existing is not None and str(existing["state"]) in {"completed", "failed"}:
             state = str(existing["state"])
         label = str(
-            event.payload.get("command")
-            or event.payload.get("tool")
+            event.payload.get("tool")
             or event.payload.get("namespace")
             or (existing["label"] if existing is not None else None)
             or kind
@@ -689,7 +812,7 @@ class ProjectingEventSink:
         )
         if not isinstance(summary, dict):
             raise StorageError("tool projection summary must be an object")
-        summary.update(event.payload)
+        summary.update(_tool_projection_payload(event))
         connection.execute(
             """
             INSERT INTO tool_projections(
@@ -722,7 +845,6 @@ class ProjectingEventSink:
         *,
         state: str,
         content: str | None,
-        plain_text: str | None = None,
         now: int,
     ) -> str | None:
         return insert_progress_update(
@@ -730,7 +852,6 @@ class ProjectingEventSink:
             turn_id=str(scope["id"]),
             state=state,
             content=content,
-            plain_text=plain_text,
             now=now,
             event_sequence=sequence,
             min_interval_ms=self._stream_update_ms,
@@ -894,7 +1015,7 @@ class ProjectingEventSink:
                     thread_hash,
                     label,
                     _agent_state(str(agent.get("status", ""))),
-                    _optional_text(agent.get("message"), 2048),
+                    None,
                     now,
                 ),
             )
@@ -987,7 +1108,7 @@ class ProjectingEventSink:
             return
         activity = str(event.payload.get("activity_kind", ""))
         activity_state = _subagent_activity_state(activity)
-        detail = _subagent_activity_detail(event)
+        detail = None
         for agent in agents:
             if (
                 str(agent["task_state"]) in _TASK_TERMINAL_STATES
@@ -1041,7 +1162,7 @@ class ProjectingEventSink:
     ) -> None:
         activity = str(event.payload.get("activity_kind", "unknown"))
         state = _subagent_activity_state(activity)
-        detail = _subagent_activity_detail(event)
+        detail = None
         existing = connection.execute(
             """
             SELECT *
@@ -1234,44 +1355,10 @@ class ProjectingEventSink:
             """,
             (target.value, terminal_code, now, scope["id"]),
         )
-        projection = connection.execute(
-            "SELECT * FROM message_projections WHERE turn_id = ?", (scope["id"],)
-        ).fetchone()
-        if projection:
-            ast = json.loads(projection["content_ast_json"])
-            transcript = terminal_assistant_transcript(
-                ast,
-                fallback=_terminal_fallback(target),
-            )
-            visible_text = transcript.visible_text
-            final_answer_text = transcript.canonical_final_answer
-            revision = int(projection["content_revision"]) + 1
-            connection.execute(
-                """
-                UPDATE message_projections
-                SET content_revision = ?, plain_text = ?, is_final = 1,
-                    last_event_sequence = ?
-                WHERE turn_id = ?
-                """,
-                (revision, visible_text, sequence, scope["id"]),
-            )
-        else:
-            ast = {"schema_version": 1, "blocks": []}
-            transcript = terminal_assistant_transcript(
-                ast,
-                fallback=_terminal_fallback(target),
-            )
-            visible_text = transcript.visible_text
-            final_answer_text = transcript.canonical_final_answer
-            connection.execute(
-                """
-                INSERT INTO message_projections(
-                    id, turn_id, content_revision, content_ast_json,
-                    plain_text, is_final, last_event_sequence
-                ) VALUES (?, ?, 1, ?, ?, 1, ?)
-                """,
-                (new_id(), scope["id"], canonical_json(ast), visible_text, sequence),
-            )
+        self._volatile_turns.finalize(
+            str(scope["id"]),
+            fallback=_terminal_fallback(target),
+        )
         self._finalize_open_tasks(
             connection,
             scope,
@@ -1306,11 +1393,20 @@ class ProjectingEventSink:
             if input_message_id is not None
             else None
         )
-        usage = latest_usage_payload(
-            connection,
-            turn_id=str(scope["id"]),
-            max_sequence=sequence,
-        )
+        turn_id = str(scope["id"])
+        usage = self._volatile_turns.usage(turn_id)
+        if usage is not None:
+            validate_usage_payload(usage)
+            connection.execute(
+                "UPDATE turns SET usage_scope = ? WHERE id = ?",
+                (USAGE_SCOPE, turn_id),
+            )
+        else:
+            usage = latest_usage_payload(
+                connection,
+                turn_id=turn_id,
+                max_sequence=sequence,
+            )
         self._insert_outbox(
             connection,
             destination_key=f"thread:{scope['discord_thread_id']}",
@@ -1330,8 +1426,7 @@ class ProjectingEventSink:
                 "input_channel_id": input_channel_id,
                 "discord_guild_id": scope["discord_guild_id"],
                 "usage": usage,
-                "visible_text": visible_text,
-                "final_answer_text": final_answer_text,
+                "content_storage": "volatile",
             },
             dedupe_key=f"turn:{scope['id']}:final",
             marker=f"turn-{str(scope['id'])[:8]}-final",
@@ -1636,6 +1731,114 @@ class ProjectingEventSink:
         return f"agent-{ordinal}"
 
 
+def _durable_event_payload(event: NormalizedEvent) -> dict[str, Any]:
+    payload = event.payload
+    if event.kind == "file_change.completed":
+        raw_changes = payload.get("changes")
+        changes = raw_changes if isinstance(raw_changes, list) else []
+        result: dict[str, Any] = {
+            "item_id": payload.get("item_id"),
+            "status": payload.get("status"),
+            "change_count": len(changes),
+        }
+        result.update(_content_metadata("changes", changes))
+        return result
+    if event.kind == "provider.error":
+        result = {
+            "will_retry": bool(payload.get("will_retry")),
+        }
+        result.update(_content_metadata("message", payload.get("message")))
+        return result
+    if event.kind in {
+        "turn.completed",
+        "turn.failed",
+        "turn.interrupted",
+        "turn.terminal_unparseable",
+    }:
+        result = {
+            "provider_turn_id": payload.get("provider_turn_id"),
+            "status": payload.get("status"),
+        }
+        result.update(_content_metadata("error", payload.get("error")))
+        return result
+    allowed_by_kind = {
+        "provider.unknown": ("method", "raw_hash", "raw_size"),
+        "provider.item": (
+            "item_id",
+            "type",
+            "lifecycle",
+            "raw_hash",
+            "raw_size",
+        ),
+        "model.rerouted": ("from_model", "to_model", "reason"),
+        "model.safety": ("model", "faster_model", "show_buffering_ui"),
+        "model.verification": ("verifications",),
+        "turn.moderation": ("metadata_hash", "metadata_size"),
+        "runtime.stream_interrupted": ("code",),
+    }
+    allowed = allowed_by_kind.get(event.kind)
+    if allowed is not None:
+        return {key: payload.get(key) for key in allowed if key in payload}
+    if event.kind.startswith("review_mode."):
+        return {
+            key: payload.get(key)
+            for key in ("item_id", "review_hash", "review_size", "lifecycle")
+            if key in payload
+        }
+    return {
+        "payload_hash": sha256_text(canonical_json(dict(payload))),
+        "payload_size": len(canonical_json(dict(payload)).encode()),
+    }
+
+
+def _tool_projection_payload(event: NormalizedEvent) -> dict[str, Any]:
+    payload = event.payload
+    allowed = (
+        "item_id",
+        "status",
+        "exit_code",
+        "duration_ms",
+        "tool",
+        "namespace",
+        "server",
+        "success",
+        "process_id_hash",
+        "stdin_hash",
+        "stdin_size",
+        "run_hash",
+        "event_name",
+        "execution_mode",
+        "handler_type",
+        "scope",
+        "entry_count",
+        "review_hash",
+        "target_item_id",
+        "risk_level",
+        "action_type",
+        "decision_source",
+        "result_hash",
+        "result_size",
+        "revised_prompt_hash",
+        "revised_prompt_size",
+        "has_saved_path",
+    )
+    result = {key: payload.get(key) for key in allowed if key in payload}
+    for key in ("action", "changes", "command", "error", "message", "output", "query"):
+        if key in payload:
+            result.update(_content_metadata(key, payload.get(key)))
+    return result
+
+
+def _content_metadata(name: str, value: object) -> dict[str, object]:
+    if value is None:
+        return {}
+    serialized = value if isinstance(value, str) else canonical_json(value)
+    return {
+        f"{name}_hash": sha256_text(serialized),
+        f"{name}_size": len(serialized.encode()),
+    }
+
+
 def terminal_state_for_event(
     event: NormalizedEvent,
     *,
@@ -1691,15 +1894,13 @@ def _tool_progress_content(event: NormalizedEvent) -> str:
         status = str(payload.get("status") or "reviewing")[:64]
         return f"Running · automatic approval review: `{status}`"
     if event.kind.startswith("command."):
-        label = str(payload.get("command") or "command")[:512]
-        return f"Running · command: `{label}`"
+        return "Running · Codex command"
     if event.kind.startswith("file_change."):
         return "Running · applying Codex file changes"
     if event.kind.startswith("image_view."):
         return "Running · inspecting an image"
     if event.kind.startswith("web_search."):
-        query = str(payload.get("query") or "search")[:512]
-        return f"Running · web search: `{query}`"
+        return "Running · Codex web search"
     if event.kind.startswith("image_generation."):
         status = str(payload.get("status") or "running")[:64]
         return f"Running · image generation: `{status}`"

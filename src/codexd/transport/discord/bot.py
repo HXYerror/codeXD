@@ -253,12 +253,14 @@ class CodexDBot(discord.Client):
             repository=self.repository,
             renderer=self.renderer,
             signer=self.signer,
+            volatile_turns=self.turns.volatile_turns,
         )
         self._outbox = OutboxWorker(
             repository=self.repository,
             transport=transport,
             worker_id=f"discord:{self.boot_id}",
             initial_ingress_ready=self._process_initial_ingress,
+            acknowledged=transport.acknowledged,
         )
         self._outbox.start()
         if self._inbound_reconciler is not None:
@@ -389,8 +391,9 @@ class CodexDBot(discord.Client):
         projects = await asyncio.to_thread(self.repository.list_enabled_projects)
         for project in projects:
             try:
-                runtime, _lease = await self.runtimes.ensure(project)
-                account = await runtime.account_status()
+                account = await self.runtimes.account_status_if_loaded(project.id)
+                if account is None:
+                    continue
                 auth_states.add(
                     "required" if account.auth_required else "authenticated"
                 )
@@ -2576,7 +2579,7 @@ class CodexDBot(discord.Client):
             f"interrupt "
             f"`{record.interrupt_origin.value if record.interrupt_origin else 'n/a'}` / "
             f"`{record.interrupt_reason or 'n/a'}`",
-            f"Projection: tool events {events['tool_events']} · file/diff events "
+            f"Projection: tools {events['tool_events']} · file/diff results "
             f"{events['file_events']} · usage "
             f"`{record.usage_scope or _usage_observation(events['usage_observed'])}`",
         ]

@@ -571,11 +571,11 @@ async def test_every_registered_discord_command_executes_through_bridge(
         (str(row["state"]), str(row["delivery"])) for row in rows
     } == {("succeeded", "delivered")}
     turn_list = interactions["/turn/list"].followup.send.await_args.args[0]
-    assert "summary `exercise every command`" in turn_list
+    assert "summary `[content not retained; 22 bytes]`" in turn_list
     assert "usage `pending`" in turn_list
     assert "input `" not in turn_list
     turn_show = interactions["/turn/show"].followup.send.await_args.args[0]
-    assert "Input summary: `exercise every command`" in turn_show
+    assert "Input summary: `[content not retained; 22 bytes]`" in turn_show
     assert "approval: `auto_review`" in turn_show
     assert (
         "https://discord.com/channels/100/300/bridge-command-message"

@@ -24,7 +24,6 @@ from codexd.errors import (
     NotFoundError,
     SecurityError,
 )
-from codexd.security.redaction import redacted_summary
 from codexd.storage.progress import insert_initial_progress
 from codexd.storage.records import (
     DynamicToolInvocationRecord,
@@ -1747,12 +1746,9 @@ class ScheduleRepository:
                     schedule["active_revision_id"],
                     fire_id,
                     turn_input.input_hash,
-                    redacted_summary(
-                        prompt,
-                        project_root=Path(str(schedule["root_path"])),
-                    ),
-                    prompt,
-                    schedule["skill_inputs_json"],
+                    f"[content not retained; {len(str(prompt).encode('utf-8'))} bytes]",
+                    None,
+                    None,
                     (
                         canonical_json([skill.name for skill in skills])
                         if skills

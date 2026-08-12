@@ -7,7 +7,7 @@ import logging
 import os
 import signal
 import uuid
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Mapping
 from contextlib import suppress
 from pathlib import Path
 
@@ -175,12 +175,14 @@ async def _run_daemon(config: AppConfig, bootstrap_token: str | None) -> int:
                 ),
             )
 
+        runtime_environment = dict(os.environ)
+        runtime_environment["RUST_LOG"] = config.runtime.codex_log_filter
         runtimes = RuntimeSupervisor(
             repository=repository,
             factory=runtime_factory,
             topology=config.runtime.topology,
-            environment=dict(os.environ),
-            environment_hash=_environment_hash(os.environ),
+            environment=runtime_environment,
+            environment_hash=_environment_hash(runtime_environment),
             codex_home=Path(os.environ["CODEX_HOME"])
             if os.environ.get("CODEX_HOME")
             else None,
@@ -512,7 +514,7 @@ async def _reset_discord_client(bot: CodexDBot) -> None:
     bot.clear()
 
 
-def _environment_hash(environment: os._Environ[str]) -> str:
+def _environment_hash(environment: Mapping[str, str]) -> str:
     import hashlib
 
     digest = hashlib.sha256()

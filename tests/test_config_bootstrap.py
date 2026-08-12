@@ -66,6 +66,14 @@ def test_config_defaults_to_full_access_and_compatible_sdk(tmp_path: Path) -> No
     assert config.runtime.sdk_version_policy == "compatible_range"
     assert config.runtime.codex_bin is None
     assert config.runtime.topology == "project_scoped"
+    assert config.runtime.codex_log_filter.startswith("warn,")
+    assert "codex_http_client::transport=error" in config.runtime.codex_log_filter
+    assert config.retention.events_days == 14
+    assert config.retention.logs_days == 7
+    assert config.retention.tool_output_hours == 24
+    assert config.retention.outbox_content_days == 7
+    assert config.retention.codex_logs_days == 7
+    assert config.retention.codex_trace_hours == 24
     assert config.discord.owner_user_id == 456
 
 
@@ -202,6 +210,7 @@ def test_bootstrap_removes_secrets_before_sdk_import() -> None:
     source = {
         "HOME": "/tmp/home",
         "PATH": "/usr/bin",
+        "CODEX_SQLITE_HOME": "/tmp/codex-state",
         "CODEXD_DISCORD_TOKEN": "discord-secret",
         "OPENAI_API_KEY": "provider-secret",
         "SAFE_FLAG": "on",
@@ -215,6 +224,7 @@ def test_bootstrap_removes_secrets_before_sdk_import() -> None:
     assert process_environment == {
         "HOME": "/tmp/home",
         "PATH": "/usr/bin",
+        "CODEX_SQLITE_HOME": "/tmp/codex-state",
         "SAFE_FLAG": "on",
     }
     assert_environment_scrubbed(

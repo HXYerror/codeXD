@@ -13,6 +13,7 @@ from codexd.domain.conversations import (
     ThreadConfig,
     ThreadIdentity,
 )
+from codexd.domain.events import NormalizedEvent
 from codexd.domain.ids import canonical_json, new_id, sha256_text, utc_now_ms
 from codexd.domain.schedules import MisfirePolicy, ScheduleKind
 from codexd.domain.turns import InterruptOrigin, TurnImage, TurnInput, TurnSource
@@ -21,6 +22,8 @@ from codexd.paths import AppPaths
 from codexd.service.diagnostics import export_diagnostics
 from codexd.service.doctor import run_doctor
 from codexd.service.manager import ServiceStatus
+from codexd.storage.compaction import compact_database
+from codexd.storage.projectors import ProjectingEventSink
 from codexd.storage.retention import run_retention
 from codexd.storage.schedules import ScheduleRepository
 from codexd.storage.sqlite import SQLiteStore
@@ -78,6 +81,168 @@ def test_sqlite_backup_rejects_fk_or_migration_corruption(tmp_path: Path) -> Non
         with pytest.raises(StorageError, match="migration checksum mismatch"):
             store.backup(checksum_backup)
     assert not checksum_backup.exists()
+
+
+def test_offline_compaction_removes_legacy_stream_and_progress_bloat(
+    storage_context: StorageContext,
+) -> None:
+    repository = storage_context.repository
+    repository.activate_thread_revision(
+        conversation_id=storage_context.conversation.id,
+        identity=ThreadIdentity(
+            thread_id="compact-thread",
+            requested_thread_id=None,
+            provider_session_id="compact-session",
+            forked_from_thread_id=None,
+            parent_thread_id=None,
+            provider_version="test",
+        ),
+        config=ThreadConfig(
+            model=None,
+            personality=None,
+            sandbox=SandboxProfile.FULL_ACCESS,
+        ),
+    )
+    lease = repository.create_runtime_lease(
+        scope_kind="project",
+        scope_key=storage_context.project.id,
+        project_id=storage_context.project.id,
+        environment_hash="compaction-runtime",
+    )
+    repository.mark_runtime_ready(
+        lease.id,
+        sdk_version="test",
+        runtime_version="test",
+        capability_hash="test",
+    )
+    claimed, _existing_turn = repository.claim_ingress_message(
+        discord_message_id="compact-legacy-detail",
+        content_hash="compact-content",
+        attachment_manifest_hash="compact-attachments",
+        project_id=storage_context.project.id,
+        conversation_id=storage_context.conversation.id,
+        discord_guild_id=storage_context.conversation.discord_guild_id,
+        discord_channel_id=storage_context.conversation.discord_thread_id,
+        boot_id="compact-boot",
+    )
+    assert claimed
+    turn = repository.enqueue_turn(
+        conversation_id=storage_context.conversation.id,
+        source=TurnSource.DISCORD,
+        turn_input=TurnInput(text="compact legacy detail"),
+        input_message_id="compact-legacy-detail",
+        ingress_message_id="compact-legacy-detail",
+    )
+    repository.claim_turn(
+        turn.id,
+        runtime_lease_id=lease.id,
+        runtime_generation=lease.generation,
+    )
+    repository.mark_turn_running(turn.id, "compact-provider-turn")
+    sink = ProjectingEventSink(storage_context.store, correlation_key=b"c" * 32)
+    assistant_text = "final assistant output"
+    for index in range(20):
+        repository.append_event(
+            project_id=storage_context.project.id,
+            conversation_id=storage_context.conversation.id,
+            turn_id=turn.id,
+            runtime_generation=lease.generation,
+            event=NormalizedEvent(
+                "assistant.text.delta",
+                {"item_id": "answer", "text": "a" * 50_000},
+                provider_event_id=f"legacy-assistant-{index}",
+            ),
+        )
+        sink.record(
+            turn_id=turn.id,
+            runtime_generation=lease.generation,
+            event=NormalizedEvent(
+                "diff.updated",
+                {"diff": f"diff-{index}\n" + ("d" * 50_000)},
+                provider_event_id=f"legacy-diff-{index}",
+            ),
+        )
+    sink.record(
+        turn_id=turn.id,
+        runtime_generation=lease.generation,
+        event=NormalizedEvent(
+            "assistant.message.completed",
+            {"item_id": "answer", "phase": "final_answer", "text": assistant_text},
+            provider_event_id="legacy-assistant-completed",
+        ),
+    )
+    sink.record(
+        turn_id=turn.id,
+        runtime_generation=lease.generation,
+        event=NormalizedEvent(
+            "turn.completed",
+            {"provider_turn_id": "compact-provider-turn", "status": "completed"},
+            provider_event_id="legacy-turn-completed",
+        ),
+    )
+    with storage_context.store.transaction() as connection:
+        connection.execute(
+            "UPDATE discord_outbox SET state = 'sent' WHERE state = 'pending'"
+        )
+        for index in range(20):
+            connection.execute(
+                """
+                INSERT INTO discord_outbox(
+                    id, destination_key, operation, payload_json, dedupe_key,
+                    coalesce_key, delivery_marker, state, attempts,
+                    next_attempt_at, created_at, updated_at
+                ) VALUES (?, ?, 'edit', ?, ?, ?, ?, 'superseded', 0, 1, 1, 1)
+                """,
+                (
+                    new_id(),
+                    f"thread:{storage_context.conversation.discord_thread_id}",
+                    canonical_json(
+                        {
+                            "kind": "turn_progress",
+                            "turn_id": turn.id,
+                            "revision": 10_000 + index,
+                            "state": "running",
+                            "content": "p" * 50_000,
+                        }
+                    ),
+                    f"legacy-progress-{turn.id}-{index}",
+                    f"turn:{turn.id}:progress",
+                    f"legacy-progress-{index}",
+                ),
+            )
+    storage_context.store.checkpoint("TRUNCATE")
+    before = storage_context.store.path.stat().st_size
+
+    result = compact_database(storage_context.store)
+    storage_context.store.vacuum()
+    after = storage_context.store.path.stat().st_size
+
+    assert result.deleted_snapshot_events == 0
+    assert result.redundant_progress_rows >= 19
+    assert result.deleted_stream_events >= 19
+    assert repository.turn_final_answer(turn.id) is None
+    assert storage_context.store.query_one(
+        "SELECT COUNT(*) AS count FROM events WHERE turn_id = ? AND kind = 'diff.updated'",
+        (turn.id,),
+    )["count"] == 0
+    assert len(
+        storage_context.store.query_all(
+            "SELECT id FROM discord_outbox WHERE coalesce_key = ?",
+            (f"turn:{turn.id}:progress",),
+        )
+    ) <= 2
+    assert storage_context.store.query_one(
+        """
+        SELECT 1
+        FROM ingress_messages i
+        JOIN discord_outbox o ON o.id = i.progress_outbox_id
+        WHERE i.discord_message_id = ?
+        """,
+        ("compact-legacy-detail",),
+    ) is not None
+    assert storage_context.store.integrity_check() == "ok"
+    assert storage_context.store.foreign_key_check() == ()
+    assert after < before
 
 
 def test_diagnostics_bundle_is_redacted_by_default(
@@ -172,7 +337,7 @@ def test_doctor_fails_when_discord_startup_prerequisites_are_missing(
     assert '"state": "missing"' in output
 
 
-def test_diagnostics_included_content_is_still_redacted(
+def test_diagnostics_never_exports_conversation_content(
     storage_context: StorageContext,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -244,7 +409,7 @@ def test_diagnostics_included_content_is_still_redacted(
     with zipfile.ZipFile(bundle) as archive:
         payload = archive.read("content.json")
     assert secret.encode() not in payload
-    assert b"<redacted>" in payload
+    assert b'"content_persistence": "disabled"' in payload
 
 
 def test_retention_preserves_active_and_removes_terminal_artifacts(
@@ -455,7 +620,7 @@ def test_retention_redacts_old_final_content_and_audit(
         now_ms=now,
     )
 
-    assert result.final_projections == 1
+    assert result.final_projections == 0
     assert result.outbox_payloads >= 2
     assert result.audit_entries >= 1
     assert result.incidents == 1
@@ -584,7 +749,7 @@ def test_retention_compacts_then_expires_tool_output_detail(
     run_retention(
         storage_context.store,
         paths,
-        RetentionConfig(),
+        RetentionConfig(events_days=90),
         now_ms=now,
     )
 
@@ -596,14 +761,15 @@ def test_retention_compacts_then_expires_tool_output_detail(
         "SELECT summary_json FROM tool_projections WHERE turn_id = ?",
         (turn.id,),
     )
-    assert event is not None and "sensitive tool output" not in event["payload_json"]
+    assert event is not None
+    assert "sensitive tool output" not in event["payload_json"]
     assert projection is not None
     assert "sensitive tool output" not in projection["summary_json"]
 
     run_retention(
         storage_context.store,
         paths,
-        RetentionConfig(),
+        RetentionConfig(events_days=90),
         now_ms=now + 61 * 24 * 60 * 60 * 1000,
     )
 
@@ -708,7 +874,7 @@ def test_retention_tombstones_then_deletes_terminal_turn_and_linked_fire(
     first = run_retention(
         storage_context.store,
         paths,
-        RetentionConfig(events_days=90),
+        RetentionConfig(events_days=90, outbox_content_days=180),
         now_ms=91 * 24 * 60 * 60 * 1000,
     )
 
@@ -732,7 +898,7 @@ def test_retention_tombstones_then_deletes_terminal_turn_and_linked_fire(
     assert storage_context.store.query_one(
         "SELECT 1 FROM message_projections WHERE turn_id = ?",
         (materialized.turn_id,),
-    )
+    ) is None
     assert storage_context.store.query_one(
         "SELECT 1 FROM turns WHERE id = ? AND state = 'queued'",
         (recoverable.turn_id,),
@@ -741,7 +907,7 @@ def test_retention_tombstones_then_deletes_terminal_turn_and_linked_fire(
     second = run_retention(
         storage_context.store,
         paths,
-        RetentionConfig(events_days=90),
+        RetentionConfig(events_days=90, outbox_content_days=180),
         now_ms=181 * 24 * 60 * 60 * 1000,
     )
 

@@ -40,6 +40,36 @@ def build_parser() -> argparse.ArgumentParser:
     )
     backup = db_commands.add_parser("backup", help="checkpoint and back up SQLite")
     backup.add_argument("--output", type=Path, help="backup destination")
+    compact = db_commands.add_parser(
+        "compact",
+        help="remove redundant event detail and physically shrink SQLite",
+    )
+    compact.add_argument("--yes", action="store_true", help="confirm offline compaction")
+    compact.add_argument(
+        "--no-backup",
+        action="store_true",
+        help="skip the default verified pre-compaction backup",
+    )
+    compact.add_argument("--backup-output", type=Path, help="backup destination")
+    trim_codex_logs = db_commands.add_parser(
+        "trim-codex-logs",
+        help="remove verbose Codex feedback logs and shrink logs_2.sqlite",
+    )
+    trim_codex_logs.add_argument(
+        "--yes",
+        action="store_true",
+        help="confirm offline Codex feedback-log compaction",
+    )
+    trim_codex_logs.add_argument(
+        "--no-backup",
+        action="store_true",
+        help="skip the default verified pre-compaction backup",
+    )
+    trim_codex_logs.add_argument(
+        "--backup-output",
+        type=Path,
+        help="backup destination",
+    )
     auth = subparsers.add_parser("auth", help="manage local credentials")
     auth_services = auth.add_subparsers(dest="auth_service", required=True)
     discord = auth_services.add_parser("discord", help="manage the Discord bot token")
@@ -78,7 +108,7 @@ def build_parser() -> argparse.ArgumentParser:
     export.add_argument(
         "--include-content",
         action="store_true",
-        help="include bounded message/event content (sensitive)",
+        help="write a marker confirming that content persistence is disabled",
     )
     return parser
 
@@ -129,8 +159,12 @@ def _dispatch(
     if args.command == "db":
         from codexd.storage.sqlite import SQLiteStore
 
+        if args.db_command == "trim-codex-logs":
+            return _trim_codex_logs(config, args)
         if not config.paths.database.exists():
             raise ConfigurationError("database is not initialized")
+        if args.db_command == "compact":
+            return _compact_database(config, args)
         with SQLiteStore(config.paths.database) as store:
             store.validate_schema()
             if args.db_command == "backup":
@@ -183,6 +217,108 @@ def _dispatch(
         return 0
     parser_error = f"unsupported command: {args.command}"
     raise AssertionError(parser_error)
+
+
+def _compact_database(config: AppConfig, args: argparse.Namespace) -> int:
+    if not bool(args.yes):
+        raise ConfigurationError(
+            "database compaction requires --yes and a stopped codexD service"
+        )
+    from codexd.service.locking import InstanceLock
+    from codexd.storage.compaction import compact_database
+    from codexd.storage.sqlite import SQLiteStore
+
+    database = config.paths.database
+    before_bytes = database.stat().st_size
+    backup_path: Path | None = None
+    with InstanceLock(config.paths.instance_lock), SQLiteStore(database) as store:
+        print("codexd: checking database before compaction", file=sys.stderr, flush=True)
+        store.migrate()
+        store.validate_schema()
+        if store.integrity_check() != "ok" or store.foreign_key_check():
+            raise ConfigurationError("database checks failed before compaction")
+        if not bool(args.no_backup):
+            print("codexd: creating verified backup", file=sys.stderr, flush=True)
+            backup_path = args.backup_output or (
+                config.paths.backups
+                / f"codexd-precompact-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}.sqlite3"
+            )
+            backup_path = store.backup(backup_path)
+        print("codexd: removing redundant durable detail", file=sys.stderr, flush=True)
+        result = compact_database(
+            store,
+            progress=lambda stage: print(
+                f"codexd: {stage}",
+                file=sys.stderr,
+                flush=True,
+            ),
+        )
+        print("codexd: vacuuming database", file=sys.stderr, flush=True)
+        store.vacuum()
+        print("codexd: verifying compacted database", file=sys.stderr, flush=True)
+        if store.integrity_check() != "ok" or store.foreign_key_check():
+            raise ConfigurationError("database checks failed after compaction")
+    after_bytes = database.stat().st_size
+    print(
+        json.dumps(
+            {
+                "database": str(database),
+                "backup": str(backup_path) if backup_path is not None else None,
+                "before_bytes": before_bytes,
+                "after_bytes": after_bytes,
+                "reclaimed_bytes": max(0, before_bytes - after_bytes),
+                **result.as_dict(),
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def _trim_codex_logs(config: AppConfig, args: argparse.Namespace) -> int:
+    if not bool(args.yes):
+        raise ConfigurationError(
+            "Codex feedback-log compaction requires --yes and all Codex apps stopped"
+        )
+    from codexd.service.locking import InstanceLock
+    from codexd.storage.codex_feedback import (
+        codex_feedback_log_path,
+        compact_codex_feedback_logs,
+    )
+
+    path = codex_feedback_log_path(dict(os.environ), cwd=config.paths.data_dir)
+    backup_path = None
+    if not bool(args.no_backup):
+        backup_path = args.backup_output or (
+            config.paths.backups
+            / f"codex-feedback-precompact-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}.sqlite"
+        )
+    with InstanceLock(config.paths.instance_lock):
+        print(
+            "codexd: compacting Codex feedback log database",
+            file=sys.stderr,
+            flush=True,
+        )
+        result = compact_codex_feedback_logs(
+            path,
+            retention_days=config.retention.codex_logs_days,
+            trace_hours=config.retention.codex_trace_hours,
+            backup_path=backup_path,
+        )
+    print(
+        json.dumps(
+            {
+                "backup": str(backup_path) if backup_path is not None else None,
+                **result.as_dict(),
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0
 
 
 def _discord_auth(action: str) -> int:

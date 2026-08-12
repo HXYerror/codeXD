@@ -336,7 +336,11 @@ async def test_existing_thread_uses_one_ingest_and_one_turn_for_file_inputs(
     await bot._handle_message(message)
 
     ingress = storage_context.repository.get_ingress_message("910")
-    turn_input = storage_context.repository.load_turn_input(cast(str, ingress.turn_id))
+    turn_input = storage_context.repository.load_turn_input(
+        cast(str, ingress.turn_id),
+        volatile_text=content or None,
+        use_volatile_text=True,
+    )
     assert ingress.state == "ready"
     assert turn_input.text == (content or None)
     combined = sorted(
@@ -508,9 +512,10 @@ async def test_channel_mention_refetches_then_ingests_attachments_once(
     )
     assert outbox_row is not None
     original_payload_json = str(outbox_row["payload_json"])
-    assert json.loads(original_payload_json)["name"] == (
-        f"{expected_title} · {ingress.id[:4]}"
-    )
+    creation_payload = json.loads(original_payload_json)
+    assert creation_payload["name_strategy"] == "starter_message"
+    assert creation_payload["name_suffix"] == ingress.id[:4]
+    assert expected_title not in original_payload_json
 
     await bot._handle_message(message)
 
@@ -536,7 +541,11 @@ async def test_channel_mention_refetches_then_ingests_attachments_once(
     await bot._handle_message(message)
 
     ingress = storage_context.repository.get_ingress_message("911")
-    turn_input = storage_context.repository.load_turn_input(cast(str, ingress.turn_id))
+    turn_input = storage_context.repository.load_turn_input(
+        cast(str, ingress.turn_id),
+        volatile_text=expected_text,
+        use_volatile_text=True,
+    )
     assert ingress.state == "ready"
     assert turn_input.text == expected_text
     assert sorted(
