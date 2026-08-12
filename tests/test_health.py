@@ -32,7 +32,7 @@ async def test_health_reports_runtime_sqlite_capacity_and_write_latency(
         return {
             "topology": "project_scoped",
             "ready": 1,
-            "capacity_limit": 4,
+            "capacity_limit": 10,
             "capacity_in_use": 1,
         }
 
@@ -58,7 +58,7 @@ async def test_health_reports_runtime_sqlite_capacity_and_write_latency(
 
     payload = json.loads(health_path.read_text(encoding="utf-8"))
     assert payload["database"] == "degraded"
-    assert payload["runtime_slots"]["capacity_limit"] == 4
+    assert payload["runtime_slots"]["capacity_limit"] == 10
     assert payload["event_pump"]["p95_ms"] == 2.0
     storage = payload["storage"]
     assert storage["runtime_sqlite_homes"] == 1

@@ -68,7 +68,7 @@ def test_config_defaults_to_full_access_and_compatible_sdk(tmp_path: Path) -> No
     assert config.runtime.topology == "project_scoped"
     assert config.runtime.codex_log_filter.startswith("warn,")
     assert "codex_http_client::transport=error" in config.runtime.codex_log_filter
-    assert config.runtime.max_active_runtimes == 4
+    assert config.runtime.max_active_runtimes == 10
     assert config.runtime.idle_ttl_seconds == 15 * 60
     assert config.retention.events_days == 14
     assert config.retention.logs_days == 7

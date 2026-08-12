@@ -39,7 +39,7 @@ class RuntimeConfig:
     topology: str = "project_scoped"
     shutdown_drain_seconds: int = 30
     codex_log_filter: str = "warn,codex_http_client::transport=error"
-    max_active_runtimes: int = 4
+    max_active_runtimes: int = 10
     idle_ttl_seconds: int = 15 * 60
 
 
@@ -312,7 +312,7 @@ def _runtime_config(raw: dict[str, Any]) -> RuntimeConfig:
             512,
         ),
         max_active_runtimes=_positive_int(
-            raw.get("max_active_runtimes", 4),
+            raw.get("max_active_runtimes", 10),
             "runtime.max_active_runtimes",
         ),
         idle_ttl_seconds=_positive_int(

@@ -679,7 +679,7 @@ Phase 0 contract 通过时，v1 首选每个 project 一个 Runtime Slot：
 - 首次使用时 lazy start；
 - Discord ready/account preflight 只检查已经加载的 slot，绝不遍历 enabled Project
   调用 `ensure()`；未加载时 auth projection 为 `unknown`，由首次真实操作解析；
-- 默认最多加载 4 个 slot；容量满时按 FIFO 等待，并优先关闭已经达到 idle TTL、
+- 默认最多加载 10 个 slot；容量满时按 FIFO 等待，并优先关闭已经达到 idle TTL、
   无 active Turn/Side Query/provider barrier 的 LRU slot；
 - 无 live work 的 slot 空闲 15 分钟后自动关闭；active Turn 不受 idle TTL 影响；
 - 同一 project 的多个 Conversation 复用 SDK client；
@@ -5805,7 +5805,7 @@ Windows：
 | Account mutation | 本机运维 only；Discord `/status` 只读 |
 | Runtime topology | preferred one slot per project；共享 `$CODEX_HOME` contract 不通过则 one shared runtime |
 | Runtime idle eviction | 15 分钟，active work 禁止回收 |
-| Runtime slots | 默认最多 4；FIFO 等待 + safe LRU |
+| Runtime slots | 默认最多 10；FIFO 等待 + safe LRU |
 | Concurrent Turns | 受 runtime slot 容量约束，1 active Turn per Conversation |
 | Schedule | local persistent，默认 timezone UTC、misfire latest |
 | Turn hard timeout | off |

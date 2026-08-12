@@ -62,7 +62,7 @@ class RuntimeSupervisor:
         allowed_roots: tuple[Path, ...],
         codex_bin: Path | None = None,
         sqlite_root: Path | None = None,
-        max_active_runtimes: int = 4,
+        max_active_runtimes: int = 10,
         idle_ttl_seconds: float = 15 * 60,
         startup_timeout_seconds: float = _RUNTIME_STARTUP_TIMEOUT_SECONDS,
         watchdog_interval_seconds: float = _RUNTIME_WATCHDOG_INTERVAL_SECONDS,
