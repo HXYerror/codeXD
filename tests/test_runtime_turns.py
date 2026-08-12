@@ -42,7 +42,7 @@ from codexd.runtime.errors import (
 )
 from codexd.runtime.fake import FakeCodexRuntime
 from codexd.runtime.mailbox import MailboxRegistry
-from codexd.runtime.port import StartedTurn
+from codexd.runtime.port import RuntimeSlotConfig, StartedTurn
 from codexd.runtime.supervisor import RuntimeFactory, RuntimeSupervisor
 from codexd.security import private_files
 from codexd.storage.projectors import ProjectingEventSink
@@ -104,6 +104,226 @@ async def test_fake_runtime_turn_is_durable_end_to_end(
     finally:
         await coordinator.close(drain_seconds=1)
         await supervisor.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_capacity_evicts_idle_lru_and_isolates_sqlite_homes(
+    storage_context: StorageContext,
+) -> None:
+    second_root = storage_context.root.parent / "project-two"
+    second_root.mkdir()
+    second = storage_context.repository.bind_project(
+        name="test-two",
+        root_path=second_root,
+        guild_id=100,
+        channel_id=201,
+        sandbox_profile=SandboxProfile.FULL_ACCESS,
+    )
+    runtimes: dict[str, FakeCodexRuntime] = {}
+    slots: dict[str, RuntimeSlotConfig] = {}
+
+    async def factory(
+        slot: RuntimeSlotConfig, generation: int
+    ) -> FakeCodexRuntime:
+        project_id = str(slot.project_id)
+        runtime = FakeCodexRuntime(generation=generation)
+        runtimes[project_id] = runtime
+        slots[project_id] = slot
+        return runtime
+
+    sqlite_root = storage_context.root.parent / "runtime-sqlite"
+    supervisor = RuntimeSupervisor(
+        repository=storage_context.repository,
+        factory=factory,
+        topology="project_scoped",
+        environment={"SAFE": "1"},
+        environment_hash="environment",
+        codex_home=None,
+        neutral_cwd=storage_context.root / ".runtime",
+        allowed_roots=(storage_context.root.parent,),
+        sqlite_root=sqlite_root,
+        max_active_runtimes=1,
+        idle_ttl_seconds=30,
+    )
+    try:
+        await supervisor.ensure(storage_context.project)
+        supervisor._slots[storage_context.project.id].last_used_at -= 31
+
+        await supervisor.ensure(second)
+
+        assert runtimes[storage_context.project.id].closed
+        assert not runtimes[second.id].closed
+        first_slot = slots[storage_context.project.id]
+        second_slot = slots[second.id]
+        first_home = first_slot.sqlite_home
+        second_home = second_slot.sqlite_home
+        assert isinstance(first_home, Path)
+        assert isinstance(second_home, Path)
+        assert first_home.parent == sqlite_root
+        assert second_home.parent == sqlite_root
+        assert first_home != second_home
+        assert first_slot.environment["CODEX_SQLITE_HOME"] == str(first_home)
+        status = await supervisor.status()
+        assert status["capacity_limit"] == 1
+        assert status["capacity_in_use"] == 1
+        assert status["idle_evictions"] == 1
+        assert status["sqlite_isolated"] is True
+    finally:
+        await supervisor.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_idle_ttl_preserves_live_turn_then_reclaims_slot(
+    storage_context: StorageContext,
+) -> None:
+    fake = FakeCodexRuntime()
+
+    async def factory(_slot: object, _generation: int) -> FakeCodexRuntime:
+        return fake
+
+    supervisor = RuntimeSupervisor(
+        repository=storage_context.repository,
+        factory=factory,
+        topology="project_scoped",
+        environment={},
+        environment_hash="environment",
+        codex_home=None,
+        neutral_cwd=storage_context.root / ".runtime",
+        allowed_roots=(storage_context.root.parent,),
+        idle_ttl_seconds=0.01,
+    )
+    try:
+        _runtime, lease = await supervisor.ensure(storage_context.project)
+        storage_context.repository.activate_thread_revision(
+            conversation_id=storage_context.conversation.id,
+            identity=ThreadIdentity(
+                thread_id="runtime-live-thread",
+                requested_thread_id=None,
+                provider_session_id="runtime-live-session",
+                forked_from_thread_id=None,
+                parent_thread_id=None,
+                provider_version="test",
+            ),
+            config=ThreadConfig(
+                model=None,
+                personality=None,
+                sandbox=SandboxProfile.FULL_ACCESS,
+            ),
+        )
+        turn = storage_context.repository.enqueue_turn(
+            conversation_id=storage_context.conversation.id,
+            source=TurnSource.DISCORD,
+            turn_input=TurnInput(text="keep runtime busy"),
+            input_message_id="runtime-live-work",
+        )
+        storage_context.repository.claim_turn(
+            turn.id,
+            runtime_lease_id=lease.id,
+            runtime_generation=lease.generation,
+        )
+        supervisor._slots[storage_context.project.id].last_used_at -= 1
+
+        await supervisor.watchdog()
+        assert not fake.closed
+
+        storage_context.repository.terminal_turn(
+            turn.id,
+            target=TurnState.INTERRUPTED,
+            terminal_code="test_complete",
+        )
+        await supervisor.watchdog()
+
+        assert fake.closed
+        lease_row = storage_context.store.query_one(
+            "SELECT state FROM runtime_leases WHERE id = ?",
+            (lease.id,),
+        )
+        assert lease_row is not None and lease_row["state"] == "stopped"
+        status = await supervisor.status()
+        assert status["capacity_in_use"] == 0
+        assert status["idle_evictions"] == 1
+    finally:
+        await supervisor.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_shutdown_closes_loaded_slots_in_parallel(
+    storage_context: StorageContext,
+) -> None:
+    second_root = storage_context.root.parent / "parallel-project"
+    second_root.mkdir()
+    second = storage_context.repository.bind_project(
+        name="parallel",
+        root_path=second_root,
+        guild_id=100,
+        channel_id=202,
+        sandbox_profile=SandboxProfile.FULL_ACCESS,
+    )
+    close_started: list[str] = []
+    both_started = asyncio.Event()
+
+    class CoordinatedCloseRuntime(FakeCodexRuntime):
+        def __init__(self, name: str, generation: int) -> None:
+            super().__init__(generation=generation)
+            self.name = name
+
+        async def close(self) -> None:
+            close_started.append(self.name)
+            if len(close_started) == 2:
+                both_started.set()
+            await asyncio.wait_for(both_started.wait(), timeout=0.5)
+            await super().close()
+
+    async def factory(
+        slot: RuntimeSlotConfig, generation: int
+    ) -> FakeCodexRuntime:
+        return CoordinatedCloseRuntime(str(slot.project_id), generation)
+
+    supervisor = RuntimeSupervisor(
+        repository=storage_context.repository,
+        factory=factory,
+        topology="project_scoped",
+        environment={},
+        environment_hash="environment",
+        codex_home=None,
+        neutral_cwd=storage_context.root / ".runtime",
+        allowed_roots=(storage_context.root.parent,),
+        max_active_runtimes=2,
+    )
+    await supervisor.ensure(storage_context.project)
+    await supervisor.ensure(second)
+
+    await supervisor.close(timeout_seconds=1)
+
+    assert set(close_started) == {storage_context.project.id, second.id}
+
+
+def test_startup_recovery_marks_abandoned_runtime_leases_failed(
+    storage_context: StorageContext,
+) -> None:
+    lease = storage_context.repository.create_runtime_lease(
+        scope_kind="project",
+        scope_key=storage_context.project.id,
+        project_id=storage_context.project.id,
+        environment_hash="environment",
+    )
+    storage_context.repository.mark_runtime_ready(
+        lease.id,
+        sdk_version="0.144.4",
+        runtime_version="0.144.4",
+        capability_hash="capabilities",
+    )
+
+    recovered = storage_context.repository.recover_startup(current_boot_id="new-boot")
+
+    row = storage_context.store.query_one(
+        "SELECT state, failure_code, ended_at FROM runtime_leases WHERE id = ?",
+        (lease.id,),
+    )
+    assert row is not None
+    assert (row["state"], row["failure_code"]) == ("failed", "daemon_restarted")
+    assert row["ended_at"] is not None
+    assert recovered["stale_runtime_leases"] == 1
 
 
 @pytest.mark.asyncio
@@ -342,6 +562,9 @@ async def test_event_pump_batches_consecutive_stream_deltas(
         final = coordinator.volatile_turns.final(turn.id)
         assert final is not None
         assert final.final_answer_text == final_text
+        metrics = coordinator.event_metrics()
+        assert metrics["count"] > 0
+        assert metrics["p95_ms"] >= 0
     finally:
         await coordinator.close(drain_seconds=1)
         await supervisor.close()

@@ -165,6 +165,9 @@ class TurnCoordinator:
     def volatile_turns(self) -> VolatileTurnStore:
         return self._volatile_turns
 
+    def event_metrics(self) -> dict[str, float | int]:
+        return self._event_pump.metrics()
+
     async def _assert_image_model(self, conversation_id: str) -> None:
         conversation = await asyncio.to_thread(
             self._repository.get_conversation, conversation_id

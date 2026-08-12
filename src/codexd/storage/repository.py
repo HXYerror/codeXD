@@ -2548,6 +2548,40 @@ class Repository:
         )
         return int(row["count"]) if row is not None else 0
 
+    def runtime_scope_has_live_work(
+        self,
+        lease_id: str,
+        *,
+        project_id: str | None,
+    ) -> bool:
+        project_clause = "" if project_id is None else "AND project_id = ?"
+        project_parameters: tuple[object, ...] = (
+            () if project_id is None else (project_id,)
+        )
+        row = self.store.query_one(
+            f"""
+            SELECT (
+                EXISTS(
+                    SELECT 1 FROM turns
+                    WHERE runtime_lease_id = ?
+                      AND state IN ('starting', 'running', 'cancelling')
+                )
+                OR EXISTS(
+                    SELECT 1 FROM side_queries
+                    WHERE state IN ('accepted', 'running')
+                    {project_clause}
+                )
+                OR EXISTS(
+                    SELECT 1 FROM conversations
+                    WHERE provider_barrier_kind IS NOT NULL
+                    {project_clause}
+                )
+            ) AS live
+            """,
+            (lease_id, *project_parameters, *project_parameters),
+        )
+        return bool(row is not None and row["live"])
+
     def mark_runtime_stopping(self, lease_id: str) -> None:
         now = utc_now_ms()
         with self.store.transaction() as connection:
@@ -5489,6 +5523,14 @@ class Repository:
                     """
                 ).fetchone()[0]
             )
+            outbox_lease_losses = int(
+                connection.execute(
+                    """
+                    SELECT COALESCE(SUM(occurrence_count), 0) FROM incidents
+                    WHERE code = 'outbox_delivery_lease_lost'
+                    """
+                ).fetchone()[0]
+            )
             attachments_total = int(
                 connection.execute("SELECT COUNT(*) FROM attachments").fetchone()[0]
             )
@@ -5496,6 +5538,11 @@ class Repository:
                 connection.execute(
                     "SELECT COUNT(*) FROM attachments WHERE retention_until <= ?",
                     (now,),
+                ).fetchone()[0]
+            )
+            event_sequence = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(sequence), 0) FROM events"
                 ).fetchone()[0]
             )
         return {
@@ -5514,6 +5561,7 @@ class Repository:
                 if oldest_outbox is not None
                 else 0
             ),
+            "outbox_lease_losses": outbox_lease_losses,
             "provider_barriers": barriers,
             "turns_terminal": sum(
                 turns.get(state, 0)
@@ -5531,11 +5579,22 @@ class Repository:
             "attachments_total": attachments_total,
             "attachments_cleanup_due": attachments_cleanup_due,
             "unknown_provider_events": unknown_events,
+            "event_sequence": event_sequence,
         }
 
     def recover_startup(self, *, current_boot_id: str) -> dict[str, int]:
         now = utc_now_ms()
         with self.store.transaction() as connection:
+            stale_runtime_leases = connection.execute(
+                """
+                UPDATE runtime_leases
+                SET state = 'failed',
+                    failure_code = COALESCE(failure_code, 'daemon_restarted'),
+                    heartbeat_at = ?, ended_at = COALESCE(ended_at, ?)
+                WHERE state IN ('starting', 'ready', 'stopping')
+                """,
+                (now, now),
+            ).rowcount
             interrupted_rows = connection.execute(
                 """
                 SELECT t.id, t.state FROM turns t
@@ -5882,6 +5941,7 @@ class Repository:
                 "reconciled_turn_cancel_intents": reconciled_turn_cancel_intents,
                 "unknown_intents": unknown_intents,
                 "interrupted_side_queries": interrupted_side_queries,
+                "stale_runtime_leases": stale_runtime_leases,
             }
 
     def interrupt_for_shutdown(self) -> int:

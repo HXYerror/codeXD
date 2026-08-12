@@ -679,14 +679,16 @@ Phase 0 contract 通过时，v1 首选每个 project 一个 Runtime Slot：
 - 首次使用时 lazy start；
 - Discord ready/account preflight 只检查已经加载的 slot，绝不遍历 enabled Project
   调用 `ensure()`；未加载时 auth projection 为 `unknown`，由首次真实操作解析；
-- 启动后默认保留到 daemon 关闭；
+- 默认最多加载 10 个 slot；容量满时按 FIFO 等待，并优先关闭已经达到 idle TTL、
+  无 active Turn/Side Query/provider barrier 的 LRU slot；
+- 无 live work 的 slot 空闲 15 分钟后自动关闭；active Turn 不受 idle TTL 影响；
 - 同一 project 的多个 Conversation 复用 SDK client；
 - project-scoped Runtime Slot 崩溃只中断该 project 的 active Turn；shared
   fallback 的 blast radius 见下；
-- 不设置固定 Runtime Slot 上限，也不因预设配额拒绝新 project；
+- `runtime.max_active_runtimes` 和 `runtime.idle_ttl_seconds` 仅控制本地资源；
+  容量等待不丢弃已接受的 Turn；
 - 若宿主机确实无法创建 runtime，返回真实启动错误并记录 incident；
-- v1 不做基于 inactivity 的自动回收，避免重演后台任务被 idle reaper
-  误杀。
+- idle/LRU 回收前必须查询 durable live-work fence，不能只依据无输出时间判断。
 
 该拓扑假设多个官方 SDK/app-server client 可安全共享同一 service-user
 `$CODEX_HOME`、同时操作不同 Thread。Phase 0 必须用两个 project/cwd 的真实并行
@@ -1296,7 +1298,8 @@ Project/Conversation 计算 effective Thread/Turn config，并在每次 lifecycl
 v1 构造 `CodexConfig` 时按 slot scope 传 canonical project cwd 或 neutral runtime
 cwd，并显式
 `experimental_api=False`。`codex_bin=None` 让 SDK 解析自己声明的 bundled
-runtime；`launch_args_override=None`、`config_overrides=()`，client metadata
+runtime；`launch_args_override=None`，`config_overrides` 只包含 codexD 生成的
+`sqlite_home=<isolated path>`，client metadata
 使用 SDK 默认。当前 SDK 的 `CodexConfig.env` 是叠加到 `os.environ.copy()`，不是
 replacement；因此只传一份 allowlist mapping **不能** 阻断 inherited secret。
 daemon bootstrap 必须先把需要的 HOME/USERPROFILE、PATH、SystemRoot、临时目录、
@@ -1313,9 +1316,12 @@ userinfo/query credential。`CodexConfig.env` 只可再次叠加同一 validated
 non-secret mapping。bootstrap 后若
 process environment 出现 allowlist 外 key，Runtime Slot creation fail closed。
 `CODEX_SQLITE_HOME` 与 `CODEX_HOME` 同属允许的非 secret location metadata；
-codexD 为 child 显式设置受配置约束的 `RUST_LOG`，默认只保留 WARN/ERROR，
-并把 `codex_http_client::transport` 降到 ERROR，避免完整 HTTP/SSE
-正文和依赖 TRACE 写入 Codex feedback SQLite。Discord 输入不能覆盖该 filter。
+每个 project/shared slot 使用 service-owned、稳定且 owner-only 的独立 SQLite home，
+环境变量与最高优先级 config override 必须指向同一路径，禁止回落到共享
+`$CODEX_HOME/logs_2.sqlite`。codexD 为 child 显式设置受配置约束的 `RUST_LOG`，
+同时兼容 pinned 0.144.4 独立的 SQLite TRACE subscriber：SDK 初始化后、任何 provider
+Turn 前，事务性清除 TRACE/DEBUG/INFO 与原始 HTTP/SSE/app-server message，并安装
+fail-closed insert trigger。Discord 输入不能覆盖 filter、SQLite home 或 trigger。
 AWS/Azure/GCP/API-key credential environment variables 不在 allowlist；若某种
 provider account 只能依赖这类 inherited secret，v1 明确报
 `environmental_auth_unsupported`，不能为兼容而把它泄露给 agent command child。
@@ -2900,8 +2906,11 @@ Schedule recovery 随后：
 - `codexd db compact --yes` 只可在 daemon 停止并取得 exclusive instance lock 后执行：
   默认先做 verified backup，再清理旧式重复 delta/diff/progress，最后 VACUUM 与
   integrity/foreign-key check；
-- `codexd db trim-codex-logs --yes` 还要求所有 Codex/ChatGPT app-server 都已关闭；
-  检测到任何进程仍打开 `logs_2.sqlite` 时 fail closed，不在线删除共享日志库；
+- `codexd db trim-codex-logs --yes` 处理 legacy 共享日志库时仍要求所有
+  Codex/ChatGPT app-server 都已关闭；检测到任何进程仍打开目标库时 fail closed；
+- codexD 主库超过 `retention.database_size_budget_mib` 时，RetentionWorker 每分钟分批
+  提前清理 terminal tool detail、已送达 outbox content 和 final projection；不提前删除
+  active/pending 引用、incident/audit 或 terminal Turn identity；
 - 备份不包含 Codex 自己的 `$CODEX_HOME`，两者分别处理；
 - restore 后若 Codex rollout 不存在，Conversation 进入 `blocked`，不能静默
   start 新 thread。
@@ -5212,7 +5221,7 @@ service-status.txt
 | Outbox lease | 30 秒 |
 | Event quiet timeout | **无** |
 | Turn hard ceiling | **关闭** |
-| Runtime idle eviction | **关闭** |
+| Runtime idle eviction | 15 分钟；live-work fence 后才允许 |
 
 所有 timeout 产生 stable code，不能静默 cancel task。
 
@@ -5795,8 +5804,9 @@ Windows：
 | Experimental API | off；`CodexConfig.experimental_api=False` |
 | Account mutation | 本机运维 only；Discord `/status` 只读 |
 | Runtime topology | preferred one slot per project；共享 `$CODEX_HOME` contract 不通过则 one shared runtime |
-| Runtime idle eviction | off |
-| Concurrent Turns | 不设全局上限，1 active Turn per Conversation |
+| Runtime idle eviction | 15 分钟，active work 禁止回收 |
+| Runtime slots | 默认最多 10；FIFO 等待 + safe LRU |
+| Concurrent Turns | 受 runtime slot 容量约束，1 active Turn per Conversation |
 | Schedule | local persistent，默认 timezone UTC、misfire latest |
 | Turn hard timeout | off |
 | Quiet timeout | none |
@@ -5832,7 +5842,7 @@ Windows：
 10. daemon restart 不 replay provider-started Turn；只恢复从未进入 provider 的
     queued Schedule Turn。
 11. Conversation 可恢复不代表 Turn 可恢复。
-12. active Turn 时不 idle-evict Runtime Slot。
+12. active Turn 时不 idle-evict Runtime Slot；空闲 slot 到 TTL 或容量压力时可安全 LRU。
 13. Discord gateway reconnect 不关闭 Runtime Slot。
 14. renderer failure 不改变 Turn terminal state。
 15. 一个 TableBlock revision 只有一个逻辑 canonical render；远端 delivery

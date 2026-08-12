@@ -6,6 +6,7 @@ import hmac
 import importlib
 import importlib.metadata
 import inspect
+import json
 import logging
 import os
 import re
@@ -107,6 +108,7 @@ from codexd.runtime.port import (
 )
 from codexd.security import private_files
 from codexd.security.redaction import redact_diff, redact_text, redact_value
+from codexd.storage.codex_feedback import install_codex_feedback_guard
 
 SDK_DECLARED_RANGE = ">=0.144.4,<0.145"
 _MAX_DELTA = 16 * 1024
@@ -416,6 +418,26 @@ class CodexSDKRuntime:
             if entered:
                 await _close_after_failed_create(client, exc)
             raise
+        if slot.sqlite_home is not None:
+            try:
+                await asyncio.to_thread(
+                    install_codex_feedback_guard,
+                    slot.sqlite_home,
+                )
+            except BaseException as exc:
+                await _close_after_failed_create(client, exc)
+                raise AdapterInvariantError(
+                    AdapterFailure(
+                        code="codex_feedback_guard_failed",
+                        provider_exception=type(exc).__name__,
+                        message=(
+                            "Codex feedback storage could not be secured before "
+                            "provider work started"
+                        ),
+                        retryable=False,
+                        runtime_generation=generation,
+                    )
+                ) from exc
         return cls(client=client, slot=slot, generation=generation, manifest=manifest)
 
     async def capabilities(self) -> CapabilityManifest:
@@ -1372,10 +1394,15 @@ def _sdk_config(
     generation: int,
     experimental_api: bool = False,
 ) -> CodexConfig:
+    config_overrides: tuple[str, ...] = ()
+    if slot.sqlite_home is not None:
+        config_overrides = (
+            f"sqlite_home={json.dumps(str(slot.sqlite_home), ensure_ascii=False)}",
+        )
     return CodexConfig(
         codex_bin=str(slot.codex_bin) if slot.codex_bin is not None else None,
         launch_args_override=None,
-        config_overrides=(),
+        config_overrides=config_overrides,
         cwd=str(slot.cwd),
         env=_sdk_environment(slot, generation=generation),
         experimental_api=experimental_api,

@@ -49,6 +49,7 @@ class RetentionResult:
     audit_entries: int
     log_files: int
     orphan_artifacts: int
+    storage_pressure: bool
 
 
 class RetentionWorker:
@@ -58,7 +59,7 @@ class RetentionWorker:
         store: SQLiteStore,
         paths: AppPaths,
         config: RetentionConfig,
-        poll_seconds: float = 15 * 60,
+        poll_seconds: float = 60,
     ) -> None:
         self._store = store
         self._paths = paths
@@ -110,6 +111,11 @@ def run_retention(
     now_ms: int | None = None,
 ) -> RetentionResult:
     now = utc_now_ms() if now_ms is None else now_ms
+    wal_path = store.path.with_name(f"{store.path.name}-wal")
+    database_bytes = (
+        store.path.stat().st_size if store.path.exists() else 0
+    ) + (wal_path.stat().st_size if wal_path.exists() else 0)
+    storage_pressure = database_bytes > config.database_size_budget_mib * 1024 * 1024
     input_artifacts: list[tuple[str, Path]] = []
     render_artifacts: list[tuple[str, tuple[Path, ...]]] = []
     outbound_artifacts: list[tuple[str, Path]] = []
@@ -193,8 +199,17 @@ def run_retention(
                 )
             )
         event_cutoff = now - config.events_days * 24 * 60 * 60 * 1000
-        tool_output_cutoff = now - config.tool_output_hours * 60 * 60 * 1000
-        content_cutoff = now - config.outbox_content_days * 24 * 60 * 60 * 1000
+        terminal_cutoff = now - config.outbox_content_days * 24 * 60 * 60 * 1000
+        tool_output_cutoff = (
+            now
+            if storage_pressure
+            else now - config.tool_output_hours * 60 * 60 * 1000
+        )
+        content_cutoff = (
+            now
+            if storage_pressure
+            else now - config.outbox_content_days * 24 * 60 * 60 * 1000
+        )
         outbox_payloads = connection.execute(
             """
             UPDATE discord_outbox
@@ -713,7 +728,7 @@ def run_retention(
             )
     terminal_turns, linked_schedule_fires = _delete_expired_terminal_turns(
         store,
-        older_than_ms=content_cutoff,
+        older_than_ms=terminal_cutoff,
     )
     orphan_artifacts = _sweep_orphan_artifacts(
         store,
@@ -741,6 +756,7 @@ def run_retention(
         audit_entries=audit_entries,
         log_files=log_files,
         orphan_artifacts=orphan_artifacts,
+        storage_pressure=storage_pressure,
     )
 
 

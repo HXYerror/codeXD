@@ -189,6 +189,9 @@ async def _run_daemon(config: AppConfig, bootstrap_token: str | None) -> int:
             neutral_cwd=neutral_cwd,
             allowed_roots=runtime_allowed_roots,
             codex_bin=config.runtime.codex_bin,
+            sqlite_root=config.paths.data_dir / "runtime-sqlite",
+            max_active_runtimes=config.runtime.max_active_runtimes,
+            idle_ttl_seconds=config.runtime.idle_ttl_seconds,
         )
         sink = ProjectingEventSink(
             store,
@@ -275,6 +278,14 @@ async def _run_daemon(config: AppConfig, bootstrap_token: str | None) -> int:
             started_at=started_at,
             sdk_version=importlib.metadata.version("openai-codex"),
             runtime_version=importlib.metadata.version("openai-codex-cli-bin"),
+            runtime_sqlite_root=config.paths.data_dir / "runtime-sqlite",
+            database_size_budget_bytes=(
+                config.retention.database_size_budget_mib * 1024 * 1024
+            ),
+            runtime_sqlite_size_budget_bytes=(
+                config.retention.runtime_sqlite_size_budget_mib * 1024 * 1024
+            ),
+            event_metrics=turns.event_metrics,
             critical_failure=critical_failure,
         )
         retention = RetentionWorker(

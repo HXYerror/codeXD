@@ -39,6 +39,8 @@ class RuntimeConfig:
     topology: str = "project_scoped"
     shutdown_drain_seconds: int = 30
     codex_log_filter: str = "warn,codex_http_client::transport=error"
+    max_active_runtimes: int = 10
+    idle_ttl_seconds: int = 15 * 60
 
 
 @dataclass(frozen=True)
@@ -80,6 +82,8 @@ class RetentionConfig:
     outbox_content_days: int = 7
     codex_logs_days: int = 7
     codex_trace_hours: int = 24
+    database_size_budget_mib: int = 512
+    runtime_sqlite_size_budget_mib: int = 1024
 
 
 @dataclass(frozen=True)
@@ -266,6 +270,8 @@ def _runtime_config(raw: dict[str, Any]) -> RuntimeConfig:
             "topology",
             "shutdown_drain_seconds",
             "codex_log_filter",
+            "max_active_runtimes",
+            "idle_ttl_seconds",
         },
         "runtime",
     )
@@ -304,6 +310,14 @@ def _runtime_config(raw: dict[str, Any]) -> RuntimeConfig:
             ),
             "runtime.codex_log_filter",
             512,
+        ),
+        max_active_runtimes=_positive_int(
+            raw.get("max_active_runtimes", 10),
+            "runtime.max_active_runtimes",
+        ),
+        idle_ttl_seconds=_positive_int(
+            raw.get("idle_ttl_seconds", 15 * 60),
+            "runtime.idle_ttl_seconds",
         ),
     )
 
@@ -399,6 +413,8 @@ def _retention_config(raw: dict[str, Any]) -> RetentionConfig:
         "outbox_content_days",
         "codex_logs_days",
         "codex_trace_hours",
+        "database_size_budget_mib",
+        "runtime_sqlite_size_budget_mib",
     }
     _reject_unknown(raw, names, "retention")
     return RetentionConfig(
@@ -421,6 +437,14 @@ def _retention_config(raw: dict[str, Any]) -> RetentionConfig:
         ),
         codex_trace_hours=_positive_int(
             raw.get("codex_trace_hours", 24), "retention.codex_trace_hours"
+        ),
+        database_size_budget_mib=_positive_int(
+            raw.get("database_size_budget_mib", 512),
+            "retention.database_size_budget_mib",
+        ),
+        runtime_sqlite_size_budget_mib=_positive_int(
+            raw.get("runtime_sqlite_size_budget_mib", 1024),
+            "retention.runtime_sqlite_size_budget_mib",
         ),
     )
 

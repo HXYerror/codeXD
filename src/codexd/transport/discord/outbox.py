@@ -301,7 +301,12 @@ class OutboxWorker:
             if not renewed:
                 if stop.is_set():
                     return
-                raise RuntimeError(
+                await self._record_worker_incident(
+                    code="outbox_delivery_lease_lost",
+                    summary="Discord outbox delivery lease was lost",
+                    details={"outbox_id": record.id},
+                )
+                raise OutboxLeaseLost(
                     f"outbox delivery lease was lost for {record.id}"
                 )
 
@@ -319,6 +324,8 @@ class OutboxWorker:
                 processed = await self.drain_once()
             except asyncio.CancelledError:
                 raise
+            except OutboxLeaseLost:
+                processed = False
             except Exception as exc:
                 logger.exception("Outbox worker iteration failed")
                 await self._record_worker_incident(
@@ -349,6 +356,10 @@ class OutboxWorker:
             )
         except Exception:
             logger.exception("Failed to persist outbox worker incident")
+
+
+class OutboxLeaseLost(RuntimeError):
+    """The delivery worker no longer owns its durable outbox claim."""
 
 
 class DiscordOutboxTransport:

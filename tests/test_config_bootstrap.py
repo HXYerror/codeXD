@@ -68,12 +68,16 @@ def test_config_defaults_to_full_access_and_compatible_sdk(tmp_path: Path) -> No
     assert config.runtime.topology == "project_scoped"
     assert config.runtime.codex_log_filter.startswith("warn,")
     assert "codex_http_client::transport=error" in config.runtime.codex_log_filter
+    assert config.runtime.max_active_runtimes == 10
+    assert config.runtime.idle_ttl_seconds == 15 * 60
     assert config.retention.events_days == 14
     assert config.retention.logs_days == 7
     assert config.retention.tool_output_hours == 24
     assert config.retention.outbox_content_days == 7
     assert config.retention.codex_logs_days == 7
     assert config.retention.codex_trace_hours == 24
+    assert config.retention.database_size_budget_mib == 512
+    assert config.retention.runtime_sqlite_size_budget_mib == 1024
     assert config.discord.owner_user_id == 456
 
 

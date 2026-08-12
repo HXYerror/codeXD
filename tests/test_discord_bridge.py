@@ -421,10 +421,14 @@ async def test_every_registered_discord_command_executes_through_bridge(
     runtimes.status = AsyncMock(
         return_value={
             "topology": "project_scoped",
-            "ready": 1,
-            "starting": 0,
-            "unhealthy": 0,
-        }
+                "ready": 1,
+                "starting": 0,
+                "unhealthy": 0,
+                "capacity_limit": 10,
+                "capacity_waiters": 0,
+                "idle_ttl_seconds": 900,
+                "sqlite_isolated": True,
+            }
     )
     bot = CodexDBot(
         config=AppConfig(
