@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import importlib.metadata
+import json
 import os
 from collections.abc import AsyncIterator
 from dataclasses import replace
@@ -815,7 +816,7 @@ def test_runtime_slot_forces_isolated_sqlite_home_over_user_config(
     assert config.env is not None
     assert config.env["CODEX_SQLITE_HOME"] == str(sqlite_home)
     assert config.config_overrides == (
-        f'sqlite_home="{sqlite_home}"',
+        f"sqlite_home={json.dumps(str(sqlite_home), ensure_ascii=False)}",
     )
 
 
