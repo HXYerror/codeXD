@@ -236,6 +236,12 @@ async def test_outbox_worker_cancels_delivery_after_lease_loss(
         await worker.drain_once()
 
     assert cancelled.is_set()
+    incident = storage_context.store.query_one(
+        "SELECT occurrence_count FROM incidents WHERE code = ?",
+        ("outbox_delivery_lease_lost",),
+    )
+    assert incident is not None and incident["occurrence_count"] == 1
+    assert storage_context.repository.health_counts()["outbox_lease_losses"] == 1
 
 
 @pytest.mark.asyncio

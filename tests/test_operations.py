@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import zipfile
 from pathlib import Path
@@ -551,6 +552,63 @@ def test_retention_sweeps_old_unreferenced_artifacts(
 
     assert result.orphan_artifacts == 1
     assert not orphan.exists()
+
+
+def test_retention_applies_recent_terminal_cleanup_under_size_pressure(
+    storage_context: StorageContext,
+) -> None:
+    turn = storage_context.repository.enqueue_turn(
+        conversation_id=storage_context.conversation.id,
+        source=TurnSource.DISCORD,
+        turn_input=TurnInput(text="pressure cleanup"),
+        input_message_id="pressure-cleanup",
+    )
+    storage_context.repository.request_cancel(turn.id, origin=InterruptOrigin.USER)
+    now = utc_now_ms()
+    with storage_context.store.transaction() as connection:
+        connection.execute(
+            """
+            INSERT INTO discord_outbox(
+                id, destination_key, operation, payload_json, dedupe_key,
+                delivery_marker, state, attempts, next_attempt_at,
+                created_at, updated_at
+            ) VALUES (
+                'pressure-final', 'thread:300', 'send', ?, 'pressure-final',
+                'pressure-final', 'sent', 1, ?, ?, ?
+            )
+            """,
+            (
+                canonical_json(
+                    {
+                        "kind": "turn_final",
+                        "turn_id": turn.id,
+                        "state": "cancelled",
+                        "terminal_code": "cancelled_before_start",
+                        "legacy_content": "must be compacted",
+                    }
+                ),
+                now,
+                now,
+                now,
+            ),
+        )
+
+    result = run_retention(
+        storage_context.store,
+        AppPaths(storage_context.store.path.parent, storage_context.store.path.parent / "logs"),
+        RetentionConfig(database_size_budget_mib=0),
+        now_ms=now + 1,
+    )
+
+    payload = storage_context.store.query_one(
+        "SELECT payload_json FROM discord_outbox WHERE id = 'pressure-final'"
+    )
+    assert result.storage_pressure
+    assert result.outbox_payloads >= 1
+    assert payload is not None
+    compacted = json.loads(str(payload["payload_json"]))
+    assert compacted["compacted"] == 1
+    assert "legacy_content" not in compacted
 
 
 def test_retention_redacts_old_final_content_and_audit(

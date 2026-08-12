@@ -217,6 +217,8 @@ def _redacted_config(config: AppConfig) -> str:
             "[runtime]",
             f'topology = "{config.runtime.topology}"',
             f'codex_log_filter = "{config.runtime.codex_log_filter}"',
+            f"max_active_runtimes = {config.runtime.max_active_runtimes}",
+            f"idle_ttl_seconds = {config.runtime.idle_ttl_seconds}",
             "",
             "[security]",
             f'new_conversation_profile = "{config.security.default_sandbox_profile}"',
@@ -231,6 +233,11 @@ def _redacted_config(config: AppConfig) -> str:
             f"outbox_content_days = {config.retention.outbox_content_days}",
             f"codex_logs_days = {config.retention.codex_logs_days}",
             f"codex_trace_hours = {config.retention.codex_trace_hours}",
+            f"database_size_budget_mib = {config.retention.database_size_budget_mib}",
+            (
+                "runtime_sqlite_size_budget_mib = "
+                f"{config.retention.runtime_sqlite_size_budget_mib}"
+            ),
             "",
         )
     )

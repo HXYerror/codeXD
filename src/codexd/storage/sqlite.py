@@ -5,6 +5,8 @@ import importlib.resources
 import os
 import sqlite3
 import threading
+import time
+from collections import deque
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -30,6 +32,8 @@ class SQLiteStore:
         self.busy_timeout_ms = busy_timeout_ms
         self._connection: sqlite3.Connection | None = None
         self._lock = threading.RLock()
+        self._metrics_lock = threading.Lock()
+        self._write_latencies_ms: deque[float] = deque(maxlen=1024)
 
     def __enter__(self) -> SQLiteStore:
         self.open()
@@ -79,16 +83,35 @@ class SQLiteStore:
 
     @contextmanager
     def transaction(self, *, immediate: bool = True) -> Iterator[sqlite3.Connection]:
-        with self._lock:
-            connection = self.connection
-            try:
-                connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
-                yield connection
-            except BaseException:
-                connection.rollback()
-                raise
-            else:
-                connection.commit()
+        started = time.monotonic()
+        try:
+            with self._lock:
+                connection = self.connection
+                try:
+                    connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+                    yield connection
+                except BaseException:
+                    connection.rollback()
+                    raise
+                else:
+                    connection.commit()
+        finally:
+            if immediate:
+                elapsed_ms = (time.monotonic() - started) * 1000
+                with self._metrics_lock:
+                    self._write_latencies_ms.append(elapsed_ms)
+
+    def write_latency_snapshot(self) -> dict[str, float | int]:
+        with self._metrics_lock:
+            samples = sorted(self._write_latencies_ms)
+        if not samples:
+            return {"count": 0, "p50_ms": 0.0, "p95_ms": 0.0, "max_ms": 0.0}
+        return {
+            "count": len(samples),
+            "p50_ms": round(_percentile(samples, 0.50), 3),
+            "p95_ms": round(_percentile(samples, 0.95), 3),
+            "max_ms": round(samples[-1], 3),
+        }
 
     def migrate(self) -> int:
         with self._lock:
@@ -322,6 +345,11 @@ def _validate_schema_connection(connection: sqlite3.Connection) -> int:
     if missing:
         raise StorageError(f"database has unapplied migrations: {missing}")
     return max(expected_versions, default=0)
+
+
+def _percentile(samples: list[float], quantile: float) -> float:
+    index = max(0, min(len(samples) - 1, int((len(samples) - 1) * quantile)))
+    return samples[index]
 
 
 def _sql_statements(script: str) -> Iterator[str]:

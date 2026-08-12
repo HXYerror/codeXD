@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+import time
+from collections import deque
 from dataclasses import dataclass
 
 from codexd.domain.events import NormalizedEvent
@@ -42,6 +45,20 @@ class EventPump:
     ) -> None:
         self._repository = repository
         self._sink = sink
+        self._persist_latencies_ms: deque[float] = deque(maxlen=1024)
+        self._metrics_lock = threading.Lock()
+
+    def metrics(self) -> dict[str, float | int]:
+        with self._metrics_lock:
+            samples = sorted(self._persist_latencies_ms)
+        if not samples:
+            return {"count": 0, "p50_ms": 0.0, "p95_ms": 0.0, "max_ms": 0.0}
+        return {
+            "count": len(samples),
+            "p50_ms": round(samples[int((len(samples) - 1) * 0.50)], 3),
+            "p95_ms": round(samples[int((len(samples) - 1) * 0.95)], 3),
+            "max_ms": round(samples[-1], 3),
+        }
 
     async def run(self, *, local_turn_id: str, started: StartedTurn) -> PumpResult:
         terminal: tuple[TurnState, str] | None = None
@@ -196,6 +213,7 @@ class EventPump:
         started: StartedTurn,
         event: NormalizedEvent,
     ) -> tuple[tuple[TurnState, str] | None, int | None]:
+        started_at = time.monotonic()
         try:
             recorded = await asyncio.to_thread(
                 self._sink.record,
@@ -209,6 +227,8 @@ class EventPump:
             raise EventJournalError(
                 f"could not durably record provider event {event.kind}"
             ) from exc
+        finally:
+            self._observe_persist_latency(started_at)
         return recorded.terminal, recorded.sequence
 
     async def _record_stream_failure(
@@ -222,6 +242,7 @@ class EventPump:
             {"code": code},
             raw_type="runtime",
         )
+        started_at = time.monotonic()
         try:
             recorded = await asyncio.to_thread(
                 self._sink.record,
@@ -237,7 +258,14 @@ class EventPump:
             raise EventJournalError(
                 "could not durably record provider stream failure"
             ) from exc
+        finally:
+            self._observe_persist_latency(started_at)
         return recorded.sequence is not None
+
+    def _observe_persist_latency(self, started_at: float) -> None:
+        elapsed_ms = (time.monotonic() - started_at) * 1000
+        with self._metrics_lock:
+            self._persist_latencies_ms.append(elapsed_ms)
 
 
 def _buffer_key(event: NormalizedEvent) -> tuple[object, ...] | None:

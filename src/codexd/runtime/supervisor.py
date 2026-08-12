@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -18,6 +19,7 @@ from codexd.runtime.errors import (
     RuntimeUnavailable,
 )
 from codexd.runtime.port import CodexRuntime, RuntimeSlotConfig
+from codexd.security import private_files
 from codexd.storage.records import ProjectRecord, RuntimeLeaseRecord
 from codexd.storage.repository import Repository
 
@@ -42,6 +44,8 @@ class RuntimeSlot:
     ready_since: float | None = None
     last_watchdog_at: float = 0
     startup_task: asyncio.Task[object] | None = None
+    last_used_at: float = 0
+    capacity_reserved: bool = False
 
 
 class RuntimeSupervisor:
@@ -57,6 +61,9 @@ class RuntimeSupervisor:
         neutral_cwd: Path,
         allowed_roots: tuple[Path, ...],
         codex_bin: Path | None = None,
+        sqlite_root: Path | None = None,
+        max_active_runtimes: int = 4,
+        idle_ttl_seconds: float = 15 * 60,
         startup_timeout_seconds: float = _RUNTIME_STARTUP_TIMEOUT_SECONDS,
         watchdog_interval_seconds: float = _RUNTIME_WATCHDOG_INTERVAL_SECONDS,
         watchdog_timeout_seconds: float = _RUNTIME_WATCHDOG_TIMEOUT_SECONDS,
@@ -67,6 +74,8 @@ class RuntimeSupervisor:
             startup_timeout_seconds <= 0
             or watchdog_interval_seconds <= 0
             or watchdog_timeout_seconds <= 0
+            or max_active_runtimes <= 0
+            or idle_ttl_seconds <= 0
         ):
             raise ValueError("runtime timeouts and watchdog intervals must be positive")
         self._repository = repository
@@ -78,6 +87,14 @@ class RuntimeSupervisor:
         self._neutral_cwd = neutral_cwd
         self._allowed_roots = allowed_roots
         self._codex_bin = codex_bin
+        self._sqlite_root = sqlite_root
+        self._max_active_runtimes = max_active_runtimes
+        self._idle_ttl_seconds = idle_ttl_seconds
+        self._capacity_gate = asyncio.BoundedSemaphore(max_active_runtimes)
+        self._capacity_start_lock = asyncio.Lock()
+        self._capacity_in_use = 0
+        self._capacity_waiters = 0
+        self._idle_evictions = 0
         self._startup_timeout_seconds = startup_timeout_seconds
         self._watchdog_interval_seconds = watchdog_interval_seconds
         self._watchdog_timeout_seconds = watchdog_timeout_seconds
@@ -112,6 +129,7 @@ class RuntimeSupervisor:
                 raise InvariantError("runtime supervisor is closing")
             if slot.runtime is not None and slot.lease is not None:
                 if slot.lease.state == "ready":
+                    slot.last_used_at = time.monotonic()
                     if slot.ready_since and time.monotonic() - slot.ready_since >= 300:
                         slot.failures = 0
                     return slot.runtime, slot.lease
@@ -140,6 +158,7 @@ class RuntimeSupervisor:
             runtime: CodexRuntime | None = None
             manifest: CapabilityManifest | None = None
             try:
+                await self._reserve_capacity(slot)
                 lease = await asyncio.to_thread(
                     self._repository.create_runtime_lease,
                     scope_kind=(
@@ -149,7 +168,7 @@ class RuntimeSupervisor:
                     project_id=(
                         project.id if self._topology == "project_scoped" else None
                     ),
-                    environment_hash=self._environment_hash,
+                    environment_hash=slot_config.environment_hash,
                 )
                 slot.lease = lease
 
@@ -273,6 +292,7 @@ class RuntimeSupervisor:
                 else:
                     slot.runtime = None
                     slot.lease = None
+                    self._release_capacity(slot)
                 secondary_errors = tuple(
                     error
                     for error in (
@@ -302,6 +322,7 @@ class RuntimeSupervisor:
             )
             slot.ready_since = time.monotonic()
             slot.last_watchdog_at = slot.ready_since
+            slot.last_used_at = slot.ready_since
             if self._closing:
                 await self._close_ready_slot(
                     slot,
@@ -373,6 +394,7 @@ class RuntimeSupervisor:
                 if close_error is None:
                     slot.runtime = None
                     slot.lease = None
+                    self._release_capacity(slot)
                 else:
                     slot.runtime = runtime
                     slot.lease = RuntimeLeaseRecord(
@@ -422,32 +444,17 @@ class RuntimeSupervisor:
             ):
                 startup_task.cancel()
         deadline = time.monotonic() + timeout_seconds
-        for slot in slots:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                error = TimeoutError("Codex runtime close deadline expired")
-                errors.append(error)
-                await self._record_close_failure(
-                    slot,
-                    failure_code="runtime_close_timeout",
-                )
-                continue
-            try:
-                await asyncio.wait_for(slot.lock.acquire(), timeout=remaining)
-            except Exception as exc:
-                errors.append(exc)
-                await self._record_close_failure(
-                    slot,
-                    failure_code="runtime_close_lock_timeout",
-                )
-                continue
-            try:
-                try:
-                    await self._close_ready_slot(slot, deadline=deadline)
-                except Exception as exc:
-                    errors.append(exc)
-            finally:
-                slot.lock.release()
+        results = await asyncio.gather(
+            *(self._close_slot_for_shutdown(slot, deadline=deadline) for slot in slots),
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, asyncio.CancelledError):
+                raise result
+            if isinstance(result, Exception):
+                errors.append(result)
+            elif isinstance(result, BaseException):
+                raise result
         if errors:
             raise ExceptionGroup("one or more Codex runtimes did not close", errors)
 
@@ -485,6 +492,12 @@ class RuntimeSupervisor:
                 else "idle"
             ),
             "watchdog_failures": self._watchdog_failures,
+            "capacity_limit": self._max_active_runtimes,
+            "capacity_in_use": self._capacity_in_use,
+            "capacity_waiters": self._capacity_waiters,
+            "idle_ttl_seconds": int(self._idle_ttl_seconds),
+            "idle_evictions": self._idle_evictions,
+            "sqlite_isolated": self._sqlite_root is not None,
         }
 
     def _schedule_watchdog(self) -> None:
@@ -524,6 +537,34 @@ class RuntimeSupervisor:
             slots = tuple(self._slots.values())
         if slots:
             await asyncio.gather(*(self._watchdog_slot(slot) for slot in slots))
+
+    async def _close_slot_for_shutdown(
+        self,
+        slot: RuntimeSlot,
+        *,
+        deadline: float,
+    ) -> None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            await self._record_close_failure(
+                slot,
+                failure_code="runtime_close_timeout",
+            )
+            raise TimeoutError("Codex runtime close deadline expired")
+        try:
+            await asyncio.wait_for(slot.lock.acquire(), timeout=remaining)
+        except Exception:
+            await self._record_close_failure(
+                slot,
+                failure_code="runtime_close_lock_timeout",
+            )
+            raise
+        try:
+            await self._close_ready_slot(slot, deadline=deadline)
+            if slot.runtime is None:
+                self._release_capacity(slot)
+        finally:
+            slot.lock.release()
 
     async def project_status(self, project_id: str) -> dict[str, int | str]:
         key = project_id if self._topology == "project_scoped" else "shared"
@@ -657,12 +698,34 @@ class RuntimeSupervisor:
         slot.lease = None
         slot.ready_since = None
         slot.last_watchdog_at = 0
+        slot.last_used_at = 0
+        self._release_capacity(slot)
 
     async def _watchdog_slot(self, slot: RuntimeSlot) -> None:
         now = time.monotonic()
         async with slot.lock:
             runtime = slot.runtime
             lease = slot.lease
+            if (
+                runtime is not None
+                and lease is not None
+                and lease.state == "ready"
+                and slot.last_used_at > 0
+                and now - slot.last_used_at >= self._idle_ttl_seconds
+                and not await asyncio.to_thread(
+                    self._repository.runtime_scope_has_live_work,
+                    lease.id,
+                    project_id=(
+                        slot.key if self._topology == "project_scoped" else None
+                    ),
+                )
+            ):
+                await self._close_ready_slot(
+                    slot,
+                    deadline=time.monotonic() + _RUNTIME_CLOSE_TIMEOUT_SECONDS,
+                )
+                self._idle_evictions += 1
+                return
             if (
                 runtime is None
                 or lease is None
@@ -759,6 +822,69 @@ class RuntimeSupervisor:
             failure_code=failure_code,
         )
 
+    async def _reserve_capacity(self, slot: RuntimeSlot) -> None:
+        if slot.capacity_reserved:
+            return
+        self._capacity_waiters += 1
+        try:
+            async with self._capacity_start_lock:
+                if self._capacity_in_use >= self._max_active_runtimes:
+                    await self._evict_lru_idle_slot(exclude=slot)
+                await self._capacity_gate.acquire()
+                if self._closing:
+                    self._capacity_gate.release()
+                    raise InvariantError("runtime supervisor is closing")
+                slot.capacity_reserved = True
+                self._capacity_in_use += 1
+        finally:
+            self._capacity_waiters -= 1
+
+    async def _evict_lru_idle_slot(self, *, exclude: RuntimeSlot) -> bool:
+        async with self._slots_lock:
+            candidates = sorted(
+                (
+                    slot
+                    for slot in self._slots.values()
+                    if slot is not exclude and slot.last_used_at > 0
+                ),
+                key=lambda slot: slot.last_used_at,
+            )
+        now = time.monotonic()
+        for candidate in candidates:
+            if now - candidate.last_used_at < self._idle_ttl_seconds:
+                continue
+            async with candidate.lock:
+                lease = candidate.lease
+                if (
+                    candidate.runtime is None
+                    or lease is None
+                    or lease.state != "ready"
+                    or await asyncio.to_thread(
+                        self._repository.runtime_scope_has_live_work,
+                        lease.id,
+                        project_id=(
+                            candidate.key
+                            if self._topology == "project_scoped"
+                            else None
+                        ),
+                    )
+                ):
+                    continue
+                await self._close_ready_slot(
+                    candidate,
+                    deadline=time.monotonic() + _RUNTIME_CLOSE_TIMEOUT_SECONDS,
+                )
+                self._idle_evictions += 1
+                return True
+        return False
+
+    def _release_capacity(self, slot: RuntimeSlot) -> None:
+        if not slot.capacity_reserved:
+            return
+        slot.capacity_reserved = False
+        self._capacity_in_use -= 1
+        self._capacity_gate.release()
+
     def _slot_config(self, project: ProjectRecord) -> RuntimeSlotConfig:
         if self._topology == "project_scoped":
             cwd = project.root_path
@@ -769,15 +895,27 @@ class RuntimeSupervisor:
             cwd = self._neutral_cwd
             project_id = None
             scope_kind = "shared"
+        environment = dict(self._environment)
+        sqlite_home: Path | None = None
+        if self._sqlite_root is not None:
+            private_files.ensure_private_directory(self._sqlite_root)
+            digest = hashlib.sha256(
+                f"{scope_kind}:{project.id if project_id is not None else 'shared'}".encode()
+            ).hexdigest()[:32]
+            sqlite_home = self._sqlite_root / f"{scope_kind}-{digest}"
+            private_files.ensure_private_directory(sqlite_home)
+            environment["CODEX_SQLITE_HOME"] = str(sqlite_home)
+        environment_hash = _environment_hash(environment)
         return RuntimeSlotConfig(
             scope_kind=scope_kind,
             project_id=project_id,
             cwd=cwd,
             codex_home=self._codex_home,
-            environment=dict(self._environment),
-            environment_hash=self._environment_hash,
+            environment=environment,
+            environment_hash=environment_hash,
             topology_contract=self._topology,
             codex_bin=self._codex_bin,
+            sqlite_home=sqlite_home,
         )
 
 
@@ -793,3 +931,13 @@ def _assert_image_capability(catalog: ModelCatalogSnapshot) -> None:
         runtime_generation=0,
     )
     raise AdapterError(failure)
+
+
+def _environment_hash(environment: dict[str, str]) -> str:
+    digest = hashlib.sha256()
+    for name, value in sorted(environment.items()):
+        digest.update(name.encode())
+        digest.update(b"\0")
+        digest.update(value.encode())
+        digest.update(b"\0")
+    return digest.hexdigest()

@@ -10,7 +10,78 @@ from codexd.storage import codex_feedback
 from codexd.storage.codex_feedback import (
     codex_feedback_log_path,
     compact_codex_feedback_logs,
+    install_codex_feedback_guard,
 )
+
+
+def test_codex_feedback_guard_scrubs_and_blocks_payload_logs(tmp_path: Path) -> None:
+    root = tmp_path / "runtime-sqlite"
+    root.mkdir()
+    path = root / "logs_2.sqlite"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts INTEGER NOT NULL,
+                ts_nanos INTEGER NOT NULL,
+                level TEXT NOT NULL,
+                target TEXT NOT NULL,
+                feedback_log_body TEXT,
+                estimated_bytes INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        connection.executemany(
+            """
+            INSERT INTO logs(ts, ts_nanos, level, target, feedback_log_body)
+            VALUES (1, 0, ?, ?, ?)
+            """,
+            (
+                ("TRACE", "codex_http_client::transport", "private prompt"),
+                ("DEBUG", "codex_core", "debug detail"),
+                ("INFO", "codex_app_server::outgoing_message", "assistant text"),
+                ("INFO", "codex_core::stream_events_utils", "tool payload"),
+                ("INFO", "codex_core", "ordinary info"),
+                ("WARN", "codex_core", "safe warning"),
+            ),
+        )
+
+    install_codex_feedback_guard(root)
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT level, target, feedback_log_body FROM logs"
+        ).fetchall() == [("WARN", "codex_core", "safe warning")]
+        connection.executemany(
+            """
+            INSERT INTO logs(ts, ts_nanos, level, target, feedback_log_body)
+            VALUES (2, 0, ?, ?, ?)
+            """,
+            (
+                ("TRACE", "codex_http_client::transport", "new private prompt"),
+                ("INFO", "codex_api::sse::responses", "private response"),
+                ("INFO", "codex_core", "new ordinary info"),
+                ("WARN", "codex_core", "second safe warning"),
+                ("ERROR", "codex_http_client::transport", "private transport error"),
+            ),
+        )
+        assert connection.execute(
+            "SELECT level, target, feedback_log_body FROM logs ORDER BY id"
+        ).fetchall() == [
+            ("WARN", "codex_core", "safe warning"),
+            ("WARN", "codex_core", "second safe warning"),
+        ]
+
+
+def test_codex_feedback_guard_requires_the_expected_schema(tmp_path: Path) -> None:
+    root = tmp_path / "runtime-sqlite"
+    root.mkdir()
+    with sqlite3.connect(root / "logs_2.sqlite") as connection:
+        connection.execute("CREATE TABLE unrelated (id INTEGER PRIMARY KEY)")
+
+    with pytest.raises(Exception, match="schema is unsupported"):
+        install_codex_feedback_guard(root)
 
 
 def test_codex_feedback_compaction_removes_transport_trace_and_old_detail(

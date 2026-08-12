@@ -794,6 +794,31 @@ def test_runtime_slot_can_select_an_explicit_codex_binary(tmp_path: Path) -> Non
     assert config.codex_bin == str(selected)
 
 
+def test_runtime_slot_forces_isolated_sqlite_home_over_user_config(
+    tmp_path: Path,
+) -> None:
+    slot = _runtime_slot(tmp_path)
+    sqlite_home = tmp_path / "isolated-sqlite"
+    slot = RuntimeSlotConfig(
+        scope_kind=slot.scope_kind,
+        project_id=slot.project_id,
+        cwd=slot.cwd,
+        codex_home=slot.codex_home,
+        environment={"CODEX_SQLITE_HOME": str(sqlite_home)},
+        environment_hash=slot.environment_hash,
+        topology_contract=slot.topology_contract,
+        sqlite_home=sqlite_home,
+    )
+
+    config = _sdk_config(slot, generation=4)
+
+    assert config.env is not None
+    assert config.env["CODEX_SQLITE_HOME"] == str(sqlite_home)
+    assert config.config_overrides == (
+        f'sqlite_home="{sqlite_home}"',
+    )
+
+
 def test_known_turn_notification_is_normalized() -> None:
     payload = TurnCompletedNotification(
         thread_id="thread",

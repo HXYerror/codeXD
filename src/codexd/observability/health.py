@@ -13,6 +13,7 @@ from codexd.domain.ids import utc_now_ms
 from codexd.storage.repository import Repository
 
 RuntimeStatus = Callable[[], Awaitable[dict[str, int | str]]]
+EventMetrics = Callable[[], dict[str, float | int]]
 
 
 @dataclass
@@ -25,6 +26,10 @@ class HealthReporter:
     started_at: int
     sdk_version: str = "unknown"
     runtime_version: str = "unknown"
+    runtime_sqlite_root: Path | None = None
+    database_size_budget_bytes: int = 512 * 1024 * 1024
+    runtime_sqlite_size_budget_bytes: int = 1024 * 1024 * 1024
+    event_metrics: EventMetrics | None = None
     critical_failure: Callable[[BaseException], None] | None = None
 
     def __post_init__(self) -> None:
@@ -38,6 +43,7 @@ class HealthReporter:
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._critical_failure = self.critical_failure or (lambda _exc: None)
+        self._last_storage_sample: tuple[int, int, int] | None = None
 
     def start(self) -> None:
         if self._task is None:
@@ -70,6 +76,50 @@ class HealthReporter:
         )
         runtime = await self.runtime_status()
         now = utc_now_ms()
+        storage = await asyncio.to_thread(
+            _storage_metrics,
+            self.repository.store.path,
+            self.runtime_sqlite_root,
+        )
+        total_bytes = int(storage["total_bytes"])
+        event_sequence = counts["event_sequence"]
+        growth_bytes_per_minute = 0
+        event_rows_per_minute = 0
+        if self._last_storage_sample is not None:
+            sampled_at, previous_bytes, previous_sequence = self._last_storage_sample
+            elapsed_ms = max(1, now - sampled_at)
+            growth_bytes_per_minute = max(
+                0,
+                int((total_bytes - previous_bytes) * 60_000 / elapsed_ms),
+            )
+            event_rows_per_minute = max(
+                0,
+                int((event_sequence - previous_sequence) * 60_000 / elapsed_ms),
+            )
+        self._last_storage_sample = (now, total_bytes, event_sequence)
+        storage["growth_bytes_per_minute"] = growth_bytes_per_minute
+        storage["event_rows_per_minute"] = event_rows_per_minute
+        write_latency = self.repository.store.write_latency_snapshot()
+        event_metrics = self.event_metrics() if self.event_metrics is not None else {}
+        storage["write_latency"] = write_latency
+        pressure_reasons: list[str] = []
+        if int(storage["codexd_total_bytes"]) > self.database_size_budget_bytes:
+            pressure_reasons.append("codexd_size_budget")
+        if (
+            int(storage["runtime_sqlite_total_bytes"])
+            > self.runtime_sqlite_size_budget_bytes
+        ):
+            pressure_reasons.append("runtime_sqlite_size_budget")
+        if int(write_latency["count"]) >= 20 and float(write_latency["p95_ms"]) > 100:
+            pressure_reasons.append("sqlite_write_p95")
+        if (
+            int(event_metrics.get("count", 0)) >= 20
+            and float(event_metrics.get("p95_ms", 0)) > 500
+        ):
+            pressure_reasons.append("event_persist_p95")
+        storage["pressure_reasons"] = pressure_reasons
+        if self.database != "failed":
+            self.database = "degraded" if pressure_reasons else "healthy"
         payload: dict[str, Any] = {
             "schema_version": 1,
             "boot_id": self.boot_id,
@@ -105,8 +155,10 @@ class HealthReporter:
                 "retry": counts["outbox_retry"],
                 "dead_letter": counts["outbox_dead_letter"],
                 "oldest_age_ms": counts["outbox_oldest_age_ms"],
+                "lease_losses": counts["outbox_lease_losses"],
             },
             "unknown_provider_events": counts["unknown_provider_events"],
+            "event_pump": event_metrics,
             "discord_reconnect_count": self.discord_reconnect_count,
             "inbound_reconciliation": inbound,
             "database_size_bytes": (
@@ -114,6 +166,7 @@ class HealthReporter:
                 if self.repository.store.path.exists()
                 else 0
             ),
+            "storage": storage,
             "sdk_version": self.sdk_version,
             "runtime_version": self.runtime_version,
         }
@@ -159,3 +212,67 @@ def heartbeat_state(path: Path, *, now_ms: int | None = None) -> str:
     if age <= 60_000:
         return "degraded"
     return "stale"
+
+
+def _storage_metrics(database: Path, runtime_sqlite_root: Path | None) -> dict[str, Any]:
+    database_bytes = _regular_file_size(database)
+    database_wal_bytes = _regular_file_size(
+        database.with_name(f"{database.name}-wal")
+    )
+    runtime_main_bytes = 0
+    runtime_wal_bytes = 0
+    runtime_feedback_bytes = 0
+    runtime_homes = 0
+    if (
+        runtime_sqlite_root is not None
+        and runtime_sqlite_root.exists()
+        and runtime_sqlite_root.is_dir()
+        and not runtime_sqlite_root.is_symlink()
+    ):
+        try:
+            homes = tuple(runtime_sqlite_root.iterdir())
+        except OSError:
+            homes = ()
+        for home in homes:
+            if home.is_symlink() or not home.is_dir():
+                continue
+            runtime_homes += 1
+            try:
+                candidates = tuple(home.iterdir())
+            except OSError:
+                continue
+            for candidate in candidates:
+                if candidate.is_symlink() or not candidate.is_file():
+                    continue
+                try:
+                    size = candidate.stat().st_size
+                except OSError:
+                    continue
+                if candidate.name.endswith("-wal"):
+                    runtime_wal_bytes += size
+                elif candidate.suffix == ".sqlite":
+                    runtime_main_bytes += size
+                    if candidate.name.startswith("logs_"):
+                        runtime_feedback_bytes += size
+    codexd_total = database_bytes + database_wal_bytes
+    runtime_total = runtime_main_bytes + runtime_wal_bytes
+    return {
+        "codexd_database_bytes": database_bytes,
+        "codexd_wal_bytes": database_wal_bytes,
+        "codexd_total_bytes": codexd_total,
+        "runtime_sqlite_homes": runtime_homes,
+        "runtime_sqlite_database_bytes": runtime_main_bytes,
+        "runtime_sqlite_wal_bytes": runtime_wal_bytes,
+        "runtime_sqlite_feedback_bytes": runtime_feedback_bytes,
+        "runtime_sqlite_total_bytes": runtime_total,
+        "total_bytes": codexd_total + runtime_total,
+    }
+
+
+def _regular_file_size(path: Path) -> int:
+    try:
+        if path.is_symlink() or not path.is_file():
+            return 0
+        return path.stat().st_size
+    except OSError:
+        return 0

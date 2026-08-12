@@ -11,6 +11,19 @@ import psutil
 
 from codexd.errors import ConflictError, StorageError
 
+_GUARD_TRIGGER = "codexd_sensitive_feedback_guard_v1"
+_SENSITIVE_TARGET_PREFIXES = (
+    "codex_http_client::transport",
+    "codex_client::transport",
+    "codex_api::sse",
+    "codex_api::endpoint::responses_websocket",
+    "codex_api::responses_websocket",
+    "codex_app_server::incoming_message",
+    "codex_app_server::outgoing_message",
+    "codex_app_server::message_processor",
+    "codex_core::stream_events_utils",
+)
+
 
 @dataclass(frozen=True)
 class CodexFeedbackCompactionResult:
@@ -23,6 +36,90 @@ class CodexFeedbackCompactionResult:
 
     def as_dict(self) -> dict[str, int | str]:
         return asdict(self)
+
+
+def install_codex_feedback_guard(sqlite_home: Path) -> None:
+    """Prevent the pinned Codex runtime from persisting payload-bearing logs.
+
+    openai-codex 0.144.4 installs its SQLite feedback layer with an independent
+    TRACE filter, so RUST_LOG cannot protect this database.  Each codexD runtime
+    gets a private SQLite home and this trigger is installed before the runtime
+    is made available for provider work.
+    """
+
+    root = sqlite_home.expanduser().resolve(strict=True)
+    candidate = root / "logs_2.sqlite"
+    if candidate.is_symlink():
+        raise StorageError("Codex feedback database must not be a symlink")
+    target = candidate.resolve(strict=True)
+    if target.parent != root:
+        raise StorageError("Codex feedback database escaped its isolated root")
+    try:
+        connection = sqlite3.connect(target, isolation_level=None, timeout=5)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout = 5000")
+        connection.execute("PRAGMA secure_delete = ON")
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(logs)").fetchall()
+        }
+        required = {"level", "target", "feedback_log_body"}
+        if not required.issubset(columns):
+            raise StorageError("Codex feedback log schema is unsupported")
+        target_predicate = " OR ".join(
+            "NEW.target = " + _sql_string(prefix)
+            + " OR NEW.target GLOB " + _sql_string(f"{prefix}::*")
+            for prefix in _SENSITIVE_TARGET_PREFIXES
+        )
+        row_predicate = " OR ".join(
+            "target = " + _sql_string(prefix)
+            + " OR target GLOB " + _sql_string(f"{prefix}::*")
+            for prefix in _SENSITIVE_TARGET_PREFIXES
+        )
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute(
+                f"DELETE FROM logs WHERE level IN ('TRACE', 'DEBUG', 'INFO') "
+                f"OR {row_predicate}"
+            )
+            connection.execute(f'DROP TRIGGER IF EXISTS "{_GUARD_TRIGGER}"')
+            connection.execute(
+                f"""
+                CREATE TRIGGER "{_GUARD_TRIGGER}"
+                BEFORE INSERT ON logs
+                WHEN NEW.level IN ('TRACE', 'DEBUG', 'INFO') OR {target_predicate}
+                BEGIN
+                    SELECT RAISE(IGNORE);
+                END
+                """
+            )
+        except BaseException:
+            connection.rollback()
+            raise
+        else:
+            connection.commit()
+        installed = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+            (_GUARD_TRIGGER,),
+        ).fetchone()
+        if installed is None:
+            raise StorageError("Codex feedback guard was not installed")
+        checkpoint = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        if checkpoint is None or int(checkpoint[0]) != 0:
+            raise StorageError("Codex feedback guard could not truncate its startup WAL")
+    except StorageError:
+        raise
+    except (OSError, sqlite3.Error) as exc:
+        raise StorageError(f"Codex feedback guard failed: {exc}") from exc
+    finally:
+        if "connection" in locals():
+            connection.close()
+    if os.name != "nt":
+        target.chmod(0o600)
+
+
+def _sql_string(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
 
 
 def codex_feedback_log_path(

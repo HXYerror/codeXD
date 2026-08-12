@@ -28,6 +28,7 @@ class RuntimeSlotConfig:
     environment_hash: str
     topology_contract: str
     codex_bin: Path | None = None
+    sqlite_home: Path | None = None
 
 
 @dataclass(frozen=True)

@@ -2453,8 +2453,11 @@ class CodexDBot(discord.Client):
             f"auth `{self._codex_auth_state}`",
             f"Database: schema `{schema_version}` · integrity `{integrity}` · "
             f"foreign-key violations `{len(foreign_keys)}`",
-            f"Runtime: `{runtime['topology']}` · ready {runtime['ready']} · "
-            f"starting {runtime['starting']} · unhealthy {runtime['unhealthy']}",
+            f"Runtime: `{runtime['topology']}` · ready {runtime['ready']}/"
+            f"{runtime['capacity_limit']} · starting {runtime['starting']} · waiting "
+            f"{runtime['capacity_waiters']} · unhealthy {runtime['unhealthy']} · "
+            f"idle TTL {runtime['idle_ttl_seconds']}s · SQLite isolated "
+            f"{runtime['sqlite_isolated']}",
             f"Queued Turns: {counts['turns_queued']} · active: {counts['turns_active']}",
             f"Schedules active: {counts['schedules_active']} · blocked: "
             f"{counts['schedules_blocked']} · next "
@@ -2462,7 +2465,8 @@ class CodexDBot(discord.Client):
             f"Attachments retained: {counts['attachments_total']} · cleanup due: "
             f"{counts['attachments_cleanup_due']}",
             f"Outbox pending: {counts['outbox_pending']} · retry: "
-            f"{counts['outbox_retry']} · dead-letter: {counts['outbox_dead_letter']}",
+            f"{counts['outbox_retry']} · dead-letter: {counts['outbox_dead_letter']} · "
+            f"lease losses: {counts['outbox_lease_losses']}",
             f"Provider barriers: {counts['provider_barriers']}",
             f"Capability manifest: `{self.capability_manifest.digest[:16]}`",
         ]
