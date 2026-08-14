@@ -126,6 +126,24 @@ class TurnFile:
 
 
 @dataclass(frozen=True)
+class MaterializedTurnFile:
+    attachment_id: str
+    canonical_path: Path
+    sha256: str
+    size_bytes: int
+
+    def __post_init__(self) -> None:
+        if not self.attachment_id:
+            raise InvariantError("materialized attachment ID may not be empty")
+        if not self.canonical_path.is_absolute():
+            raise InvariantError("materialized file path must be absolute")
+        if not _SHA256.fullmatch(self.sha256):
+            raise InvariantError("materialized file SHA-256 is invalid")
+        if isinstance(self.size_bytes, bool) or self.size_bytes <= 0:
+            raise InvariantError("materialized file size must be positive")
+
+
+@dataclass(frozen=True)
 class TurnSkill:
     name: str
     canonical_path: Path
@@ -145,6 +163,8 @@ class TurnInput:
     images: tuple[TurnImage, ...] = ()
     skill_inputs: tuple[TurnSkill, ...] = ()
     files: tuple[TurnFile, ...] = ()
+    attachment_context: str | None = None
+    materialized_files: tuple[MaterializedTurnFile, ...] = ()
 
     def __post_init__(self) -> None:
         normalized = self.text.strip() if self.text is not None else None
@@ -156,6 +176,25 @@ class TurnInput:
             self, "files", tuple(sorted(self.files, key=lambda item: item.ordinal))
         )
         object.__setattr__(self, "skill_inputs", _dedupe_skills(self.skill_inputs))
+        context = (
+            self.attachment_context.strip()
+            if self.attachment_context is not None
+            else None
+        )
+        object.__setattr__(self, "attachment_context", context or None)
+        if self.attachment_context is not None and not self.files:
+            raise InvariantError("attachment context requires ordinary files")
+        if self.materialized_files and self.attachment_context is None:
+            raise InvariantError("materialized files require attachment context")
+        if self.materialized_files:
+            source_ids = {file.attachment_id for file in self.files}
+            materialized_ids = {
+                file.attachment_id for file in self.materialized_files
+            }
+            if materialized_ids != source_ids:
+                raise InvariantError(
+                    "materialized files must cover exactly the ordinary attachments"
+                )
         if self.text is None and not self.images and not self.files:
             raise InvariantError("Turn input requires text or at least one attachment")
         attachment_ordinals = [image.ordinal for image in self.images]

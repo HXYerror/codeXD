@@ -86,8 +86,12 @@ def file_input_unsupported(
     return FileInputUnsupported(
         AdapterFailure(
             code=FileInputUnsupported.code,
-            provider_exception="MentionInputUnavailable",
-            message="Codex runtime does not support ordinary file input",
+            provider_exception="AttachmentMaterializationUnavailable",
+            message=(
+                "Codex runtime cannot safely materialize this attachment. "
+                "Workaround: place the file in the bound project workspace and "
+                "reference its relative path in the prompt."
+            ),
             retryable=False,
             runtime_generation=generation,
             thread_id=thread_id,

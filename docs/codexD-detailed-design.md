@@ -63,9 +63,9 @@ v1。
    Discord 输出 PNG，并附 Markdown 原文和复制按钮，失败时回退代码块。
 8. **Discord 输入附件使用统一的 v1 管线。**
    每个附件只下载一次并由隔离 MediaWorker 按内容分类；图片规范化后映射为 SDK
-   image input，普通文件作为受控 opaque file 映射为 `MentionInput`。文本、图片和
-   文件可混合，image-only/file-only 都合法，CDN URL、本地路径和文件内容不进入
-   prompt 或公开状态。
+   image input；普通文件复制到 daemon-owned staging，并通过 bounded host context
+   暴露 opaque path。文本、图片和文件可混合，image-only/file-only 都合法，CDN URL、
+   源 data-dir 路径和文件内容不进入 prompt 或公开状态。
 9. **v1 只走官方 Python SDK。**
    不把 `codex exec --json`、TypeScript SDK、私有 app-server RPC 或
    Codex TUI slash command 当作隐藏 fallback。
@@ -248,7 +248,7 @@ codexD 只选择 Python SDK 能稳定映射的 Codex 原生动作。CLI 有但 S
 | 结构化 Item 流 | commandExecution、fileChange、plan、MCP、dynamic tool、webSearch、image generation、subagent 等 | 按正式类型自动渲染或安全降级，不要求用户先执行命令 |
 | Web search | Codex config + `webSearch` Item | Native Optional，显式 mode 与风险提示 |
 | Skills | public `SkillInput(name, path)` | 仅预登记 path 或 Codex 自发现；不造 `/skills` 管理器 |
-| 普通文件输入 | public `MentionInput(name, path)` | 仅把已持久化并复验的受控文件交给同一 Turn；能力缺失时 `file_input_unsupported` |
+| 普通文件输入 | 无 public local-file type；`MentionInput` 仅为 app/plugin/skill target | daemon-owned staging + bounded context；能力缺失时 `file_input_unsupported` |
 | 多 Agent 可观察性 | 正式 `collabAgentToolCall` 与 `subAgentActivity` Item | 只做当前主会话内折叠卡片；控制面 Gated |
 | 本机账号 | `account()`、API key/browser/device-code login、`logout()` | `/status` 只读 auth 状态；`codexd auth codex ...` 只允许本机运维，不进入 Discord |
 | Typed error/retry helper | public `CodexError` hierarchy、`is_retryable_error()`、同步 `retry_on_overload()` | 只给幂等 read/local CLI 做 bounded retry；不包裹 Turn/lifecycle mutation，也不在 async event loop 调同步 helper |
@@ -410,7 +410,7 @@ claudeD 曾经出现过的 task/tool 类型：
 | background | daemon 存活期间尽力而为 | 不虚构任务恢复 |
 | 子 Agent/task 展示 | 当前 Discord thread 内默认折叠卡片 | 不为 task 新建 Discord thread |
 | 图片输入 | v1 Core，Discord 图片映射到 SDK 原生 image input | 不做 OCR、不把图片 URL 塞进文本 prompt |
-| 普通文件输入 | 受控 opaque file 映射为 `MentionInput` | 不解析、不复制到 project；能力缺失时 `file_input_unsupported` |
+| 普通文件输入 | daemon-owned staging + bounded context | ZIP 安全解压，其他文件 opaque；不复制到 project；能力缺失时 `file_input_unsupported` |
 | 表格 | PNG + Markdown copy source + code fallback | 兼顾可读、可复制和故障降级；不生成 CSV |
 | 执行权限 | 固定 `full_access` | 单用户私有部署的明确产品选择；不是可变 profile，每次新会话醒目标示 |
 | 审批 | `ApprovalMode.auto_review`；不做 Discord 人工审批 | v1 只用 Python SDK public mode |
@@ -551,7 +551,8 @@ codexD 是单用户本机服务，但不能把“单用户”理解为“无边�
 | `item.command_file_diff_plan` | rich tool/file/diff/plan cards | 已知类型走安全 generic card |
 | `web_search.config` | `/websearch` + `webSearch` Item | 不注册命令；沿用 provider default，并标 `uncontrolled` |
 | `skill.input` | 预登记 SkillInput | 作为普通文本输入并提示未注入 |
-| `mention.input` | 受控 ordinary file 的 `MentionInput` | 文件 Turn 在 provider start 前以 `file_input_unsupported` 失败；文字/图片 Turn 不受影响 |
+| `mention.input` | app/plugin/skill mention target；**不是本地文件 API** | 固定报告 false，不用于 ordinary file |
+| `codexd.attachment_materialization` | daemon-owned 临时文件/安全 ZIP 物化 + bounded context | 文件 Turn 在 provider start 前以 `file_input_unsupported` 失败；文字/图片 Turn 不受影响 |
 | `mcp.item` | 已配置 MCP 的自动工具卡 | 不影响无 MCP 的 Turn |
 | `dynamic_tool.item` | dynamic tool card | safe generic metadata |
 | `dynamic_tool.call` | 注册并响应 client-executed dynamic tool | 仅保留 `/schedule`；不向 Agent 描述不可调用工具 |
@@ -867,7 +868,7 @@ mailbox 把 queued Turn 转为 `starting` 前，还要用幂等
   facade，并显式设置 `experimental_api=True`；
 - 将 domain request 转换为 SDK 参数；
 - 将 SDK thread/turn/item 转换为 normalized event；
-- 将受信任的 `TurnFile` 映射为 public `MentionInput`，不读取文件内容或生成替代 prompt；
+- 将受信任的 `TurnFile` 复制/安全物化并生成 bounded host context；
 - 捕获 thread ID、turn ID 和 runtime version；
 - 实现 interrupt、steer、fork、archive/unarchive 等 capability；
 - 统一 SDK exception；
@@ -1053,19 +1054,20 @@ personality，codexD 不能宣称它一定继承；desired override 在 fork 后
 `Thread.turn(personality=...)` 重新显式应用。若未来
 要使用上述字段，必须独立设计版本化语义与 contract test。
 
-`text`、`images` 与 `files` 至少一项存在。adapter 不做 OCR，不生成替代 prompt，
-也不把 Discord CDN URL 传给 Codex。图片文件至少保留到 SDK 接受输入并收到
+`text`、`images` 与 `files` 至少一项存在。adapter 不做 OCR，也不把 Discord CDN URL
+传给 Codex。图片文件至少保留到 SDK 接受输入并收到
 `turn.started`，之后仍按输入附件 retention policy 保存，以便审计和故障诊断。
-wire list 的 deterministic 顺序为可选 `TextInput`、按 prompt 首次出现顺序去重的
-预登记 `SkillInput`、再把 image/file 按共享的 Discord ordinal 合并：`TurnImage`
-映射为 `LocalImageInput(canonical_path)`，`TurnFile` 映射为
-`MentionInput(display_name, canonical_path)`。adapter 不读取或内嵌 ordinary file
-bytes，不把 URL/path 拼入 `TextInput`；同一 immutable snapshot/retry-free provider
-call 始终产生一个相同顺序的 wire input，file-only Turn 也不补隐式文字。
+wire list 的 deterministic 顺序为可选原始 `TextInput`、host-generated attachment
+context `TextInput`、按 prompt 首次出现顺序去重的预登记 `SkillInput`，以及按 Discord
+ordinal 排序的 `LocalImageInput`。ordinary file 先复制到 daemon-owned per-Turn
+`attachments/materialized/`；ZIP 在 entry/size/ratio/path/depth/time budget 内解压，
+其他文件保持 opaque snapshot。context 仅含安全 display name、opaque staging path、
+大小和 bounded manifest，并明确内容是不可信用户数据；不含 CDN URL、源 data-dir path
+或文件正文。file-only Turn 合法。
 
 `TurnFile.canonical_path` 只来自 storage load 时完成 path/symlink/type/mode/size/hash
 复验的 snapshot；runtime 不接受 Discord 文本、URL 或调用者另传的路径 channel。
-`mention.input` 不为 `true` 时，coordinator 与 SDK adapter 都必须在调用
+`codexd.attachment_materialization` 不为 `true` 时，coordinator 与 SDK adapter 都必须在调用
 `Thread.turn()` 前返回稳定的 `file_input_unsupported`，错误和日志不包含 display
 name 或绝对路径。ordinary file 不参与 image modality 检查。
 
@@ -1152,11 +1154,12 @@ SDK 对其配套 `openai-codex-cli-bin` 的依赖关系由官方 SDK 包管理�
 
 补丁版本在声明范围内默认可安装；若启动检查发现 required capability 缺失，
 仍然 fail closed。Optional capability 按实际 manifest 注册，不按版本号猜测。
-`mention.input` 当前只在 public export、`MentionInput(name, path)` constructor、
-`{"type":"mention","name":...,"path":...}` wire serialization 与平台 secure-lease
-contract 均通过的 SDK `0.144.4`/POSIX 组合上报告 `true`；范围内其他 patch 或缺少
-安全 lease 的平台保持文字/图片兼容，但文件 Turn fail closed，直到对应组合加入
-compatibility matrix。
+`mention.input` 固定报告 false：0.144.4 的 `MentionInput.path` 是 app/plugin/skill
+结构化 target，不会把任意 filesystem path暴露给模型。ordinary file 能力由
+`codexd.attachment_materialization` 表示，并要求平台 owner-only/no-reparse lease、
+materialized snapshot、bounded host context 和真实 app-server marker-read contract。
+当前只对已实测的 SDK/runtime `0.144.4` 配对报告 true；范围内其他 patch 或 runtime
+override 保持 false，直到独立 marker-read contract 通过。
 
 启动时记录：
 
@@ -1232,7 +1235,8 @@ Manifest 是 adapter 的显式输出，不通过 `hasattr` 散落判断：
     "item.command_file_diff_plan": "supported",
     "web_search.config": true,
     "skill.input": true,
-    "mention.input": true,
+    "mention.input": false,
+    "codexd.attachment_materialization": true,
     "mcp.item": "supported_not_observed",
     "dynamic_tool.item": "supported_not_observed",
     "dynamic_tool.call": true,
@@ -1272,10 +1276,9 @@ fail-closed operational state，不能把“能解析 Python 类型”冒充图�
 `model_catalog_incomplete`，不能误报为 provider 明确不支持；只有 complete
 catalog 才可报 `required_capability_unavailable`。
 
-`mention.input` 是稳定的 optional capability ID，不是对任意本机路径开放的入口。
-它只表示当前 SDK version 的 public constructor/wire contract 已验证；具体文件在
-每次 provider start 前仍须通过 storage snapshot 复验。capability 为 false/missing
-时不得删除 `MentionInput`、改成 `TextInput(path)` 或只发送同 Turn 的其余输入。
+`mention.input` 只描述 SDK mention target，不能作为文件能力推断。
+`codexd.attachment_materialization` 为 false/missing 时不得静默删除文件或仅发送同
+Turn 的其他输入。
 
 ### 7.6 Runtime 配置
 
@@ -2171,6 +2174,7 @@ macOS：
 ├── codexd.sqlite3
 ├── attachments/
 │   ├── input/             # 0700；随机 daemon-owned name，文件 0600
+│   ├── materialized/      # 0700；per-Turn 随机 staging 与安全 ZIP 展开结果
 │   └── .quarantine/       # 0700；未提交的临时下载
 ├── diagnostics/
 ├── health.json
@@ -2187,6 +2191,7 @@ Windows：
 ├── codexd.sqlite3
 ├── attachments\
 │   ├── input\             # service-user-only ACL
+│   ├── materialized\      # service-user-only per-Turn staging
 │   └── .quarantine\       # service-user-only ACL
 ├── diagnostics\
 ├── health.json
@@ -2700,6 +2705,18 @@ final dependency 后才取得删除目标，避免把远端用户消息 ID 变�
 | `retention_until` | cleanup |
 | `created_at` | UTC ms |
 
+#### `materialized_attachments`
+
+| 字段 | 说明 |
+|---|---|
+| `id` | PK UUID |
+| `attachment_id`, `turn_id` | source attachment 与 owning Turn；均为 FK |
+| `kind` | file/zip |
+| `root_relative_path` | `attachments/materialized/` 下的随机 data-dir-relative root |
+| `manifest_json`, `manifest_hash` | bounded entry path/size/hash manifest 与完整性 hash |
+| `file_count`, `total_bytes` | 实际物化 regular files 数与总字节 |
+| `retention_until`, `created_at` | cleanup deadline 与 UTC ms |
+
 #### `incidents`
 
 | 字段 | 说明 |
@@ -2881,7 +2898,7 @@ Schedule recovery 随后：
 | conversation prompt/assistant transcript | 0 天；从不进入 SQLite |
 | tool output delta | 0 天；不进入 event journal/tool projection |
 | table source/PNG | 30 天 |
-| input image / ordinary file | 7 天 |
+| input image / ordinary file source + materialized staging | 7 天 |
 | Schedule definition | active definition 到显式删除；delete 立即清除 prompt，只保留 tombstone/audit metadata |
 | Schedule Fire | 与关联 Turn 同期；无 Turn 的 fire 90 天 |
 | codexD logs | 7 天滚动 |
@@ -2900,6 +2917,8 @@ Schedule recovery 随后：
 - 不删除 current thread revision metadata；
 - input_image/input_file 只有在 Turn terminal 且 deadline 到期后才删除；
   queued/starting/running/cancelling 引用一律保留；
+- materialized staging 先删完整目录与 metadata，再允许 source input_file 删除；任一
+  symlink、lease lock、路径替换或部分删除失败均保留 DB 引用并在下轮重试；
 - orphan sweep 同时把两个 input kind 的相对路径视为引用，且绝不沿 symlink 删除；
 - attachment 必须先确认无 projection/outbox 引用；
 - DB backup 前执行 WAL checkpoint；
@@ -3779,7 +3798,8 @@ Product-gated
   account_mutation   local operations only
 
 Discord ingress
-  mention_input              available
+  mention_input              unavailable
+  codexd.attachment_materialization  available for verified SDK/runtime pair
   conversation_thread_input  available
 
 codexD extension
@@ -4388,7 +4408,7 @@ operational degraded 状态处理，不改写 capability 结论。
 image 时，图片 ingress 在
 provider 调用前拒绝并提示 `/model set`；绝不静默丢图或自动切换 model。
 
-普通文件使用独立的 `mention.input` capability；能力缺失时在 provider start 前以
+普通文件使用独立的 `codexd.attachment_materialization` capability；能力缺失时在 provider start 前以
 `file_input_unsupported` fail closed，不得静默丢弃文件。
 
 ### 15.2 图片输入
@@ -4429,9 +4449,14 @@ Turn。
 
 ### 15.3 普通文件 durable contract
 
-普通文件是 opaque bytes；codexD 不解析、解压、执行、OCR，也不把内容、URL 或
-路径字符串拼入 prompt。最终文件只写入 `attachments/input/` 的随机名称，安全
-`display_name` 仅作为 `MentionInput.name` metadata，绝不决定目录或文件名。
+普通文件源是 opaque bytes；codexD 不执行或 OCR。最终源文件只写入
+`attachments/input/` 的随机名称，安全 `display_name` 只进入 bounded manifest，
+绝不决定目录或文件名。provider start 前复制到 `attachments/materialized/`；仅 ZIP
+按安全合同解压，Office ZIP 容器和 nested archive保持普通文件。
+
+ZIP 最多 256 entries、单 entry 64 MiB、总解压 128 MiB、压缩比 100:1、路径深度
+16、路径字符数 240、解压 wall time 15 秒。以上默认值也是硬安全上限，配置只能
+收紧，不能放宽。
 
 `TurnFile` 是 immutable snapshot，包含 attachment ID、原 ordinal、canonical
 path、安全 display name、nullable reported media type、SHA-256、实际大小和
@@ -4450,12 +4475,12 @@ enqueue 和每次 provider start 前都执行同一 fail-closed 校验：
 5. 任一文件失败则 provider 不启动；错误与 diagnostics 只含稳定 code/内部
    attachment ID，不含 display name、绝对路径、CDN URL 或文件内容。
 
-capability/catalog await 完成后、构造 SDK `MentionInput` 前执行最后一次校验，并在
+capability/catalog await 完成后、调用 SDK Turn 前执行最后一次校验，并在
 POSIX 上持有 shared descriptor lock 到 provider terminal 或 confirmed runtime
 termination；非 terminal stream 异常、取消或意外结束不会释放。retention 删除前使用
 non-blocking exclusive lock。Windows 使用受保护的 service-user owner-only DACL、
 no-reparse handle 和 provider-lifetime no-write/delete-sharing lease；任一原生安全
-能力初始化或验证失败时不报告 `mention.input=true`。
+能力初始化或验证失败时不报告 `codexd.attachment_materialization=true`。
 
 该边界明确把 same-service-UID 进程视为 trusted：descriptor lease 防御其他
 principal、retention cleanup 与遵守 lease 协议的协作 mutation；它不声称能防御已经
@@ -4520,6 +4545,13 @@ command_scope = "guild"
 max_attachment_count = 10
 file_max_bytes = 26214400
 message_max_bytes = 52428800
+archive_max_entries = 256
+archive_max_entry_bytes = 67108864
+archive_max_total_bytes = 134217728
+archive_max_compression_ratio = 100
+archive_max_path_depth = 16
+archive_max_path_chars = 240
+archive_extract_timeout_seconds = 15
 
 [runtime]
 sdk_version_policy = "compatible_range"
@@ -5520,8 +5552,11 @@ Golden fixtures：
   转交 retention，不由 transport error path 删除；
 - 普通文件 enqueue/provider-start 前的 path/symlink/type/mode/size/hash 复验失败时
   不启动 provider Turn，错误、日志和 diagnostics 不暴露路径、URL 或内容；
-- `mention.input` 缺失时 file Turn 以 `file_input_unsupported` fail closed，文字/图片
+- `codexd.attachment_materialization` 缺失时 file Turn 以 `file_input_unsupported` fail closed，文字/图片
   Turn 与既有 image modality gate 不受影响；
+- 显式 opt-in 的真实 `0.144.4` app-server contract 从安全 ZIP 中读取随机唯一 marker，
+  最终回答必须返回 marker 且事件中必须出现 command execution；mock/wire serialization
+  不能替代该验证，也不把计费 Turn 作为 daemon 启动探针；
 - normalized commit 后原始 EXIF/GPS quarantine 被删除；
 - `imageGeneration` symlink/path-swap/越界文件不上传；
 - queued/active Turn 引用的图片不被 retention cleanup 删除；
@@ -5774,7 +5809,7 @@ Windows：
 - pre-registered SkillInput；
 - passive MCP cards；
 - dynamic tool/image-generation cards；
-- ordinary file `MentionInput` 已按 §15 的受控 attachment contract 启用；任意本机
+- ordinary file materialization 已按 §15 的受控 attachment contract 启用；任意本机
   resource picker/路径引用仍需独立 proposal。
 
 `review`、plan mode、agent control、background terminals 和 plugin management

@@ -52,10 +52,20 @@ from codexd.transport.discord.outbox import (
     DeliveryResult,
     DiscordOutboxTransport,
     OutboxWorker,
+    _attachment_failure_guidance,
     _bounded_plain_text_fallback,
     _message_has_delivery_marker,
 )
 from codexd.transport.discord.presentation import TABLE_COPY_CUSTOM_ID, task_card_embed
+
+
+def test_attachment_failure_guidance_is_code_based_and_actionable() -> None:
+    unsupported = _attachment_failure_guidance("file_input_unsupported")
+    assert unsupported is not None
+    assert "bound project workspace" in unsupported
+    assert "relative path" in unsupported
+    assert "ZIP" in (_attachment_failure_guidance("archive_unsupported") or "")
+    assert _attachment_failure_guidance("provider_completed") is None
 
 
 def _volatile_final(

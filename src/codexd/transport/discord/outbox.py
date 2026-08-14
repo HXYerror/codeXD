@@ -709,6 +709,9 @@ class DiscordOutboxTransport:
                 was_volatile=payload.get("content_storage") == "volatile",
             )
         )
+        failure_guidance = _attachment_failure_guidance(payload.get("terminal_code"))
+        if failure_guidance is not None:
+            visible_text += f"\n\n{failure_guidance}"
         raw_outbound_records = await asyncio.to_thread(
             self._repository.registered_outbound_images,
             turn_id,
@@ -1786,6 +1789,37 @@ def _plain_text_fallback_chunks(source: str) -> tuple[str, ...]:
         return split_discord_text(text, limit=1700)
     except ValueError:
         return split_discord_code(text, limit=1700)
+
+
+def _attachment_failure_guidance(value: object) -> str | None:
+    code = value if isinstance(value, str) else ""
+    if code == "file_input_unsupported":
+        return (
+            "This runtime cannot safely expose the uploaded file to Codex. "
+            "Workaround: place the file in the bound project workspace and "
+            "reference its relative path in your prompt."
+        )
+    if code == "archive_unsupported":
+        return "This archive format is unsupported. Upload a ZIP archive instead."
+    archive_messages = {
+        "archive_encrypted": "Encrypted ZIP archives are not supported.",
+        "archive_entry_limit": "The ZIP contains too many entries.",
+        "archive_uncompressed_size_limit": (
+            "The ZIP exceeds the safe uncompressed-size limit."
+        ),
+        "archive_compression_ratio_limit": (
+            "The ZIP exceeds the safe compression-ratio limit."
+        ),
+        "archive_path_unsafe": "The ZIP contains an unsafe or colliding path.",
+        "archive_integrity_failed": "The ZIP failed integrity validation.",
+        "attachment_materialization_failed": (
+            "The attachment could not be prepared safely for Codex."
+        ),
+        "attachment_integrity_failed": (
+            "The attachment changed or failed integrity validation before Codex started."
+        ),
+    }
+    return archive_messages.get(code)
 
 
 def _bounded_plain_text_fallback(source: str) -> tuple[str, ...]:

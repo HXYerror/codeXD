@@ -18,6 +18,13 @@ _MISFIRE_POLICIES = frozenset({"skip", "latest", "all"})
 _TOP_LEVEL_KEYS = frozenset(
     {"discord", "runtime", "codex", "schedule", "security", "rendering", "retention"}
 )
+_ARCHIVE_MAX_ENTRIES_CEILING = 256
+_ARCHIVE_MAX_ENTRY_BYTES_CEILING = 64 * 1024 * 1024
+_ARCHIVE_MAX_TOTAL_BYTES_CEILING = 128 * 1024 * 1024
+_ARCHIVE_MAX_COMPRESSION_RATIO_CEILING = 100
+_ARCHIVE_MAX_PATH_DEPTH_CEILING = 16
+_ARCHIVE_MAX_PATH_CHARS_CEILING = 240
+_ARCHIVE_EXTRACT_TIMEOUT_SECONDS_CEILING = 15
 
 
 @dataclass(frozen=True)
@@ -29,6 +36,13 @@ class DiscordConfig:
     max_attachment_count: int = 10
     file_max_bytes: int = 25 * 1024 * 1024
     message_max_bytes: int = 50 * 1024 * 1024
+    archive_max_entries: int = 256
+    archive_max_entry_bytes: int = 64 * 1024 * 1024
+    archive_max_total_bytes: int = 128 * 1024 * 1024
+    archive_max_compression_ratio: int = 100
+    archive_max_path_depth: int = 16
+    archive_max_path_chars: int = 240
+    archive_extract_timeout_seconds: int = 15
 
 
 @dataclass(frozen=True)
@@ -196,6 +210,13 @@ def _discord_config(raw: dict[str, Any], env: Mapping[str, str]) -> DiscordConfi
             "max_attachment_count",
             "file_max_bytes",
             "message_max_bytes",
+            "archive_max_entries",
+            "archive_max_entry_bytes",
+            "archive_max_total_bytes",
+            "archive_max_compression_ratio",
+            "archive_max_path_depth",
+            "archive_max_path_chars",
+            "archive_extract_timeout_seconds",
         },
         "discord",
     )
@@ -249,6 +270,54 @@ def _discord_config(raw: dict[str, Any], env: Mapping[str, str]) -> DiscordConfi
         raise ConfigurationError(
             "discord.file_max_bytes may not exceed discord.message_max_bytes"
         )
+    archive_max_entry_bytes = _positive_int(
+        raw.get("archive_max_entry_bytes", 64 * 1024 * 1024),
+        "discord.archive_max_entry_bytes",
+    )
+    archive_max_total_bytes = _positive_int(
+        raw.get("archive_max_total_bytes", 128 * 1024 * 1024),
+        "discord.archive_max_total_bytes",
+    )
+    if archive_max_entry_bytes > archive_max_total_bytes:
+        raise ConfigurationError(
+            "discord.archive_max_entry_bytes may not exceed "
+            "discord.archive_max_total_bytes"
+        )
+    archive_max_entries = _bounded_positive_int(
+        raw.get("archive_max_entries", 256),
+        "discord.archive_max_entries",
+        maximum=_ARCHIVE_MAX_ENTRIES_CEILING,
+    )
+    archive_max_compression_ratio = _bounded_positive_int(
+        raw.get("archive_max_compression_ratio", 100),
+        "discord.archive_max_compression_ratio",
+        maximum=_ARCHIVE_MAX_COMPRESSION_RATIO_CEILING,
+    )
+    archive_max_path_depth = _bounded_positive_int(
+        raw.get("archive_max_path_depth", 16),
+        "discord.archive_max_path_depth",
+        maximum=_ARCHIVE_MAX_PATH_DEPTH_CEILING,
+    )
+    archive_max_path_chars = _bounded_positive_int(
+        raw.get("archive_max_path_chars", 240),
+        "discord.archive_max_path_chars",
+        maximum=_ARCHIVE_MAX_PATH_CHARS_CEILING,
+    )
+    archive_extract_timeout_seconds = _bounded_positive_int(
+        raw.get("archive_extract_timeout_seconds", 15),
+        "discord.archive_extract_timeout_seconds",
+        maximum=_ARCHIVE_EXTRACT_TIMEOUT_SECONDS_CEILING,
+    )
+    if archive_max_entry_bytes > _ARCHIVE_MAX_ENTRY_BYTES_CEILING:
+        raise ConfigurationError(
+            "discord.archive_max_entry_bytes may not exceed "
+            f"{_ARCHIVE_MAX_ENTRY_BYTES_CEILING}"
+        )
+    if archive_max_total_bytes > _ARCHIVE_MAX_TOTAL_BYTES_CEILING:
+        raise ConfigurationError(
+            "discord.archive_max_total_bytes may not exceed "
+            f"{_ARCHIVE_MAX_TOTAL_BYTES_CEILING}"
+        )
     return DiscordConfig(
         guild_id=guild_id,
         owner_user_id=owner_user_id,
@@ -257,6 +326,13 @@ def _discord_config(raw: dict[str, Any], env: Mapping[str, str]) -> DiscordConfi
         max_attachment_count=max_attachment_count,
         file_max_bytes=file_max_bytes,
         message_max_bytes=message_max_bytes,
+        archive_max_entries=archive_max_entries,
+        archive_max_entry_bytes=archive_max_entry_bytes,
+        archive_max_total_bytes=archive_max_total_bytes,
+        archive_max_compression_ratio=archive_max_compression_ratio,
+        archive_max_path_depth=archive_max_path_depth,
+        archive_max_path_chars=archive_max_path_chars,
+        archive_extract_timeout_seconds=archive_extract_timeout_seconds,
     )
 
 
@@ -478,6 +554,13 @@ def _positive_int(value: object, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ConfigurationError(f"{name} must be a positive integer")
     return value
+
+
+def _bounded_positive_int(value: object, name: str, *, maximum: int) -> int:
+    parsed = _positive_int(value, name)
+    if parsed > maximum:
+        raise ConfigurationError(f"{name} may not exceed {maximum}")
+    return parsed
 
 
 def _string(value: object, name: str) -> str:

@@ -38,11 +38,11 @@ class FakeCodexRuntime:
         *,
         generation: int = 1,
         event_delay: float = 0,
-        mention_input_supported: bool = True,
+        attachment_materialization_supported: bool = True,
     ) -> None:
         self.generation = generation
         self.event_delay = event_delay
-        self.mention_input_supported = mention_input_supported
+        self.attachment_materialization_supported = attachment_materialization_supported
         self.closed = False
         self._thread_counter = 0
         self._turn_counter = 0
@@ -91,7 +91,10 @@ class FakeCodexRuntime:
                 "turn.reasoning_summary": True,
                 "turn.service_tier": True,
                 "web_search.config": True,
-                "mention.input": self.mention_input_supported,
+                "mention.input": False,
+                "codexd.attachment_materialization": (
+                    self.attachment_materialization_supported
+                ),
                 "collab.item": EventCapability.SUPPORTED_NOT_OBSERVED,
             },
         )
@@ -202,7 +205,11 @@ class FakeCodexRuntime:
         input: TurnInput,
         config: TurnConfig,
     ) -> StartedTurn:
-        if input.files and not self.mention_input_supported:
+        if input.files and (
+            not self.attachment_materialization_supported
+            or input.attachment_context is None
+            or not input.materialized_files
+        ):
             raise file_input_unsupported(
                 generation=self.generation,
                 thread_id=thread.thread_id,

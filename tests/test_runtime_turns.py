@@ -11,6 +11,7 @@ import pytest
 from conftest import StorageContext
 
 from codexd.application import turn_coordinator as turn_coordinator_module
+from codexd.application.attachment_materializer import AttachmentMaterializer
 from codexd.application.turn_coordinator import TurnCoordinator
 from codexd.domain.conversations import (
     ConversationState,
@@ -368,10 +369,10 @@ async def test_file_only_turn_does_not_require_image_model_modality(
 
 
 @pytest.mark.asyncio
-async def test_missing_mention_capability_fails_file_turn_before_runtime_start(
+async def test_missing_materialization_capability_fails_file_turn_before_runtime_start(
     storage_context: StorageContext,
 ) -> None:
-    fake = FakeCodexRuntime(mention_input_supported=False)
+    fake = FakeCodexRuntime(attachment_materialization_supported=False)
 
     async def factory(_slot: object, _generation: int) -> FakeCodexRuntime:
         return fake
@@ -392,6 +393,73 @@ async def test_missing_mention_capability_fails_file_turn_before_runtime_start(
         assert terminal.terminal_code == "file_input_unsupported"
         assert terminal.error_code == "file_input_unsupported"
         assert terminal.error_message_redacted is None
+        assert fake.started_inputs == []
+    finally:
+        await coordinator.close(drain_seconds=1)
+        await supervisor.close()
+
+
+@pytest.mark.asyncio
+async def test_missing_materialization_capability_does_not_create_staging(
+    storage_context: StorageContext,
+) -> None:
+    fake = FakeCodexRuntime(attachment_materialization_supported=False)
+
+    async def factory(_slot: object, _generation: int) -> FakeCodexRuntime:
+        return fake
+
+    supervisor = _runtime_supervisor(storage_context, factory)
+    coordinator = _turn_coordinator(storage_context, supervisor)
+    file = _stored_turn_file(storage_context, name="private.txt")
+    try:
+        turn = await coordinator.enqueue(
+            conversation_id=storage_context.conversation.id,
+            source=TurnSource.DISCORD,
+            turn_input=TurnInput(files=(file,)),
+            input_message_id="unsupported-file-no-staging",
+        )
+        terminal = await _wait_for_terminal(storage_context, turn.id)
+
+        assert terminal.terminal_code == "file_input_unsupported"
+        row = storage_context.store.query_one(
+            "SELECT COUNT(*) AS count FROM materialized_attachments"
+        )
+        assert row is not None and row["count"] == 0
+        materialized_root = (
+            storage_context.store.path.parent / "attachments" / "materialized"
+        )
+        assert not materialized_root.exists()
+    finally:
+        await coordinator.close(drain_seconds=1)
+        await supervisor.close()
+
+
+@pytest.mark.asyncio
+async def test_boot_manifest_gate_rejects_before_runtime_capability_lookup(
+    storage_context: StorageContext,
+) -> None:
+    fake = FakeCodexRuntime(attachment_materialization_supported=True)
+
+    async def factory(_slot: object, _generation: int) -> FakeCodexRuntime:
+        return fake
+
+    supervisor = _runtime_supervisor(storage_context, factory)
+    coordinator = _turn_coordinator(
+        storage_context,
+        supervisor,
+        attachment_materialization_supported=False,
+    )
+    file = _stored_turn_file(storage_context, name="private.txt")
+    try:
+        turn = await coordinator.enqueue(
+            conversation_id=storage_context.conversation.id,
+            source=TurnSource.DISCORD,
+            turn_input=TurnInput(files=(file,)),
+            input_message_id="boot-manifest-file-gate",
+        )
+        terminal = await _wait_for_terminal(storage_context, turn.id)
+
+        assert terminal.terminal_code == "file_input_unsupported"
         assert fake.started_inputs == []
     finally:
         await coordinator.close(drain_seconds=1)
@@ -2230,6 +2298,7 @@ def _turn_coordinator(
     *,
     critical_failure: Callable[[BaseException], None] | None = None,
     skill_input_supported: bool = True,
+    attachment_materialization_supported: bool = True,
 ) -> TurnCoordinator:
     return TurnCoordinator(
         repository=storage_context.repository,
@@ -2240,4 +2309,9 @@ def _turn_coordinator(
         ),
         critical_failure=critical_failure,
         skill_input_supported=skill_input_supported,
+        attachment_materialization_supported=attachment_materialization_supported,
+        attachment_materializer=AttachmentMaterializer(
+            store=storage_context.store,
+            data_root=storage_context.store.path.parent,
+        ),
     )

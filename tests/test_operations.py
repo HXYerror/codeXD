@@ -311,6 +311,8 @@ def test_diagnostics_bundle_is_redacted_by_default(
     assert b"max_attachment_count = 10" in redacted_config
     assert b"file_max_bytes = 26214400" in redacted_config
     assert b"message_max_bytes = 52428800" in redacted_config
+    assert b"archive_max_entries = 256" in redacted_config
+    assert b"archive_max_total_bytes = 134217728" in redacted_config
 
 
 def test_doctor_fails_when_discord_startup_prerequisites_are_missing(

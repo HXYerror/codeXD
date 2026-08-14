@@ -2316,6 +2316,12 @@ class CodexDBot(discord.Client):
             "**Discord ingress**",
             "  `bot_mention_input`: available",
             "  `conversation_thread_input`: available",
+            "  `ordinary_file_materialization`: "
+            + (
+                "available"
+                if manifest.optional.get("codexd.attachment_materialization") is True
+                else "unavailable"
+            ),
             "**codexD extension**",
             "  `schedule`: available",
             "**Excluded**",
