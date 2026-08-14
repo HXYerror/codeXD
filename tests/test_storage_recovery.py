@@ -827,6 +827,7 @@ def test_terminal_transcript_remains_volatile_and_outbox_is_metadata_only(
     assert final is not None
     payload = json.loads(str(final["payload_json"]))
     assert payload["content_storage"] == "volatile"
+    assert payload["dynamic_tools_enabled"] is False
     assert "visible_text" not in payload
     assert "final_answer_text" not in payload
     assert expected not in str(final["payload_json"])
@@ -1042,6 +1043,7 @@ def test_local_terminal_does_not_recover_volatile_assistant_content(
     assert final is not None
     payload = json.loads(str(final["payload_json"]))
     assert payload["content_storage"] == "none"
+    assert payload["dynamic_tools_enabled"] is False
     assert "visible_text" not in payload
     assert "final_answer_text" not in payload
     assert "partial after commentary" not in str(final["payload_json"])

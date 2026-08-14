@@ -416,11 +416,20 @@ class DiscordRenderPlanner:
         return self._artifact_root
 
 
+@dataclass(frozen=True)
+class VisualizationMarkerResult:
+    text: str
+    found: bool
+    missing_reason: str | None
+
+
 def suppress_visualization_markers(
     source: str,
     *,
     has_registered_images: bool,
-) -> tuple[str, tuple[str, ...]]:
+    has_registered_image_records: bool,
+    dynamic_tools_enabled: bool | None,
+) -> VisualizationMarkerResult:
     """Remove unsupported private visualize controls without trusting their payload."""
 
     start_marker = "\ue200"
@@ -429,6 +438,32 @@ def suppress_visualization_markers(
     output: list[str] = []
     found = False
     placeholder_added = False
+    if has_registered_images:
+        potential_missing_reason = None
+        replacement = ""
+    elif has_registered_image_records:
+        potential_missing_reason = "artifact_unavailable"
+        replacement = (
+            "[The registered image artifact was unavailable for Discord delivery.]"
+        )
+    elif dynamic_tools_enabled is False:
+        potential_missing_reason = "legacy_session"
+        replacement = (
+            "[This session was created before Discord image delivery was enabled. "
+            "Run `/session new`, then request the image again.]"
+        )
+    elif dynamic_tools_enabled is True:
+        potential_missing_reason = "publish_tool_not_used"
+        replacement = (
+            "[This visualization could not be delivered because Codex did not "
+            "register an image for Discord delivery.]"
+        )
+    else:
+        potential_missing_reason = "unknown"
+        replacement = (
+            "[This visualization could not be delivered because no image was "
+            "registered for Discord delivery.]"
+        )
     while cursor < len(source):
         start = source.find(start_marker, cursor)
         if start < 0:
@@ -442,9 +477,7 @@ def suppress_visualization_markers(
             continue
         found = True
         if not has_registered_images and not placeholder_added:
-            output.append(
-                "[This visualization could not be delivered as a Discord image attachment.]"
-            )
+            output.append(replacement)
             placeholder_added = True
         cursor = len(source) if end < 0 else end + 1
     sanitized = (
@@ -453,12 +486,8 @@ def suppress_visualization_markers(
         .replace("\ue202", "")
         .replace(end_marker, "")
     )
-    incidents = (
-        ("visualization_attachment_missing",)
-        if found and not has_registered_images
-        else ()
-    )
-    return sanitized, incidents
+    missing_reason = potential_missing_reason if found else None
+    return VisualizationMarkerResult(sanitized, found, missing_reason)
 
 
 def split_discord_text(value: str, limit: int = DISCORD_MESSAGE_LIMIT) -> tuple[str, ...]:

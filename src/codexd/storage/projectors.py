@@ -124,10 +124,12 @@ class ProjectingEventSink:
                 """
                 SELECT t.*, c.project_id, c.discord_thread_id,
                        c.discord_guild_id, c.discord_parent_channel_id,
+                       r.dynamic_tools_enabled,
                        rl.state AS lease_state,
                        rl.generation AS lease_generation
                 FROM turns t
                 JOIN conversations c ON c.id = t.conversation_id
+                LEFT JOIN thread_revisions r ON r.id = t.thread_revision_id
                 LEFT JOIN runtime_leases rl ON rl.id = t.runtime_lease_id
                 WHERE t.id = ?
                 """,
@@ -1562,6 +1564,7 @@ class ProjectingEventSink:
                     else None,
                 ),
                 "content_storage": "volatile",
+                "dynamic_tools_enabled": bool(scope["dynamic_tools_enabled"]),
             },
             dedupe_key=f"turn:{scope['id']}:final",
             marker=f"turn-{str(scope['id'])[:8]}-final",

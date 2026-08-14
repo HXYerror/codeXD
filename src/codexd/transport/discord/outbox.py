@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import inspect
 import io
 import json
 import logging
@@ -372,6 +373,13 @@ class DiscordOutboxTransport:
         signer: ComponentSigner,
         volatile_turns: VolatileTurnStore | None = None,
     ) -> None:
+        nonce_support = inspect.signature(discord.abc.Messageable.send).parameters.get(
+            "nonce"
+        )
+        if nonce_support is None:
+            raise InvariantError(
+                "discord.py does not expose native message nonce idempotency"
+            )
         self._client = client
         self._repository = repository
         self._renderer = renderer
@@ -452,7 +460,7 @@ class DiscordOutboxTransport:
             if not isinstance(raw_content_value, str):
                 raise DeliveryError("payload_invalid", permanent=True)
             raw_content = raw_content_value
-            content = _with_marker("", record.delivery_marker)
+            content = ""
             level = str(payload.get("level", "info"))
             raw_title = payload.get("title")
             title = str(raw_title) if raw_title is not None else None
@@ -464,6 +472,7 @@ class DiscordOutboxTransport:
                     title=title,
                 ),
                 allowed_mentions=discord.AllowedMentions.none(),
+                nonce=_delivery_nonce(record.delivery_marker),
             )
             return DeliveryResult(str(message.id))
         except (KeyError, TypeError, ValueError) as exc:
@@ -747,10 +756,46 @@ class DiscordOutboxTransport:
             visible_text += (
                 "\n\n[The generated image could not be loaded for Discord delivery.]"
             )
-        visible_text, marker_incidents = suppress_visualization_markers(
+        raw_dynamic_tools_enabled = payload.get("dynamic_tools_enabled")
+        dynamic_tools_enabled = (
+            raw_dynamic_tools_enabled
+            if isinstance(raw_dynamic_tools_enabled, bool)
+            else None
+        )
+        marker_result = suppress_visualization_markers(
             visible_text,
             has_registered_images=bool(outbound_attachments),
+            has_registered_image_records=bool(outbound_records),
+            dynamic_tools_enabled=dynamic_tools_enabled,
         )
+        visible_text = marker_result.text
+        incident_by_reason = {
+            "legacy_session": (
+                "visualization_legacy_session",
+                "A legacy Codex session could not register an image for Discord",
+            ),
+            "publish_tool_not_used": (
+                "visualization_publish_tool_not_used",
+                "Codex emitted a visualization control without registering an image",
+            ),
+            "unknown": (
+                "visualization_attachment_missing",
+                "A visualization had no registered Discord image",
+            ),
+        }
+        marker_incident = (
+            incident_by_reason.get(marker_result.missing_reason)
+            if marker_result.missing_reason is not None
+            else None
+        )
+        if marker_incident is not None:
+            await asyncio.to_thread(
+                self._repository.record_incident,
+                severity="warning",
+                code=marker_incident[0],
+                summary=marker_incident[1],
+                turn_id=turn_id,
+            )
         try:
             rendered = await self._renderer.render_markdown(visible_text)
         except (CodexDError, OSError, ValueError):
@@ -769,7 +814,7 @@ class DiscordOutboxTransport:
         else:
             messages = list(rendered.messages)
             attachments = [*rendered.attachments, *outbound_attachments]
-            for code in dict.fromkeys((*rendered.incident_codes, *marker_incidents)):
+            for code in dict.fromkeys(rendered.incident_codes):
                 await asyncio.to_thread(
                     self._repository.record_incident,
                     severity="warning",
@@ -805,17 +850,19 @@ class DiscordOutboxTransport:
                     continue
             if index == 0 and reference is not None:
                 message = await channel.send(
-                    _with_marker_strict(content, part_marker),
+                    _bounded_message_content(content),
                     allowed_mentions=discord.AllowedMentions.none(),
                     suppress_embeds=True,
                     reference=reference,
                     mention_author=False,
+                    nonce=_delivery_nonce(part_marker),
                 )
             else:
                 message = await channel.send(
-                    _with_marker_strict(content, part_marker),
+                    _bounded_message_content(content),
                     allowed_mentions=discord.AllowedMentions.none(),
                     suppress_embeds=True,
+                    nonce=_delivery_nonce(part_marker),
                 )
             first = first or message
         table_groups, generic_attachments = _partition_table_attachments(attachments)
@@ -840,14 +887,12 @@ class DiscordOutboxTransport:
             try:
                 message = await _send_files(
                     channel,
-                    content=_with_marker_strict(
-                        "",
-                        part_marker,
-                    ),
+                    content="",
                     attachments=[item for _suffix, item in group],
                     embed=attachment_embed(
                         [item.filename for _suffix, item in group]
                     ),
+                    nonce=_delivery_nonce(part_marker),
                 )
             except discord.HTTPException as exc:
                 if exc.status not in {400, 403, 413}:
@@ -870,9 +915,10 @@ class DiscordOutboxTransport:
                 first = first or existing
                 return DeliveryResult(str(first.id) if first else None)
         footer = await channel.send(
-            _with_marker(terminal_footer(payload), footer_marker),
+            _bounded_message_content(terminal_footer(payload)),
             allowed_mentions=discord.AllowedMentions.none(),
             suppress_embeds=True,
+            nonce=_delivery_nonce(footer_marker),
         )
         first = first or footer
         return DeliveryResult(str(first.id) if first else None)
@@ -909,7 +955,7 @@ class DiscordOutboxTransport:
             try:
                 delivered = await _send_files(
                     channel,
-                    content=_with_marker("", page_marker),
+                    content="",
                     attachments=files,
                     embed=table_embed(
                         summary=summary,
@@ -919,6 +965,7 @@ class DiscordOutboxTransport:
                         source_attached=include_source,
                     ),
                     view=table_copy_view() if include_source else None,
+                    nonce=_delivery_nonce(page_marker),
                 )
             except discord.HTTPException as exc:
                 if exc.status not in {400, 403, 413}:
@@ -963,13 +1010,14 @@ class DiscordOutboxTransport:
                 return existing
         return await _send_files(
             channel,
-            content=_with_marker("", marker),
+            content="",
             attachments=[source],
             embed=table_source_embed(
                 summary=_table_summary(source),
                 reason=reason,
             ),
             view=table_copy_view(),
+            nonce=_delivery_nonce(marker),
         )
 
     async def _deliver_attachment_fallback(
@@ -996,11 +1044,11 @@ class DiscordOutboxTransport:
                     try:
                         delivered = await _send_files(
                             channel,
-                            content=_with_marker_strict(
-                                f"Image attachment: `{attachment.filename[:120]}`",
-                                individual_marker,
+                            content=_bounded_message_content(
+                                f"Image attachment: `{attachment.filename[:120]}`"
                             ),
                             attachments=[attachment],
+                            nonce=_delivery_nonce(individual_marker),
                         )
                     except discord.HTTPException as exc:
                         if exc.status not in {400, 403, 413}:
@@ -1029,11 +1077,11 @@ class DiscordOutboxTransport:
             try:
                 delivered = await _send_files(
                     channel,
-                    content=_with_marker_strict(
-                        f"Attachment fallback: `{attachment.filename[:120]}`",
-                        individual_marker,
+                    content=_bounded_message_content(
+                        f"Attachment fallback: `{attachment.filename[:120]}`"
                     ),
                     attachments=[attachment],
+                    nonce=_delivery_nonce(individual_marker),
                 )
             except discord.HTTPException as exc:
                 if exc.status not in {400, 403, 413}:
@@ -1081,10 +1129,9 @@ class DiscordOutboxTransport:
             },
         )
         return await channel.send(
-            _with_marker_strict(
+            _bounded_message_content(
                 "The generated image could not be attached to Discord. "
-                "Ask Codex to regenerate it or inspect diagnostics.",
-                marker,
+                "Ask Codex to regenerate it or inspect diagnostics."
             ),
             embed=notice_embed(
                 "The generated image was registered locally, but Discord rejected "
@@ -1093,6 +1140,7 @@ class DiscordOutboxTransport:
                 title="Image delivery failed",
             ),
             allowed_mentions=discord.AllowedMentions.none(),
+            nonce=_delivery_nonce(marker),
         )
 
     async def _deliver_attachment_as_text(
@@ -1124,9 +1172,10 @@ class DiscordOutboxTransport:
                 f"({index + 1}/{len(chunks)}, {encoding}):\n"
             )
             message = await channel.send(
-                _with_marker_strict(header + chunk, part_marker),
+                _bounded_message_content(header + chunk),
                 allowed_mentions=discord.AllowedMentions.none(),
                 suppress_embeds=True,
+                nonce=_delivery_nonce(part_marker),
             )
             first = first or message
         if first is None:
@@ -1150,7 +1199,7 @@ class DiscordOutboxTransport:
         revision = int(revision_value)
         expanded = bool(payload.get("expanded"))
         action = "collapse" if expanded else "expand"
-        content = _with_marker("", marker)
+        content = ""
         embed = task_card_embed(payload, expanded=expanded)
         nonce = payload.get("nonce")
         if not isinstance(nonce, str) or not nonce:
@@ -1195,6 +1244,7 @@ class DiscordOutboxTransport:
             embed=embed,
             view=view,
             allowed_mentions=discord.AllowedMentions.none(),
+            nonce=_delivery_nonce(marker),
         )
         return DeliveryResult(str(message.id), view_id)
 
@@ -1287,7 +1337,7 @@ class DiscordOutboxTransport:
                     permanent=True,
                 )
             await message.edit(
-                content=_with_marker("", marker),
+                content="",
                 embed=schedule_draft_embed(effective_payload),
                 view=None,
                 allowed_mentions=discord.AllowedMentions.none(),
@@ -1325,7 +1375,8 @@ class DiscordOutboxTransport:
         if reference is not None:
             send_options["reference"] = reference
         message = await channel.send(
-            _with_marker(visible_content, marker),
+            _bounded_message_content(visible_content),
+            nonce=_delivery_nonce(marker),
             **send_options,
         )
         await asyncio.to_thread(
@@ -1368,7 +1419,7 @@ class DiscordOutboxTransport:
                         message.content if isinstance(message.content, str) else ""
                     )
                     await message.edit(
-                        content=_with_marker(visible_text, marker),
+                        content=_bounded_message_content(visible_text),
                         embed=embed,
                         allowed_mentions=discord.AllowedMentions.none(),
                         suppress=False,
@@ -1377,7 +1428,7 @@ class DiscordOutboxTransport:
                         str(message.id),
                         turn_progress_id=turn_id,
                     )
-        rendered = _with_marker(plain_text, marker)
+        rendered = _bounded_message_content(plain_text)
         if record_state != "pending":
             existing = await self._find_marker(channel, marker)
             if existing is not None:
@@ -1389,6 +1440,7 @@ class DiscordOutboxTransport:
             rendered,
             embed=embed,
             allowed_mentions=discord.AllowedMentions.none(),
+            nonce=_delivery_nonce(marker),
         )
         return DeliveryResult(
             str(message.id),
@@ -1413,7 +1465,11 @@ class DiscordOutboxTransport:
                 count += 1
                 if (
                     message.author.id == bot_user.id
-                    and _message_has_delivery_marker(message.content, marker)
+                    and _message_has_delivery_marker(
+                        message.content,
+                        marker,
+                        nonce=getattr(message, "nonce", None),
+                    )
                 ):
                     return message
         except discord.Forbidden as exc:
@@ -1677,6 +1733,7 @@ async def _send_files(
     ],
     embed: discord.Embed | None = None,
     view: discord.ui.View | None = None,
+    nonce: int,
 ) -> discord.Message:
     files = [_discord_file(item) for item in attachments]
     try:
@@ -1687,6 +1744,7 @@ async def _send_files(
                 embed=embed,
                 view=view,
                 allowed_mentions=discord.AllowedMentions.none(),
+                nonce=nonce,
             )
         if embed is not None:
             return await channel.send(
@@ -1694,6 +1752,7 @@ async def _send_files(
                 files=files,
                 embed=embed,
                 allowed_mentions=discord.AllowedMentions.none(),
+                nonce=nonce,
             )
         if view is not None:
             return await channel.send(
@@ -1702,12 +1761,14 @@ async def _send_files(
                 view=view,
                 allowed_mentions=discord.AllowedMentions.none(),
                 suppress_embeds=True,
+                nonce=nonce,
             )
         return await channel.send(
             content,
             files=files,
             allowed_mentions=discord.AllowedMentions.none(),
             suppress_embeds=True,
+            nonce=nonce,
         )
     finally:
         for file in files:
@@ -1747,22 +1808,17 @@ def _discord_file(
     )
 
 
-def _with_marker(content: str, marker: str) -> str:
-    marker_text = _hidden_delivery_marker(marker)
-    maximum = 2000 - len(marker_text)
-    if len(content) > maximum:
+def _bounded_message_content(content: str) -> str:
+    if len(content) > 2000:
         try:
-            content = split_discord_text(content, limit=maximum)[0]
+            content = split_discord_text(content, limit=2000)[0]
         except ValueError:
-            content = content[:maximum]
-    return content + marker_text
+            content = content[:2000]
+    return content
 
 
-def _with_marker_strict(content: str, marker: str) -> str:
-    marker_text = _hidden_delivery_marker(marker)
-    if len(content) + len(marker_text) > 2000:
-        raise DeliveryError("render_plan_message_too_long", permanent=True)
-    return content + marker_text
+def _delivery_nonce(marker: str) -> int:
+    return int(sha256_text(f"discord-delivery-nonce:{marker}")[:16], 16)
 
 
 def _hidden_delivery_marker(marker: str) -> str:
@@ -1771,8 +1827,15 @@ def _hidden_delivery_marker(marker: str) -> str:
     return "\u200b" + encoded
 
 
-def _message_has_delivery_marker(content: str, marker: str) -> bool:
-    return content.endswith(_hidden_delivery_marker(marker)) or content.endswith(
+def _message_has_delivery_marker(
+    content: str,
+    marker: str,
+    *,
+    nonce: object = None,
+) -> bool:
+    return str(nonce) == str(_delivery_nonce(marker)) or content.endswith(
+        _hidden_delivery_marker(marker)
+    ) or content.endswith(
         f"\n-# codexD:{marker}"
     )
 

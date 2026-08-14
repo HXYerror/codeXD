@@ -4495,9 +4495,11 @@ class Repository:
         scope = connection.execute(
             """
             SELECT t.*, c.discord_thread_id, c.discord_guild_id,
-                   c.discord_parent_channel_id, c.project_id
+                   c.discord_parent_channel_id, c.project_id,
+                   r.dynamic_tools_enabled
             FROM turns t
             JOIN conversations c ON c.id = t.conversation_id
+            LEFT JOIN thread_revisions r ON r.id = t.thread_revision_id
             WHERE t.id = ?
             """,
             (turn_id,),
@@ -4612,6 +4614,9 @@ class Repository:
                             max_sequence=sequence,
                         ),
                         "content_storage": "none",
+                        "dynamic_tools_enabled": bool(
+                            scope["dynamic_tools_enabled"]
+                        ),
                     }
                 ),
                 f"turn:{turn_id}:final",

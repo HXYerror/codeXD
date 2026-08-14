@@ -482,6 +482,7 @@ async def test_visualize_marker_without_registered_image_becomes_visible_failure
                     "turn_id": turn.id,
                     "plain_text": marker,
                     "state": "completed",
+                    "dynamic_tools_enabled": True,
                 }
             ),
             delivery_marker="missing-image-final",
@@ -495,9 +496,158 @@ async def test_visualize_marker_without_registered_image_becomes_visible_failure
     assert all("\ue200" not in content and "\ue201" not in content for content in sent_content)
     incident = storage_context.store.query_one(
         "SELECT code FROM incidents WHERE turn_id = ? AND code = ?",
-        (turn.id, "visualization_attachment_missing"),
+        (turn.id, "visualization_publish_tool_not_used"),
     )
     assert incident is not None
+
+
+@pytest.mark.asyncio
+async def test_legacy_visualize_marker_recommends_new_session(
+    storage_context: StorageContext,
+) -> None:
+    turn, _generation = _active_turn(storage_context)
+    renderer = DiscordRenderPlanner(
+        media_worker=MediaWorker(),
+        table_limits=TableLimits(),
+        artifact_root=storage_context.store.path.parent / "attachments" / "render",
+    )
+    thread = Mock(spec=discord.Thread)
+    thread.id = 300
+    thread.archived = False
+    thread.locked = False
+    thread.send = AsyncMock(
+        side_effect=lambda content="", **_kwargs: SimpleNamespace(
+            id=1,
+            content=content,
+            attachments=[],
+        )
+    )
+    client = Mock(spec=discord.Client)
+    client.user = Mock(id=999)
+    client.get_channel.return_value = thread
+    marker = "\ue200visualize\ue202{}\ue201"
+    volatile_turns = VolatileTurnStore()
+    volatile_turns.put_final(turn.id, visible_text=marker, final_answer_text=marker)
+    transport = DiscordOutboxTransport(
+        client=client,
+        repository=storage_context.repository,
+        renderer=renderer,
+        signer=ComponentSigner(b"k" * 32),
+        volatile_turns=volatile_turns,
+    )
+
+    await transport.deliver(
+        OutboxRecord(
+            id="legacy-image-final",
+            destination_key="thread:300",
+            operation="send",
+            payload_json=canonical_json(
+                {
+                    "kind": "turn_final",
+                    "turn_id": turn.id,
+                    "state": "completed",
+                    "dynamic_tools_enabled": False,
+                }
+            ),
+            delivery_marker="legacy-image-final",
+            state="pending",
+            attempts=0,
+            lease_owner="test",
+        )
+    )
+
+    final_content = thread.send.await_args_list[0].args[0]
+    assert "/session new" in final_content
+    assert "created before Discord image delivery" in final_content
+    assert all(not ("\ufe00" <= character <= "\ufe0f") for character in final_content)
+    assert thread.send.await_args_list[0].kwargs["nonce"]
+    incident = storage_context.store.query_one(
+        "SELECT code FROM incidents WHERE turn_id = ? AND code = ?",
+        (turn.id, "visualization_legacy_session"),
+    )
+    assert incident is not None
+
+
+@pytest.mark.asyncio
+async def test_registered_image_artifact_missing_keeps_distinct_failure(
+    storage_context: StorageContext,
+) -> None:
+    turn, generation = _active_turn(storage_context)
+    source = storage_context.root / "missing-after-registration.png"
+    _image(source, metadata=False)
+    result = await _broker(storage_context).handle(
+        _call(turn, generation, source)
+    )
+    assert result["success"] is True
+    registered = storage_context.repository.registered_outbound_images(turn.id)
+    assert len(registered) == 1
+    artifact = (
+        storage_context.store.path.parent
+        / "attachments"
+        / "render"
+        / registered[0].relative_path
+    )
+    artifact.unlink()
+    marker = "\ue200visualize\ue202{}\ue201"
+    volatile_turns = VolatileTurnStore()
+    volatile_turns.put_final(turn.id, visible_text=marker, final_answer_text=marker)
+    thread = Mock(spec=discord.Thread)
+    thread.id = 300
+    thread.archived = False
+    thread.locked = False
+    thread.send = AsyncMock(
+        side_effect=lambda content="", **_kwargs: SimpleNamespace(
+            id=1,
+            content=content,
+            attachments=[],
+        )
+    )
+    client = Mock(spec=discord.Client)
+    client.user = Mock(id=999)
+    client.get_channel.return_value = thread
+    transport = DiscordOutboxTransport(
+        client=client,
+        repository=storage_context.repository,
+        renderer=DiscordRenderPlanner(
+            media_worker=MediaWorker(),
+            table_limits=TableLimits(),
+            artifact_root=storage_context.store.path.parent / "attachments" / "render",
+        ),
+        signer=ComponentSigner(b"k" * 32),
+        volatile_turns=volatile_turns,
+    )
+
+    await transport.deliver(
+        OutboxRecord(
+            id="missing-registered-image-final",
+            destination_key="thread:300",
+            operation="send",
+            payload_json=canonical_json(
+                {
+                    "kind": "turn_final",
+                    "turn_id": turn.id,
+                    "state": "completed",
+                    "dynamic_tools_enabled": True,
+                }
+            ),
+            delivery_marker="missing-registered-image-final",
+            state="pending",
+            attempts=0,
+            lease_owner="test",
+        )
+    )
+
+    delivered = thread.send.await_args_list[0].args[0]
+    assert "registered image artifact was unavailable" in delivered
+    assert "/session new" not in delivered
+    assert storage_context.store.query_one(
+        "SELECT 1 FROM incidents WHERE turn_id = ? AND code = ?",
+        (turn.id, "outbound_image_artifact_unavailable"),
+    ) is not None
+    assert storage_context.store.query_one(
+        "SELECT 1 FROM incidents WHERE turn_id = ? AND code = ?",
+        (turn.id, "visualization_publish_tool_not_used"),
+    ) is None
 
 
 @pytest.mark.asyncio

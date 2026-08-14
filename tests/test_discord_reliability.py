@@ -54,6 +54,7 @@ from codexd.transport.discord.outbox import (
     OutboxWorker,
     _attachment_failure_guidance,
     _bounded_plain_text_fallback,
+    _delivery_nonce,
     _message_has_delivery_marker,
 )
 from codexd.transport.discord.presentation import TABLE_COPY_CUSTOM_ID, task_card_embed
@@ -66,6 +67,20 @@ def test_attachment_failure_guidance_is_code_based_and_actionable() -> None:
     assert "relative path" in unsupported
     assert "ZIP" in (_attachment_failure_guidance("archive_unsupported") or "")
     assert _attachment_failure_guidance("provider_completed") is None
+
+
+def test_delivery_nonce_is_stable_and_content_has_no_hidden_marker() -> None:
+    nonce = _delivery_nonce("turn-final")
+
+    assert nonce == _delivery_nonce("turn-final")
+    assert nonce != _delivery_nonce("turn-other")
+    assert _message_has_delivery_marker("visible text", "turn-final", nonce=nonce)
+    assert not _message_has_delivery_marker(
+        "visible text",
+        "turn-final",
+        nonce=_delivery_nonce("turn-other"),
+    )
+    assert all(not ("\ufe00" <= character <= "\ufe0f") for character in "visible text")
 
 
 def _volatile_final(
@@ -490,6 +505,7 @@ async def test_final_outbox_delivers_all_attachment_batches(tmp_path: Path) -> N
     assert _message_has_delivery_marker(
         thread.send.await_args_list[3].args[0],
         "final-marker-a2",
+        nonce=thread.send.await_args_list[3].kwargs["nonce"],
     )
     assert "codexD:" not in thread.send.await_args_list[3].args[0]
     assert thread.send.await_args_list[4].args[0].startswith(
@@ -700,6 +716,7 @@ async def test_outbox_worker_waits_for_full_final_retry_before_progress_cleanup(
         message.id = 1000 + send_attempt
         message.author = bot_user
         message.content = content
+        message.nonce = _kwargs.get("nonce")
         message.attachments = []
         delivered_messages.append(message)
         return message
@@ -882,6 +899,7 @@ async def test_progress_fallback_send_reconciles_before_terminal_cleanup(
         message.id = 602 + len(delivered_messages)
         message.author = bot_user
         message.content = content
+        message.nonce = _kwargs.get("nonce")
         message.attachments = []
         message.edit = AsyncMock()
         message.delete = AsyncMock()
@@ -934,6 +952,7 @@ async def test_progress_fallback_send_reconciles_before_terminal_cleanup(
     assert _message_has_delivery_marker(
         replacement.content,
         running.delivery_marker,
+        nonce=replacement.nonce,
     )
 
     repository.retry_outbox(
@@ -1436,6 +1455,7 @@ async def test_turn_progress_uses_one_editable_rich_embed() -> None:
     assert _message_has_delivery_marker(
         thread.send.await_args.args[0],
         "progress-create",
+        nonce=thread.send.await_args.kwargs["nonce"],
     )
     assert "codexD:" not in thread.send.await_args.args[0]
     assert thread.send.await_args.kwargs["embed"].title == "⚙️ Codex is working"
@@ -1474,9 +1494,9 @@ async def test_turn_progress_uses_one_editable_rich_embed() -> None:
     assert existing.edit.await_args.kwargs["embed"].title == "✅ Turn completed"
     assert existing.edit.await_args.kwargs["suppress"] is False
     assert "Completed" not in existing.edit.await_args.kwargs["content"]
-    assert _message_has_delivery_marker(
-        existing.edit.await_args.kwargs["content"],
-        "progress-edit",
+    assert all(
+        not ("\ufe00" <= character <= "\ufe0f")
+        for character in existing.edit.await_args.kwargs["content"]
     )
     assert "Ordinary assistant text" in existing.edit.await_args.kwargs["content"]
 
@@ -3190,7 +3210,7 @@ async def test_malformed_outbox_payload_dead_letters_and_notifies_parent(
         FROM discord_outbox
         WHERE dedupe_key = ?
         """,
-            (f"conversation:{turn.conversation_id}:delivery-unavailable",),
+        (f"conversation:{turn.conversation_id}:delivery-unavailable",),
     )
     assert notice is not None
     assert notice["destination_key"] == "channel:200"
@@ -4051,6 +4071,7 @@ async def test_final_attachment_failure_falls_back_to_actual_content(
     assert _message_has_delivery_marker(
         thread.send.await_args_list[2].args[0],
         "final-marker-at0-0",
+        nonce=thread.send.await_args_list[2].kwargs["nonce"],
     )
     assert "codexD:" not in thread.send.await_args_list[2].args[0]
     assert thread.send.await_args_list[3].args[0].startswith(
@@ -4068,6 +4089,7 @@ async def test_final_attachment_failure_falls_back_to_actual_content(
         delivered.id = message_id
         delivered.author = Mock(id=999)
         delivered.content = call.args[0]
+        delivered.nonce = call.kwargs.get("nonce")
         delivered_messages.append(delivered)
 
     async def history(*, limit: int):
