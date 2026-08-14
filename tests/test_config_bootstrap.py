@@ -79,6 +79,55 @@ def test_config_defaults_to_full_access_and_compatible_sdk(tmp_path: Path) -> No
     assert config.retention.database_size_budget_mib == 512
     assert config.retention.runtime_sqlite_size_budget_mib == 1024
     assert config.discord.owner_user_id == 456
+    assert config.discord.archive_max_entries == 256
+    assert config.discord.archive_max_entry_bytes == 64 * 1024 * 1024
+    assert config.discord.archive_max_total_bytes == 128 * 1024 * 1024
+    assert config.discord.archive_max_compression_ratio == 100
+    assert config.discord.archive_max_path_depth == 16
+    assert config.discord.archive_max_path_chars == 240
+    assert config.discord.archive_extract_timeout_seconds == 15
+
+
+def test_archive_entry_limit_may_not_exceed_total_limit(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        (
+            "[discord]\n"
+            "archive_max_entry_bytes = 20\n"
+            "archive_max_total_bytes = 10\n"
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(Exception, match="may not exceed"):
+        load_config(config_file, environment={"HOME": str(tmp_path)})
+
+
+@pytest.mark.parametrize(
+    ("setting", "value"),
+    (
+        ("archive_max_entries", 257),
+        ("archive_max_entry_bytes", 64 * 1024 * 1024 + 1),
+        ("archive_max_total_bytes", 128 * 1024 * 1024 + 1),
+        ("archive_max_compression_ratio", 101),
+        ("archive_max_path_depth", 17),
+        ("archive_max_path_chars", 241),
+        ("archive_extract_timeout_seconds", 16),
+    ),
+)
+def test_archive_limits_have_hard_security_ceilings(
+    tmp_path: Path,
+    setting: str,
+    value: int,
+) -> None:
+    config_file = tmp_path / f"{setting}.toml"
+    config_file.write_text(
+        f"[discord]\n{setting} = {value}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(Exception, match="may not exceed"):
+        load_config(config_file, environment={"HOME": str(tmp_path)})
 
 
 def test_schedule_poll_rejects_unrepresentable_integer(tmp_path: Path) -> None:

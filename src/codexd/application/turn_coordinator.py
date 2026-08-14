@@ -6,6 +6,7 @@ from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 
+from codexd.application.attachment_materializer import AttachmentMaterializer
 from codexd.application.conversation_locks import ConversationLocks
 from codexd.application.volatile_turns import VolatileTurnStore
 from codexd.domain.conversations import (
@@ -68,6 +69,8 @@ class TurnCoordinator:
         provider_barrier_observer: Callable[[str], None] | None = None,
         skill_input_supported: bool = True,
         schedule_tool_supported: bool = False,
+        attachment_materialization_supported: bool = False,
+        attachment_materializer: AttachmentMaterializer | None = None,
     ) -> None:
         self._repository = repository
         self._runtime_supervisor = runtime_supervisor
@@ -80,6 +83,10 @@ class TurnCoordinator:
         )
         self._skill_input_supported = skill_input_supported
         self._schedule_tool_supported = schedule_tool_supported
+        self._attachment_materialization_supported = (
+            attachment_materialization_supported
+        )
+        self._attachment_materializer = attachment_materializer
         self._active: dict[str, ActiveTurn] = {}
         self._inflight: set[str] = set()
         self._active_lock = asyncio.Lock()
@@ -609,6 +616,41 @@ class TurnCoordinator:
                     self._repository.load_turn_input,
                     claimed.id,
                 )
+            if turn_input.files:
+                if not self._attachment_materialization_supported:
+                    raise file_input_unsupported(
+                        generation=runtime.generation,
+                        turn_id=claimed.id,
+                    )
+                capabilities = await runtime.capabilities()
+                if (
+                    capabilities.optional.get(
+                        "codexd.attachment_materialization"
+                    )
+                    is not True
+                ):
+                    raise file_input_unsupported(
+                        generation=runtime.generation,
+                        turn_id=claimed.id,
+                    )
+                if self._attachment_materializer is None:
+                    raise file_input_unsupported(
+                        generation=runtime.generation,
+                        turn_id=claimed.id,
+                    )
+                materialized = await asyncio.to_thread(
+                    self._attachment_materializer.materialize,
+                    turn_id=claimed.id,
+                    files=turn_input.files,
+                )
+                turn_input = TurnInput(
+                    text=turn_input.text,
+                    images=turn_input.images,
+                    skill_inputs=turn_input.skill_inputs,
+                    files=turn_input.files,
+                    attachment_context=materialized.context,
+                    materialized_files=materialized.files,
+                )
             await self._validate_turn_catalog(
                 runtime,
                 turn=claimed,
@@ -663,7 +705,7 @@ class TurnCoordinator:
                 target=TurnState.FAILED,
                 terminal_code=getattr(exc, "code", "input_validation_failed"),
                 error_code=getattr(exc, "code", "input_validation_failed"),
-                error_message_redacted=str(exc),
+                error_message_redacted=None,
             )
             return None
 
@@ -1020,13 +1062,6 @@ class TurnCoordinator:
         turn: TurnRecord,
         turn_input: TurnInput,
     ) -> ModelDescriptor:
-        if turn_input.files:
-            manifest = await runtime.capabilities()
-            if manifest.optional.get("mention.input") is not True:
-                raise file_input_unsupported(
-                    generation=runtime.generation,
-                    turn_id=turn.id,
-                )
         catalog = await runtime.list_models()
         descriptor = _effective_model(catalog, turn.effective_model)
         if turn_input.images and "image" not in descriptor.input_modalities:

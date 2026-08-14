@@ -50,6 +50,7 @@ from codexd.domain.conversations import (
     TurnConfig,
 )
 from codexd.domain.turns import (
+    MaterializedTurnFile,
     TurnFile,
     TurnImage,
     TurnInput,
@@ -94,17 +95,17 @@ def test_official_sdk_public_contract_and_required_manifest() -> None:
     manifest.assert_required()
     assert manifest.adapter == "openai_codex"
     assert "local_path" in manifest.image_input_modes
-    assert manifest.optional["mention.input"] is (
-        manifest.sdk_version == "0.144.4"
-        and codex_sdk._file_input_leasing_supported()
+    assert manifest.optional["mention.input"] is False
+    assert manifest.optional["codexd.attachment_materialization"] is (
+        codex_sdk._file_input_leasing_supported()
+        and (manifest.sdk_version, manifest.runtime_version)
+        == ("0.144.4", "0.144.4")
     )
 
 
 @pytest.mark.asyncio
-async def test_sdk_0144_4_public_mention_constructor_and_exact_wire_contract() -> None:
+async def test_sdk_0144_4_mention_wire_is_not_treated_as_local_file_input() -> None:
     assert openai_codex.MentionInput is MentionInput
-    assert codex_sdk._mention_input_contract_supported("0.144.4")
-    assert not codex_sdk._mention_input_contract_supported("0.144.5")
 
     class CaptureWireClient:
         def __init__(self) -> None:
@@ -159,6 +160,7 @@ async def test_runtime_maps_mixed_attachments_by_ordinal_without_prompt_downgrad
         _turn_file(tmp_path / "late.bin", ordinal=2, display_name="late.pdf"),
         _turn_file(tmp_path / "first.bin", ordinal=0, display_name="资料.txt"),
     )
+    context, materialized = _materialized_input(tmp_path, files)
 
     started = await runtime.start_turn(
         local_turn_id="local",
@@ -168,6 +170,8 @@ async def test_runtime_maps_mixed_attachments_by_ordinal_without_prompt_downgrad
             images=images,
             files=files,
             skill_inputs=(skill,),
+            attachment_context=context,
+            materialized_files=materialized,
         ),
         config=_turn_config(tmp_path),
     )
@@ -175,10 +179,9 @@ async def test_runtime_maps_mixed_attachments_by_ordinal_without_prompt_downgrad
     assert capture.inputs == [
         [
             TextInput("inspect attachments"),
+            TextInput(context),
             SkillInput("review", str(tmp_path / "SKILL.md")),
-            MentionInput("资料.txt", str(files[1].canonical_path)),
             LocalImageInput(str(tmp_path / "middle.png")),
-            MentionInput("late.pdf", str(files[0].canonical_path)),
             LocalImageInput(str(tmp_path / "late.png")),
         ]
     ]
@@ -188,19 +191,26 @@ async def test_runtime_maps_mixed_attachments_by_ordinal_without_prompt_downgrad
 
 
 @pytest.mark.asyncio
-async def test_runtime_starts_file_only_turn_with_one_mention(tmp_path: Path) -> None:
+async def test_runtime_starts_file_only_turn_with_materialized_context(
+    tmp_path: Path,
+) -> None:
     capture = _InputCaptureThread()
     runtime = _runtime_for_input_capture(tmp_path, capture)
     file = _turn_file(tmp_path / "only.bin", ordinal=0, display_name="only.zip")
+    context, materialized = _materialized_input(tmp_path, (file,))
 
     started = await runtime.start_turn(
         local_turn_id="local",
         thread=ThreadIdentity("thread", None, "session", None, None, "test"),
-        input=TurnInput(files=(file,)),
+        input=TurnInput(
+            files=(file,),
+            attachment_context=context,
+            materialized_files=materialized,
+        ),
         config=_turn_config(tmp_path),
     )
 
-    assert capture.inputs == [[MentionInput("only.zip", str(file.canonical_path))]]
+    assert capture.inputs == [[TextInput(context)]]
     with pytest.raises(RuntimeUnavailable):
         async for _event in started.stream:
             pass
@@ -215,6 +225,8 @@ async def test_runtime_final_file_lease_rejects_named_path_replacement(
     capture = _InputCaptureThread()
     runtime = _runtime_for_input_capture(tmp_path, capture)
     file = _turn_file(tmp_path / "leased.bin", ordinal=0, display_name="leased.txt")
+    materialized_input = _turn_input_with_files(tmp_path, (file,))
+    materialized_file = materialized_input.materialized_files[0]
     original_read = os.read
     replaced = False
 
@@ -223,10 +235,10 @@ async def test_runtime_final_file_lease_rejects_named_path_replacement(
         chunk = original_read(descriptor, size)
         if chunk and not replaced:
             replaced = True
-            replacement = file.canonical_path.with_name("replacement.bin")
-            replacement.write_bytes(file.canonical_path.read_bytes())
+            replacement = materialized_file.canonical_path.with_name("replacement.bin")
+            replacement.write_bytes(materialized_file.canonical_path.read_bytes())
             replacement.chmod(0o600)
-            os.replace(replacement, file.canonical_path)
+            os.replace(replacement, materialized_file.canonical_path)
         return chunk
 
     monkeypatch.setattr(codex_sdk.os, "read", replace_during_hash)
@@ -235,7 +247,7 @@ async def test_runtime_final_file_lease_rejects_named_path_replacement(
         await runtime.start_turn(
             local_turn_id="local",
             thread=ThreadIdentity("thread", None, "session", None, None, "test"),
-            input=TurnInput(files=(file,)),
+            input=materialized_input,
             config=_turn_config(tmp_path),
         )
 
@@ -253,16 +265,51 @@ async def test_runtime_file_lease_rejects_symlinked_private_parent(
     capture = _InputCaptureThread()
     runtime = _runtime_for_input_capture(tmp_path, capture)
     file = _turn_file(tmp_path / "leased.bin", ordinal=0, display_name="leased.txt")
-    input_root = file.canonical_path.parent
-    moved_root = input_root.with_name("moved-input")
-    input_root.rename(moved_root)
-    input_root.symlink_to(moved_root, target_is_directory=True)
+    materialized_input = _turn_input_with_files(tmp_path, (file,))
+    materialized_root = materialized_input.materialized_files[0].canonical_path.parent
+    moved_root = materialized_root.with_name("moved-materialized")
+    materialized_root.rename(moved_root)
+    materialized_root.symlink_to(moved_root, target_is_directory=True)
 
     with pytest.raises(AttachmentIntegrityError):
         await runtime.start_turn(
             local_turn_id="local",
             thread=ThreadIdentity("thread", None, "session", None, None, "test"),
-            input=TurnInput(files=(file,)),
+            input=materialized_input,
+            config=_turn_config(tmp_path),
+        )
+
+    assert capture.inputs == []
+
+
+@pytest.mark.asyncio
+async def test_runtime_file_lease_rejects_lookalike_materialized_path(
+    tmp_path: Path,
+) -> None:
+    capture = _InputCaptureThread()
+    runtime = _runtime_for_input_capture(tmp_path, capture)
+    file = _turn_file(tmp_path / "leased.bin", ordinal=0, display_name="leased.txt")
+    materialized_input = _turn_input_with_files(tmp_path, (file,))
+    valid = materialized_input.materialized_files[0]
+    lookalike_root = tmp_path / "materialized" / "attachments" / "turn" / "snapshot"
+    private_files.ensure_private_directory(tmp_path)
+    private_files.ensure_private_directory(lookalike_root.parent.parent.parent)
+    private_files.ensure_private_directory(lookalike_root.parent.parent)
+    private_files.ensure_private_directory(lookalike_root.parent)
+    private_files.ensure_private_directory(lookalike_root)
+    lookalike = lookalike_root / "payload.bin"
+    lookalike.write_bytes(valid.canonical_path.read_bytes())
+    private_files.secure_private_file(lookalike)
+    invalid_input = replace(
+        materialized_input,
+        materialized_files=(replace(valid, canonical_path=lookalike.resolve()),),
+    )
+
+    with pytest.raises(AttachmentIntegrityError):
+        await runtime.start_turn(
+            local_turn_id="local",
+            thread=ThreadIdentity("thread", None, "session", None, None, "test"),
+            input=invalid_input,
             config=_turn_config(tmp_path),
         )
 
@@ -304,10 +351,14 @@ async def test_abnormal_stream_retains_file_lease_until_confirmed_runtime_close(
         ),
     )
 
+    materialized_input = _turn_input_with_files(
+        storage_context.store.path.parent,
+        (file,),
+    )
     started = await runtime.start_turn(
         local_turn_id="local",
         thread=ThreadIdentity("thread", None, "session", None, None, "test"),
-        input=TurnInput(files=(file,)),
+        input=materialized_input,
         config=_turn_config(storage_context.root),
     )
     descriptor = runtime._file_input_leases["turn"].descriptors[0]
@@ -325,7 +376,8 @@ async def test_abnormal_stream_retains_file_lease_until_confirmed_runtime_close(
     assert runtime._file_input_leases["turn"].descriptors == (descriptor,)
     assert "turn" in runtime._turn_handles
     os.fstat(descriptor)
-    _assert_exclusive_lock(file.canonical_path, available=False)
+    materialized_path = materialized_input.materialized_files[0].canonical_path
+    _assert_exclusive_lock(materialized_path, available=False)
 
     paths = AppPaths(
         storage_context.store.path.parent,
@@ -337,8 +389,9 @@ async def test_abnormal_stream_retains_file_lease_until_confirmed_runtime_close(
         RetentionConfig(),
         now_ms=1_000_000_000,
     )
-    assert retained.input_attachments == 0
-    assert file.canonical_path.exists()
+    assert retained.input_attachments == 1
+    assert not file.canonical_path.exists()
+    assert materialized_path.exists()
 
     await runtime.close()
 
@@ -346,14 +399,14 @@ async def test_abnormal_stream_retains_file_lease_until_confirmed_runtime_close(
     assert runtime._turn_handles == {}
     with pytest.raises(OSError):
         os.fstat(descriptor)
-    _assert_exclusive_lock(file.canonical_path, available=True)
+    _assert_exclusive_lock(materialized_path, available=True)
     removed = run_retention(
         storage_context.store,
         paths,
         RetentionConfig(),
         now_ms=1_000_000_000,
     )
-    assert removed.input_attachments == 1
+    assert removed.input_attachments == 0
     assert not file.canonical_path.exists()
 
 
@@ -374,7 +427,7 @@ async def test_runtime_releases_file_lease_before_yielding_terminal_event(
     started = await runtime.start_turn(
         local_turn_id="local",
         thread=ThreadIdentity("thread", None, "session", None, None, "test"),
-        input=TurnInput(files=(file,)),
+        input=_turn_input_with_files(tmp_path, (file,)),
         config=_turn_config(tmp_path),
     )
     descriptor = runtime._file_input_leases["turn"].descriptors[0]
@@ -399,9 +452,9 @@ async def test_runtime_releases_file_lease_on_start_failure_and_close(
 ) -> None:
     file = _turn_file(tmp_path / "leased.bin", ordinal=0, display_name="leased.txt")
     acquired: list[int] = []
-    original_acquire = codex_sdk._acquire_file_input_lease
+    original_acquire = codex_sdk._acquire_materialized_file_lease
 
-    def record_acquire(value: TurnFile) -> int:
+    def record_acquire(value: MaterializedTurnFile) -> int:
         descriptor = original_acquire(value)
         acquired.append(descriptor)
         return descriptor
@@ -410,13 +463,17 @@ async def test_runtime_releases_file_lease_on_start_failure_and_close(
         async def turn(self, *_args: object, **_kwargs: object) -> object:
             raise CodexError("start failed")
 
-    monkeypatch.setattr(codex_sdk, "_acquire_file_input_lease", record_acquire)
+    monkeypatch.setattr(
+        codex_sdk,
+        "_acquire_materialized_file_lease",
+        record_acquire,
+    )
     failing = _runtime_for_input_capture(tmp_path, cast(Any, FailingThread()))
     with pytest.raises(AdapterError):
         await failing.start_turn(
             local_turn_id="failed",
             thread=ThreadIdentity("thread", None, "session", None, None, "test"),
-            input=TurnInput(files=(file,)),
+            input=_turn_input_with_files(tmp_path, (file,)),
             config=_turn_config(tmp_path),
         )
     assert acquired
@@ -430,7 +487,7 @@ async def test_runtime_releases_file_lease_on_start_failure_and_close(
     await runtime.start_turn(
         local_turn_id="closing",
         thread=ThreadIdentity("thread", None, "session", None, None, "test"),
-        input=TurnInput(files=(file,)),
+        input=_turn_input_with_files(tmp_path, (file,)),
         config=_turn_config(tmp_path),
     )
     descriptor = runtime._file_input_leases["turn"].descriptors[0]
@@ -453,10 +510,10 @@ async def test_uncertain_file_start_force_terminates_before_descriptor_close(
     file = _turn_file(tmp_path / "leased.bin", ordinal=0, display_name="leased.txt")
     acquired: list[int] = []
     events: list[str] = []
-    original_acquire = codex_sdk._acquire_file_input_lease
+    original_acquire = codex_sdk._acquire_materialized_file_lease
     original_close = codex_sdk.os.close
 
-    def record_acquire(value: TurnFile) -> int:
+    def record_acquire(value: MaterializedTurnFile) -> int:
         descriptor = original_acquire(value)
         acquired.append(descriptor)
         return descriptor
@@ -492,7 +549,11 @@ async def test_uncertain_file_start_force_terminates_before_descriptor_close(
         sync_client._proc = None
         raise OSError("close failed")
 
-    monkeypatch.setattr(codex_sdk, "_acquire_file_input_lease", record_acquire)
+    monkeypatch.setattr(
+        codex_sdk,
+        "_acquire_materialized_file_lease",
+        record_acquire,
+    )
     monkeypatch.setattr(codex_sdk.os, "close", record_close)
     runtime = _runtime_for_input_capture(tmp_path, cast(Any, FailingThread()))
     runtime._client = cast(
@@ -508,7 +569,7 @@ async def test_uncertain_file_start_force_terminates_before_descriptor_close(
         await runtime.start_turn(
             local_turn_id="failed",
             thread=ThreadIdentity("thread", None, "session", None, None, "test"),
-            input=TurnInput(files=(file,)),
+            input=_turn_input_with_files(tmp_path, (file,)),
             config=_turn_config(tmp_path),
         )
 
@@ -530,7 +591,7 @@ async def test_runtime_close_force_terminates_before_descriptor_close(
     await runtime.start_turn(
         local_turn_id="closing",
         thread=ThreadIdentity("thread", None, "session", None, None, "test"),
-        input=TurnInput(files=(file,)),
+        input=_turn_input_with_files(tmp_path, (file,)),
         config=_turn_config(tmp_path),
     )
     descriptor = runtime._file_input_leases["turn"].descriptors[0]
@@ -654,14 +715,17 @@ async def test_runtime_force_wait_failure_retains_file_leases(
 
 
 @pytest.mark.asyncio
-async def test_runtime_rejects_files_before_provider_when_mention_capability_is_missing(
+async def test_runtime_rejects_files_before_provider_when_materialization_is_missing(
     tmp_path: Path,
 ) -> None:
     capture = _InputCaptureThread()
     manifest = _capability_manifest()
     unsupported = replace(
         manifest,
-        optional={**manifest.optional, "mention.input": False},
+        optional={
+            **manifest.optional,
+            "codexd.attachment_materialization": False,
+        },
     )
     runtime = CodexSDKRuntime(
         client=cast(Any, object()),
@@ -688,6 +752,43 @@ async def test_runtime_rejects_files_before_provider_when_mention_capability_is_
     assert error.value.failure.code == "file_input_unsupported"
     assert not error.value.failure.retryable
     assert str(file.canonical_path) not in error.value.failure.message
+    assert capture.inputs == []
+
+
+@pytest.mark.asyncio
+async def test_runtime_manifest_gate_rejects_even_pre_materialized_file(
+    tmp_path: Path,
+) -> None:
+    capture = _InputCaptureThread()
+    manifest = _capability_manifest()
+    unsupported = replace(
+        manifest,
+        optional={
+            **manifest.optional,
+            "codexd.attachment_materialization": False,
+        },
+    )
+    runtime = CodexSDKRuntime(
+        client=cast(Any, object()),
+        slot=_runtime_slot(tmp_path),
+        generation=7,
+        manifest=unsupported,
+    )
+    runtime._threads["thread"] = cast(Any, capture)
+    file = _turn_file(
+        tmp_path / "private-location.bin",
+        ordinal=0,
+        display_name="safe.txt",
+    )
+
+    with pytest.raises(FileInputUnsupported):
+        await runtime.start_turn(
+            local_turn_id="local",
+            thread=ThreadIdentity("thread", None, "session", None, None, "test"),
+            input=_turn_input_with_files(tmp_path, (file,)),
+            config=_turn_config(tmp_path),
+        )
+
     assert capture.inputs == []
 
 
@@ -1608,9 +1709,21 @@ def test_in_range_patch_uses_verified_public_contract(
     assert manifest.optional["thread.archive"] is False
     assert manifest.optional["thread.unarchive"] is False
     assert manifest.optional["mention.input"] is False
+    assert manifest.optional["codexd.attachment_materialization"] is False
 
 
-def test_mention_capability_rejects_an_incompatible_public_constructor(
+def test_runtime_override_disables_unverified_materialization_pair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(importlib.metadata, "version", lambda _name: "0.144.4")
+
+    manifest = codex_sdk.capability_manifest(runtime_version="0.144.5")
+
+    assert manifest.compatibility.matrix_tier == "runtime_override"
+    assert manifest.optional["codexd.attachment_materialization"] is False
+
+
+def test_incompatible_mention_constructor_does_not_affect_file_materialization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class IncompatibleMentionInput:
@@ -1619,12 +1732,13 @@ def test_mention_capability_rejects_an_incompatible_public_constructor(
 
     monkeypatch.setattr(openai_codex, "MentionInput", IncompatibleMentionInput)
 
-    assert not codex_sdk._mention_input_contract_supported("0.144.4")
-    assert codex_sdk.capability_manifest().optional["mention.input"] is False
+    manifest = codex_sdk.capability_manifest()
+    assert manifest.optional["mention.input"] is False
+    assert manifest.optional["codexd.attachment_materialization"] is True
 
 
 @pytest.mark.skipif(os.name == "nt", reason="simulates an unavailable Windows backend")
-def test_windows_file_lease_facade_disables_mention_capability(
+def test_windows_file_lease_facade_disables_materialization_capability(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(private_files, "_platform_name", lambda: "nt")
@@ -1632,13 +1746,16 @@ def test_windows_file_lease_facade_disables_mention_capability(
     manifest = codex_sdk.capability_manifest()
 
     assert manifest.optional["mention.input"] is False
+    assert manifest.optional["codexd.attachment_materialization"] is False
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires native Windows semantics")
-def test_windows_runtime_reports_file_input_supported_with_handle_contract() -> None:
+def test_windows_runtime_reports_materialization_supported_with_handle_contract() -> None:
     assert private_files.private_file_security_supported()
     assert codex_sdk._file_input_leasing_supported()
-    assert codex_sdk.capability_manifest().optional["mention.input"] is True
+    manifest = codex_sdk.capability_manifest()
+    assert manifest.optional["mention.input"] is False
+    assert manifest.optional["codexd.attachment_materialization"] is True
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires native Windows semantics")
@@ -1681,13 +1798,14 @@ def test_windows_private_storage_rejects_unc_paths() -> None:
 
 
 @pytest.mark.asyncio
-async def test_missing_optional_mention_export_keeps_text_and_image_turns_working(
+async def test_missing_optional_mention_export_does_not_disable_materialized_files(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delattr(openai_codex, "MentionInput")
     manifest = codex_sdk.capability_manifest()
     assert manifest.optional["mention.input"] is False
+    assert manifest.optional["codexd.attachment_materialization"] is True
 
     capture = _InputCaptureThread()
     runtime = CodexSDKRuntime(
@@ -1709,14 +1827,14 @@ async def test_missing_optional_mention_export_keeps_text_and_image_turns_workin
     ]
 
     file = _turn_file(tmp_path / "file.bin", ordinal=0, display_name="file.txt")
-    with pytest.raises(FileInputUnsupported):
-        await runtime.start_turn(
-            local_turn_id="file",
-            thread=ThreadIdentity("thread", None, "session", None, None, "test"),
-            input=TurnInput(files=(file,)),
-            config=_turn_config(tmp_path),
-        )
-    assert len(capture.inputs) == 1
+    file_input = _turn_input_with_files(tmp_path, (file,))
+    await runtime.start_turn(
+        local_turn_id="file",
+        thread=ThreadIdentity("thread", None, "session", None, None, "test"),
+        input=file_input,
+        config=_turn_config(tmp_path),
+    )
+    assert capture.inputs[-1] == [TextInput(file_input.attachment_context or "")]
 
 
 def test_codex_home_is_propagated_and_conflicts_fail(tmp_path: Path) -> None:
@@ -2290,6 +2408,51 @@ def _turn_file(
         sha256=hashlib.sha256(content).hexdigest(),
         size_bytes=len(content),
         retention_until=9_999_999_999_999,
+    )
+
+
+def _materialized_input(
+    root: Path,
+    files: tuple[TurnFile, ...],
+) -> tuple[str, tuple[MaterializedTurnFile, ...]]:
+    materialized_root = root / "attachments" / "materialized" / "turn" / "snapshot"
+    private_files.ensure_private_directory(materialized_root.parent.parent)
+    private_files.ensure_private_directory(materialized_root.parent)
+    private_files.ensure_private_directory(materialized_root)
+    result: list[MaterializedTurnFile] = []
+    paths: list[str] = []
+    for index, source in enumerate(files):
+        path = materialized_root / f"payload-{index}.bin"
+        content = source.canonical_path.read_bytes()
+        path.write_bytes(content)
+        private_files.secure_private_file(path)
+        result.append(
+            MaterializedTurnFile(
+                attachment_id=source.attachment_id,
+                canonical_path=path.resolve(strict=True),
+                sha256=hashlib.sha256(content).hexdigest(),
+                size_bytes=len(content),
+            )
+        )
+        paths.append(str(path))
+    return (
+        "Host-provided attachment context: " + json.dumps(paths),
+        tuple(result),
+    )
+
+
+def _turn_input_with_files(
+    root: Path,
+    files: tuple[TurnFile, ...],
+    *,
+    text: str | None = None,
+) -> TurnInput:
+    context, materialized = _materialized_input(root, files)
+    return TurnInput(
+        text=text,
+        files=files,
+        attachment_context=context,
+        materialized_files=materialized,
     )
 
 

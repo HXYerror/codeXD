@@ -213,6 +213,19 @@ def _redacted_config(config: AppConfig) -> str:
             f"max_attachment_count = {config.discord.max_attachment_count}",
             f"file_max_bytes = {config.discord.file_max_bytes}",
             f"message_max_bytes = {config.discord.message_max_bytes}",
+            f"archive_max_entries = {config.discord.archive_max_entries}",
+            f"archive_max_entry_bytes = {config.discord.archive_max_entry_bytes}",
+            f"archive_max_total_bytes = {config.discord.archive_max_total_bytes}",
+            (
+                "archive_max_compression_ratio = "
+                f"{config.discord.archive_max_compression_ratio}"
+            ),
+            f"archive_max_path_depth = {config.discord.archive_max_path_depth}",
+            f"archive_max_path_chars = {config.discord.archive_max_path_chars}",
+            (
+                "archive_extract_timeout_seconds = "
+                f"{config.discord.archive_extract_timeout_seconds}"
+            ),
             "",
             "[runtime]",
             f'topology = "{config.runtime.topology}"',

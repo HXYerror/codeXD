@@ -12,13 +12,12 @@ import os
 import re
 import stat
 import tomllib
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
 from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
-import openai_codex
 from openai_codex import (
     ApprovalMode,
     AsyncCodex,
@@ -78,7 +77,7 @@ from codexd.domain.models import (
     ModelDescriptor,
     ServiceTierDescriptor,
 )
-from codexd.domain.turns import TurnFile, TurnIdentity, TurnInput
+from codexd.domain.turns import MaterializedTurnFile, TurnIdentity, TurnInput
 from codexd.errors import AttachmentIntegrityError, InvariantError, NotFoundError
 from codexd.runtime.app_server import (
     DynamicAsyncCodex,
@@ -127,7 +126,9 @@ _SIDE_QUERY_DEVELOPER_INSTRUCTIONS = (
 _ARCHIVE_DIRECT_HANDLE_CONTRACT_VERIFIED = False
 _MIN_SDK_VERSION = (0, 144, 4)
 _MAX_SDK_VERSION = (0, 145, 0)
-_MENTION_INPUT_VERIFIED_SDK_VERSIONS = frozenset({"0.144.4"})
+_ATTACHMENT_MATERIALIZATION_VERIFIED_VERSION_PAIRS = frozenset(
+    {("0.144.4", "0.144.4")}
+)
 _DYNAMIC_TOOL_VERIFIED_VERSION_PAIRS = frozenset({("0.144.4", "0.144.4")})
 try:
     _FCNTL: Any | None = importlib.import_module("fcntl")
@@ -707,10 +708,12 @@ class CodexSDKRuntime:
         input: TurnInput,
         config: TurnConfig,
     ) -> StartedTurn:
-        mention_input = _resolve_mention_input_constructor(self._manifest.sdk_version)
         if input.files and (
-            self._manifest.optional.get("mention.input") is not True
-            or mention_input is None
+            self._manifest.optional.get("codexd.attachment_materialization")
+            is not True
+            or
+            input.attachment_context is None
+            or not input.materialized_files
             or not _file_input_leasing_supported()
         ):
             raise file_input_unsupported(
@@ -722,6 +725,8 @@ class CodexSDKRuntime:
         wire_input: list[InputItem] = []
         if input.text:
             wire_input.append(TextInput(input.text))
+        if input.attachment_context:
+            wire_input.append(TextInput(input.attachment_context))
         wire_input.extend(
             SkillInput(skill.name, str(skill.canonical_path))
             for skill in input.skill_inputs
@@ -730,18 +735,9 @@ class CodexSDKRuntime:
             (image.ordinal, LocalImageInput(str(image.canonical_path)))
             for image in input.images
         ]
-        leases = _acquire_file_input_leases(input.files)
+        leases = _acquire_materialized_file_leases(input.materialized_files)
         provider_start_attempted = False
         try:
-            if input.files:
-                assert mention_input is not None
-                attachment_input.extend(
-                    (
-                        file.ordinal,
-                        mention_input(file.display_name, str(file.canonical_path)),
-                    )
-                    for file in input.files
-                )
             wire_input.extend(
                 item
                 for _ordinal, item in sorted(
@@ -1655,42 +1651,12 @@ def _callable_accepts(
     return callable(candidate) and parameters <= set(inspect.signature(candidate).parameters)
 
 
-def _resolve_mention_input_constructor(
-    sdk_version: str,
-) -> Callable[[str, str], InputItem] | None:
-    if sdk_version not in _MENTION_INPUT_VERIFIED_SDK_VERSIONS:
-        return None
-    try:
-        candidate = getattr(openai_codex, "MentionInput", None)
-    except Exception:
-        return None
-    if not callable(candidate):
-        return None
-    try:
-        parameters = tuple(inspect.signature(candidate).parameters.values())
-        probe = candidate("contract-name", "contract-path")
-    except Exception:
-        return None
-    if not (
-        tuple(parameter.name for parameter in parameters) == ("name", "path")
-        and all(
-            parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
-            and parameter.default is inspect.Parameter.empty
-            for parameter in parameters
-        )
-        and getattr(probe, "name", None) == "contract-name"
-        and getattr(probe, "path", None) == "contract-path"
-    ):
-        return None
-    return cast(Callable[[str, str], InputItem], candidate)
-
-
-def _mention_input_contract_supported(sdk_version: str) -> bool:
-    return _resolve_mention_input_constructor(sdk_version) is not None
-
-
-def _file_input_supported(sdk_version: str) -> bool:
-    return _mention_input_contract_supported(sdk_version) and _file_input_leasing_supported()
+def _file_input_supported(sdk_version: str, runtime_version: str) -> bool:
+    return (
+        (sdk_version, runtime_version)
+        in _ATTACHMENT_MATERIALIZATION_VERIFIED_VERSION_PAIRS
+        and _file_input_leasing_supported()
+    )
 
 
 def _file_input_leasing_supported() -> bool:
@@ -1707,14 +1673,16 @@ def _file_input_leasing_supported() -> bool:
     )
 
 
-def _acquire_file_input_leases(files: tuple[TurnFile, ...]) -> _FileInputLeases:
+def _acquire_materialized_file_leases(
+    files: tuple[MaterializedTurnFile, ...],
+) -> _FileInputLeases:
     if not files:
         return _FileInputLeases()
     descriptors: list[int] = []
-    current: TurnFile | None = None
+    current: MaterializedTurnFile | None = None
     try:
         for current in files:
-            descriptors.append(_acquire_file_input_lease(current))
+            descriptors.append(_acquire_materialized_file_lease(current))
     except _FileInputLeaseError:
         _FileInputLeases(tuple(descriptors)).close()
         attachment_id = current.attachment_id if current is not None else "unknown"
@@ -1725,7 +1693,7 @@ def _acquire_file_input_leases(files: tuple[TurnFile, ...]) -> _FileInputLeases:
     return _FileInputLeases(tuple(descriptors))
 
 
-def _acquire_file_input_lease(file: TurnFile) -> int:
+def _acquire_materialized_file_lease(file: MaterializedTurnFile) -> int:
     if not _file_input_leasing_supported():
         raise _FileInputLeaseError("secure file leasing is unavailable")
     path = file.canonical_path
@@ -1789,19 +1757,26 @@ def _acquire_file_input_lease(file: TurnFile) -> int:
 def _validate_file_lease_path(path: Path) -> None:
     if not path.is_absolute() or ".." in path.parts or path.name in {"", ".", ".."}:
         raise _FileInputLeaseError("file lease path is invalid")
-    if path.parent.name != "input" or path.parent.parent.name != "attachments":
-        raise _FileInputLeaseError("file lease path is outside private attachment storage")
+    marker_indexes = tuple(
+        index
+        for index, part in enumerate(path.parts[:-1])
+        if part == "attachments" and path.parts[index + 1] == "materialized"
+    )
+    if len(marker_indexes) != 1:
+        raise _FileInputLeaseError("file lease path is outside materialized storage")
+    marker_index = marker_indexes[0]
+    if len(path.parts) - marker_index < 5:
+        raise _FileInputLeaseError("file lease path has an invalid materialized layout")
 
     current = Path(path.anchor)
-    for part in path.parts[1:-1]:
+    for index, part in enumerate(path.parts[1:-1], start=1):
         current /= part
         private_files.validate_directory_no_reparse(current)
         metadata = current.lstat()
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
             raise _FileInputLeaseError("file lease path contains an unsafe parent")
-
-    for directory in (path.parent.parent.parent, path.parent.parent, path.parent):
-        private_files.validate_private_directory(directory)
+        if index >= marker_index:
+            private_files.validate_private_directory(current)
 
 
 def _open_file_lease_descriptor(path: Path) -> int:
@@ -2067,7 +2042,11 @@ def capability_manifest(
             "web_search.item": EventCapability.SUPPORTED,
             "web_search.config": True,
             "skill.input": True,
-            "mention.input": _file_input_supported(sdk_version),
+            "mention.input": False,
+            "codexd.attachment_materialization": _file_input_supported(
+                sdk_version,
+                effective_runtime_version,
+            ),
             "mcp.item": EventCapability.SUPPORTED_NOT_OBSERVED,
             "dynamic_tool.item": EventCapability.SUPPORTED_NOT_OBSERVED,
             "dynamic_tool.call": dynamic_tool_call,

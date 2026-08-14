@@ -16,6 +16,7 @@ from codexd.domain.conversations import SandboxProfile
 from codexd.domain.ids import canonical_json, sha256_text
 from codexd.domain.turns import (
     InterruptOrigin,
+    MaterializedTurnFile,
     TurnFile,
     TurnImage,
     TurnInput,
@@ -160,6 +161,35 @@ def test_turn_file_rejects_unsafe_display_names(
             sha256="0" * 64,
             size_bytes=1,
             retention_until=_FUTURE,
+        )
+
+
+def test_materialized_files_must_cover_exactly_the_source_attachments(
+    tmp_path: Path,
+) -> None:
+    source = TurnFile(
+        attachment_id="source",
+        ordinal=0,
+        canonical_path=(tmp_path / "source.bin").absolute(),
+        display_name="source.bin",
+        reported_media_type=None,
+        sha256="0" * 64,
+        size_bytes=1,
+        retention_until=_FUTURE,
+    )
+    materialized_path = (tmp_path / "materialized.bin").absolute()
+    with pytest.raises(InvariantError, match="cover exactly"):
+        TurnInput(
+            files=(source,),
+            attachment_context="context",
+            materialized_files=(
+                MaterializedTurnFile(
+                    attachment_id="different",
+                    canonical_path=materialized_path,
+                    sha256="0" * 64,
+                    size_bytes=1,
+                ),
+            ),
         )
 
 
@@ -488,7 +518,7 @@ def test_input_file_migration_preserves_images_and_enforces_shared_ordinals(
         )
 
         monkeypatch.setattr(sqlite_module, "_load_migrations", lambda: migrations)
-        assert store.migrate() == 22
+        assert store.migrate() == 23
         assert store.integrity_check() == "ok"
         assert store.foreign_key_check() == ()
         assert repository.load_turn_input(image_turn.id).images[0].attachment_id == "legacy-image"
@@ -547,7 +577,7 @@ def test_file_snapshot_survives_database_reopen(tmp_path: Path) -> None:
         )
 
     with SQLiteStore(database) as reopened:
-        assert reopened.migrate() == 22
+        assert reopened.migrate() == 23
         restored = Repository(reopened).load_turn_input(turn.id)
     assert restored.files == (file,)
 

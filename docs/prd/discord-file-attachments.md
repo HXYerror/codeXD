@@ -1,8 +1,8 @@
-# Discord 普通文件附件与 MentionInput
+# Discord 普通文件附件与 daemon-owned materialization
 
 ## Status
 
-Done
+Implemented on `fix/issue-3-file-materialization`; pending review and merge.
 
 ## Source
 
@@ -13,7 +13,8 @@ Done
 
 把 Discord 附件入口从“所有附件都按图片解析”扩展为统一、安全、持久的附件管线。
 有效图片继续映射为 `LocalImageInput`；普通文件作为 opaque bytes 保存到 daemon
-控制的数据目录，并通过 SDK `MentionInput(name, path)` 交给同一个 Turn。
+控制的数据目录。`MentionInput(name, path)` 不是本地文件 API；普通文件必须复制到
+daemon-owned per-Turn staging，并通过 host-generated bounded context 明确提供给 Codex。
 
 ## Requirements
 
@@ -41,12 +42,17 @@ Done
    路径、hash 和 metadata，绝不保存 CDN URL 或公开绝对本地路径。
 9. provider start 前重新验证文件路径位于 data dir，所有父级无 symlink、目标为普通
    文件且 SHA-256/大小未变化；失败时 fail closed，provider 不启动。
-10. Runtime 按附件 ordinal 组合 `TextInput`、`LocalImageInput` 和
-    `MentionInput`；不把文件内容、URL 或路径字符串拼入 prompt，不复制到项目目录。
-11. capability manifest 暴露稳定的 `mention.input`。能力不可用时在 provider start
-    前返回 `file_input_unsupported`，不能静默丢弃文件。
+10. Runtime 使用原始 `TextInput`、host-generated attachment-context `TextInput` 和
+    `LocalImageInput`；context 只含安全显示名、opaque materialized path、大小与 bounded
+    manifest，不含 Discord URL、源 data-dir path或文件正文。
+11. capability manifest 固定报告 `mention.input=false`，并暴露
+    `codexd.attachment_materialization`。能力不可用时在 provider start 前返回
+    `file_input_unsupported`，不能静默丢弃文件；只有通过真实 marker-read contract 的
+    SDK/runtime 配对可报告 true，当前为 `0.144.4`/`0.144.4`。
 12. 默认上限：一条消息最多 10 个附件、单个普通文件 25 MiB、总下载 50 MiB；配置、
-    校验、doctor/diagnostics 和详细设计保持一致。图片仍受原 image limits 约束。
+    校验、doctor/diagnostics 和详细设计保持一致。ZIP 默认 256 entries、单 entry
+    64 MiB、总解压 128 MiB、100:1、深度 16、路径 240 字符、15 秒；这些默认值
+    同时是不可越过的硬安全上限，配置只能收紧。图片仍受原 image limits 约束。
 13. 普通文件复用 7 天 input attachment retention；queued/starting/running 引用期间
     不删除，terminal 到期后删除；orphan sweep 同时覆盖 input_image/input_file。
 14. 保持 ingress 重复投递、queued input 恢复、SkillInput、prompt reaction、
@@ -54,7 +60,7 @@ Done
 
 ## Acceptance Criteria
 
-- `.txt`、`.md`、`.json`、PDF、Office、archive 和未知二进制不再误报
+- `.txt`、`.md`、`.json`、PDF、Office 和未知二进制不再误报
   `image_decode_failed`，而是作为 opaque file 传给 Codex。
 - 文本+多文件、文本+图片+文件和 file-only 均保序且只产生一个 Turn。
 - 有效图片不受 MIME/扩展名欺骗并继续走图片模型检查；损坏且声明为图片的内容拒绝。
@@ -70,8 +76,9 @@ Done
    形成 `TurnFile` 的持久契约。
 2. 将 `DiscordImageIngestor` 演进为统一 `DiscordAttachmentIngestor`：单次下载，
    MediaWorker 内容分类，图片规范化或 opaque 原子 commit，统一回滚。
-3. 扩展 runtime adapter/capability contract，把普通文件映射为 SDK
-   `MentionInput`，并在 start 前校验 snapshot。
+3. 扩展 runtime adapter/capability contract，把普通文件物化到临时 staging，ZIP 在
+   entry/size/ratio/path/time budget 内安全解压，注入 bounded context，并在 start 前
+   校验 snapshot。
 4. 最后接入 Discord bot ingress、错误文案、混合 ordinal 与端到端恢复路径。
 5. 不编辑既有 migration；新增下一个有序 migration。
 
@@ -80,12 +87,14 @@ Done
 - Domain/storage：snapshot/hash、migration、enqueue/load、path/symlink/hash fail-closed、
   duplicate/recovery、retention/orphan。
 - Ingestor：图片/普通文件/MIME 错配/损坏图片/redirect/timeout/partial failure/caps。
-- Runtime contract：MentionInput export、constructor、wire serialization、capability 缺失。
+- Runtime contract：MentionInput 任意 path 明确视为 unsupported；attachment context、
+  opaque staging path、provider-lifetime lease 与 capability 缺失；显式 opt-in 的真实
+  0.144.4 app-server marker-read 测试必须同时看到唯一 marker 和 command execution。
 - Discord：频道 mention、thread reply、file-only、混合顺序、错误码和原子 cleanup。
 - 完整运行 ruff、mypy 与 pytest。
 
 ## Out of Scope
 
 - 用户引用任意本机路径、URL 下载或复制附件到项目/git workspace。
-- codexD 自动解析、OCR、解压、执行或杀毒。
+- codexD 自动解析、OCR、执行或杀毒；ZIP 的受限安全解压属于本 Issue 明确支持的例外。
 - 保证每种专有格式都可被当前 Codex 工具链理解。

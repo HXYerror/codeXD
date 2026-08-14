@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import sqlite3
+import stat
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +35,7 @@ except ImportError:
 @dataclass(frozen=True)
 class RetentionResult:
     input_attachments: int
+    materialized_attachments: int
     render_plans: int
     events: int
     event_tombstones: int
@@ -117,6 +119,7 @@ def run_retention(
     ) + (wal_path.stat().st_size if wal_path.exists() else 0)
     storage_pressure = database_bytes > config.database_size_budget_mib * 1024 * 1024
     input_artifacts: list[tuple[str, Path]] = []
+    materialized_artifacts: list[tuple[str, Path]] = []
     render_artifacts: list[tuple[str, tuple[Path, ...]]] = []
     outbound_artifacts: list[tuple[str, Path]] = []
     with store.transaction() as connection:
@@ -128,6 +131,10 @@ def run_retention(
             LEFT JOIN ingress_messages i ON i.id = a.ingress_id
             WHERE a.kind IN ('input_image', 'input_file')
               AND a.retention_until <= ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM materialized_attachments m
+                  WHERE m.attachment_id = a.id
+              )
               AND (
                 (a.turn_id IS NOT NULL AND t.state IN ({_placeholders(_TERMINAL_TURNS)}))
                 OR
@@ -142,6 +149,27 @@ def run_retention(
                 (
                     str(row["id"]),
                     _safe_relative_path(paths.data_dir, str(row["relative_path"])),
+                )
+            )
+        materialized_rows = connection.execute(
+            f"""
+            SELECT m.id, m.root_relative_path
+            FROM materialized_attachments m
+            JOIN turns t ON t.id = m.turn_id
+            WHERE m.retention_until <= ?
+              AND t.state IN ({_placeholders(_TERMINAL_TURNS)})
+            LIMIT 250
+            """,
+            (now, *_TERMINAL_TURNS),
+        ).fetchall()
+        for row in materialized_rows:
+            materialized_artifacts.append(
+                (
+                    str(row["id"]),
+                    _safe_relative_path(
+                        paths.data_dir,
+                        str(row["root_relative_path"]),
+                    ),
                 )
             )
 
@@ -683,6 +711,15 @@ def run_retention(
             artifact_kind="input_attachment",
         )
     )
+    removed_materialized_ids = tuple(
+        materialized_id
+        for materialized_id, path in materialized_artifacts
+        if _unlink_artifact_tree(
+            path,
+            artifact_id=materialized_id,
+            artifact_kind="materialized_attachment",
+        )
+    )
     removed_render_turn_ids: list[str] = []
     for turn_id, artifact_paths in render_artifacts:
         removed_all = True
@@ -711,6 +748,11 @@ def run_retention(
             connection.executemany(
                 "DELETE FROM attachments WHERE id = ?",
                 ((attachment_id,) for attachment_id in removed_attachment_ids),
+            )
+        if removed_materialized_ids:
+            connection.executemany(
+                "DELETE FROM materialized_attachments WHERE id = ?",
+                ((materialized_id,) for materialized_id in removed_materialized_ids),
             )
         if removed_render_turn_ids:
             connection.executemany(
@@ -741,6 +783,7 @@ def run_retention(
     )
     return RetentionResult(
         input_attachments=len(removed_attachment_ids),
+        materialized_attachments=len(removed_materialized_ids),
         render_plans=len(removed_render_turn_ids),
         events=events,
         event_tombstones=event_tombstones,
@@ -921,6 +964,73 @@ def _unlink_artifact(
                 os.close(descriptor)
 
 
+def _unlink_artifact_tree(
+    path: Path,
+    *,
+    artifact_id: str,
+    artifact_kind: str,
+) -> bool:
+    try:
+        if path.is_symlink():
+            return False
+        if not path.exists():
+            return True
+        if path.is_file():
+            return _unlink_artifact(
+                path,
+                artifact_id=artifact_id,
+                artifact_kind=artifact_kind,
+            )
+        root_metadata = path.lstat()
+        if not stat.S_ISDIR(root_metadata.st_mode):
+            return False
+        candidates = sorted(
+            tuple(path.rglob("*")),
+            key=lambda item: len(item.parts),
+            reverse=True,
+        )
+        if any(candidate.is_symlink() for candidate in candidates):
+            return False
+        for candidate in candidates:
+            if not candidate.is_relative_to(path):
+                return False
+            if candidate.is_file():
+                if not _unlink_artifact(
+                    candidate,
+                    artifact_id=artifact_id,
+                    artifact_kind=artifact_kind,
+                ):
+                    return False
+            elif candidate.is_dir():
+                candidate.rmdir()
+            else:
+                return False
+        named_root = path.lstat()
+        if (
+            not stat.S_ISDIR(named_root.st_mode)
+            or named_root.st_dev != root_metadata.st_dev
+            or named_root.st_ino != root_metadata.st_ino
+        ):
+            return False
+        path.rmdir()
+        parent = path.parent
+        with suppress(OSError):
+            if parent.name and not any(parent.iterdir()):
+                parent.rmdir()
+        return True
+    except OSError as exc:
+        logger.warning(
+            "Retention artifact tree removal failed",
+            extra={
+                "stable_code": "retention_artifact_tree_remove_failed",
+                "artifact_id": artifact_id,
+                "artifact_kind": artifact_kind,
+                "exception_type": type(exc).__name__,
+            },
+        )
+        return False
+
+
 def _remove_old_logs(path: Path, *, older_than_ms: int) -> int:
     removed = 0
     for candidate in path.parent.glob(f"{path.name}.*"):
@@ -955,6 +1065,16 @@ def _sweep_orphan_artifacts(
         referenced.add(
             _safe_relative_path(paths.data_dir, str(row["relative_path"]))
         )
+    for row in store.query_all(
+        "SELECT root_relative_path FROM materialized_attachments"
+    ):
+        root = _safe_relative_path(
+            paths.data_dir,
+            str(row["root_relative_path"]),
+        )
+        referenced.add(root)
+        if root.exists() and not root.is_symlink():
+            referenced.update(root.rglob("*"))
     render_root = paths.attachments / "render"
     for row in store.query_all("SELECT plan_json FROM discord_render_plans"):
         referenced.update(_render_plan_paths(render_root, str(row["plan_json"])))
@@ -973,6 +1093,7 @@ def _sweep_orphan_artifacts(
         paths.attachments / "input",
         render_root,
         paths.attachments / ".quarantine",
+        paths.attachments / "materialized",
     ):
         if not root.exists() or root.is_symlink():
             continue

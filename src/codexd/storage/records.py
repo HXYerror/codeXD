@@ -70,6 +70,21 @@ class RuntimeLeaseRecord:
 
 
 @dataclass(frozen=True)
+class MaterializedAttachmentRecord:
+    id: str
+    attachment_id: str
+    turn_id: str
+    kind: str
+    root_relative_path: str
+    manifest_json: str
+    manifest_hash: str
+    file_count: int
+    total_bytes: int
+    retention_until: int
+    created_at: int
+
+
+@dataclass(frozen=True)
 class TurnRecord:
     id: str
     conversation_id: str

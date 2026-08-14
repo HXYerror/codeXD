@@ -86,6 +86,18 @@ def run_doctor(
             f"message_bytes={config.discord.message_max_bytes}"
         ),
     }
+    checks["archive_limits"] = {
+        "state": "ok",
+        "value": (
+            f"entries={config.discord.archive_max_entries}, "
+            f"entry_bytes={config.discord.archive_max_entry_bytes}, "
+            f"total_bytes={config.discord.archive_max_total_bytes}, "
+            f"ratio={config.discord.archive_max_compression_ratio}, "
+            f"depth={config.discord.archive_max_path_depth}, "
+            f"path_chars={config.discord.archive_max_path_chars}, "
+            f"timeout_seconds={config.discord.archive_extract_timeout_seconds}"
+        ),
+    }
     print(json.dumps(checks, ensure_ascii=False, indent=2, sort_keys=True))
     blocking = {
         name

@@ -60,7 +60,12 @@ def _bot(
         renderer=Mock(),
         media_worker=Mock(),
         signer=Mock(),
-        capability_manifest=Mock(optional={"mention.input": True}),
+        capability_manifest=Mock(
+            optional={
+                "mention.input": False,
+                "codexd.attachment_materialization": True,
+            }
+        ),
         boot_id="attachment-integration",
     )
     bot_user = Mock(id=999, bot=True)

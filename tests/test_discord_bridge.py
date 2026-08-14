@@ -603,6 +603,7 @@ async def test_every_registered_discord_command_executes_through_bridge(
     capabilities = interactions["/capabilities"].followup.send.await_args.args[0]
     assert "`bot_mention_input`" in capabilities
     assert "`sdk_mention_input`" in capabilities
+    assert "`ordinary_file_materialization`" in capabilities
     assert "`gpt-test` · personality `supported`" in capabilities
     diagnostics = interactions["/diagnostics"].followup.send.await_args.args[0]
     assert "Attachments retained:" in diagnostics

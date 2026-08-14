@@ -14,6 +14,10 @@ from pathlib import Path
 import aiohttp
 import discord
 
+from codexd.application.attachment_materializer import (
+    ArchiveLimits,
+    AttachmentMaterializer,
+)
 from codexd.config import AppConfig
 from codexd.domain.ids import utc_now_ms
 from codexd.errors import ConfigurationError, SecurityError
@@ -244,6 +248,26 @@ async def _run_daemon(config: AppConfig, bootstrap_token: str | None) -> int:
             skill_input_supported=manifest.optional.get("skill.input") is True,
             schedule_tool_supported=(
                 manifest.optional.get("codexd.schedule_create_tool") is True
+            ),
+            attachment_materialization_supported=(
+                manifest.optional.get("codexd.attachment_materialization") is True
+            ),
+            attachment_materializer=AttachmentMaterializer(
+                store=store,
+                data_root=config.paths.data_dir,
+                limits=ArchiveLimits(
+                    max_entries=config.discord.archive_max_entries,
+                    max_entry_bytes=config.discord.archive_max_entry_bytes,
+                    max_total_bytes=config.discord.archive_max_total_bytes,
+                    max_compression_ratio=(
+                        config.discord.archive_max_compression_ratio
+                    ),
+                    max_path_depth=config.discord.archive_max_path_depth,
+                    max_path_chars=config.discord.archive_max_path_chars,
+                    extract_timeout_seconds=(
+                        config.discord.archive_extract_timeout_seconds
+                    ),
+                ),
             ),
         )
         schedules = ScheduleCoordinator(
