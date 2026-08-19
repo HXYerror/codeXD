@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 
 import discord
@@ -14,6 +15,7 @@ COLOR_INFO = 0x3B82F6
 COLOR_MUTED = 0x6B7280
 
 TABLE_COPY_CUSTOM_ID = "tb:v1:copy"
+_OPAQUE_PROVIDER_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 
 
 def progress_embed(content: str) -> discord.Embed:
@@ -43,7 +45,11 @@ def progress_embed(content: str) -> discord.Embed:
     return embed
 
 
-def session_status_embed(view: SessionStatusView) -> discord.Embed:
+def session_status_embed(
+    view: SessionStatusView,
+    *,
+    disclose_provider_session_id: bool = False,
+) -> discord.Embed:
     conversation = view.conversation
     runtime_state = view.activity.runtime_state
     if (
@@ -125,15 +131,10 @@ def session_status_embed(view: SessionStatusView) -> discord.Embed:
         inline=False,
     )
 
-    session_lines = [
-        (
-            f"Revision `{revision.id[:8]}` · Codex "
-            f"`{_safe_plain(revision.provider_version, 64)}`"
-            if revision is not None
-            else "Revision `none`"
-        ),
-        f"Provider identity {_safe_plain(view.resume_verification, 160)}",
-    ]
+    session_lines = _session_identity_lines(
+        view,
+        disclose_provider_session_id=disclose_provider_session_id,
+    )
     embed.add_field(name="Session", value="\n".join(session_lines), inline=False)
 
     execution_lines = ["**FULL ACCESS** · `auto_review`"]
@@ -156,6 +157,44 @@ def session_status_embed(view: SessionStatusView) -> discord.Embed:
         text="Advanced: /model show · /usage · /session list · /capabilities"
     )
     return embed
+
+
+def _session_identity_lines(
+    view: SessionStatusView,
+    *,
+    disclose_provider_session_id: bool,
+) -> list[str]:
+    revision = view.active_revision
+    if revision is None:
+        return [
+            "Provider Session ID",
+            "`none`",
+            "Current revision `none`",
+            f"Identity: {_safe_plain(view.resume_verification, 160)}",
+        ]
+    if disclose_provider_session_id and view.provider_session_id is not None:
+        session_reference = _exact_provider_id(view.provider_session_id)
+    elif view.provider_session_hash is not None:
+        session_reference = _exact_provider_id(f"hash:{view.provider_session_hash}")
+    else:
+        session_reference = "unavailable"
+    provider_thread = (
+        _exact_provider_id(f"hash:{view.provider_thread_hash}")
+        if view.provider_thread_hash is not None
+        else "unavailable"
+    )
+    return [
+        "Provider Session ID",
+        f"`{session_reference}`",
+        f"Current revision `{revision.id[:8]}` · Codex "
+        f"`{_safe_plain(revision.provider_version, 64)}`",
+        f"Provider Thread `{provider_thread}`",
+        f"Identity: {_safe_plain(view.resume_verification, 160)}",
+    ]
+
+
+def _exact_provider_id(value: str) -> str:
+    return value if _OPAQUE_PROVIDER_ID.fullmatch(value) is not None else "unavailable"
 
 
 def terminal_footer(payload: Mapping[str, object]) -> str:

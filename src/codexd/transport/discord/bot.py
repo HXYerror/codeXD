@@ -3066,7 +3066,12 @@ class CodexDBot(discord.Client):
         conversation = await self._conversation(interaction)
         view = await self.session_lifecycle.status_view(conversation.id)
         await interaction.followup.send(
-            embed=session_status_embed(view),
+            embed=session_status_embed(
+                view,
+                disclose_provider_session_id=(
+                    interaction.user.id == conversation.owner_user_id
+                ),
+            ),
             ephemeral=True,
         )
 

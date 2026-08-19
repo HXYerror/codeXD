@@ -81,6 +81,7 @@ def _interaction(
     thread: discord.Thread,
     text_channel: discord.TextChannel,
     in_thread: bool,
+    user_id: int = 400,
 ) -> Mock:
     channel = thread if in_thread else text_channel
     interaction = Mock(spec=discord.Interaction)
@@ -88,7 +89,7 @@ def _interaction(
     interaction.guild_id = 100
     interaction.channel_id = channel.id
     interaction.channel = channel
-    interaction.user = Mock(id=400)
+    interaction.user = Mock(id=user_id)
     interaction.response = _response()
     interaction.followup = Mock(send=AsyncMock())
     interaction.app_permissions = SimpleNamespace(
@@ -125,6 +126,8 @@ def _leaf_commands(bot: CodexDBot) -> dict[str, Any]:
 def _storage_bot(
     storage_context: StorageContext,
     tmp_path: Path,
+    *,
+    allowed_user_ids: frozenset[int] = frozenset({400}),
 ) -> CodexDBot:
     conversation = storage_context.repository.get_conversation(
         storage_context.conversation.id
@@ -142,7 +145,7 @@ def _storage_bot(
             discord=DiscordConfig(
                 guild_id=100,
                 owner_user_id=400,
-                allowed_user_ids=frozenset({400}),
+                allowed_user_ids=allowed_user_ids,
             ),
         ),
         repository=storage_context.repository,
@@ -167,6 +170,102 @@ def _thread_channels() -> tuple[discord.Thread, discord.TextChannel]:
     text_channel = Mock(spec=discord.TextChannel)
     text_channel.id = 200
     return thread, text_channel
+
+
+@pytest.mark.asyncio
+async def test_session_status_discloses_full_provider_session_only_to_owner(
+    storage_context: StorageContext,
+    tmp_path: Path,
+) -> None:
+    bot = _storage_bot(
+        storage_context,
+        tmp_path,
+        allowed_user_ids=frozenset({400, 401}),
+    )
+    conversation = storage_context.repository.get_conversation(
+        storage_context.conversation.id
+    )
+    revision = storage_context.repository.activate_thread_revision(
+        conversation_id=conversation.id,
+        identity=ThreadIdentity(
+            thread_id="provider-thread-opaque",
+            requested_thread_id=None,
+            provider_session_id="01a00f0b_fd41-77c2-aa33-5c76d6a4b9e9",
+            forked_from_thread_id=None,
+            parent_thread_id=None,
+            provider_version="0.144.4",
+        ),
+        config=ThreadConfig(
+            model=None,
+            personality=None,
+            sandbox=SandboxProfile.FULL_ACCESS,
+        ),
+    )
+    view = SessionStatusView(
+        conversation=conversation,
+        active_revision=revision,
+        provider_session_id="01a00f0b_fd41-77c2-aa33-5c76d6a4b9e9",
+        provider_session_hash=sha256_text(
+            "01a00f0b_fd41-77c2-aa33-5c76d6a4b9e9"
+        )[:12],
+        provider_thread_hash=sha256_text("provider-thread-opaque")[:12],
+        project_name=storage_context.project.name,
+        behavior=SessionBehaviorStatus(
+            model=SessionStatusValue("provider default", "provider default"),
+            reasoning_effort=SessionStatusValue(
+                "provider default", "provider default"
+            ),
+            reasoning_summary=SessionStatusValue(
+                "provider default", "provider default"
+            ),
+            personality=SessionStatusValue("provider default", "provider default"),
+            service_tier=SessionStatusValue("provider default", "provider default"),
+            web_search_mode="cached",
+            input_modalities=(),
+            resolution="resolves on next Turn",
+        ),
+        activity=SessionActivityStatus(
+            runtime_state="not_loaded",
+            runtime_generation=0,
+            queued_turns=0,
+            active_turns=0,
+            last_completed_at=None,
+            active_turn=None,
+            active_settings_differ=False,
+        ),
+        resume_verification="will verify on next provider use",
+        degraded_reason=None,
+    )
+    bot.session_lifecycle.status_view = AsyncMock(return_value=view)
+    thread, channel = _thread_channels()
+    owner = _interaction(
+        8991,
+        thread=thread,
+        text_channel=channel,
+        in_thread=True,
+        user_id=400,
+    )
+    authorized_non_owner = _interaction(
+        8992,
+        thread=thread,
+        text_channel=channel,
+        in_thread=True,
+        user_id=401,
+    )
+
+    await bot._session_status(owner)
+    await bot._session_status(authorized_non_owner)
+
+    full_id = "01a00f0b_fd41-77c2-aa33-5c76d6a4b9e9"
+    owner_embed = owner.followup.send.await_args.kwargs["embed"]
+    non_owner_embed = authorized_non_owner.followup.send.await_args.kwargs["embed"]
+    owner_rendered = json.dumps(owner_embed.to_dict(), ensure_ascii=False)
+    non_owner_rendered = json.dumps(non_owner_embed.to_dict(), ensure_ascii=False)
+    assert f"`{full_id}`" in owner_rendered
+    assert full_id not in non_owner_rendered
+    assert f"hash:{sha256_text(full_id)[:12]}" in non_owner_rendered
+    assert owner.followup.send.await_args.kwargs["ephemeral"] is True
+    assert authorized_non_owner.followup.send.await_args.kwargs["ephemeral"] is True
 
 
 @pytest.mark.asyncio
@@ -347,6 +446,9 @@ async def test_every_registered_discord_command_executes_through_bridge(
         return_value=SessionStatusView(
             conversation=conversation,
             active_revision=revision,
+            provider_session_id="bridge-provider-session",
+            provider_session_hash=sha256_text("bridge-provider-session")[:12],
+            provider_thread_hash=sha256_text("bridge-provider-thread")[:12],
             project_name=storage_context.project.name,
             behavior=SessionBehaviorStatus(
                 model=SessionStatusValue("gpt-test", "provider default"),
@@ -597,6 +699,12 @@ async def test_every_registered_discord_command_executes_through_bridge(
         "Session",
         "Execution",
     ]
+    session_field = next(
+        field for field in session_embed.fields if field.name == "Session"
+    )
+    assert "`bridge-provider-session`" in session_field.value
+    assert f"`{revision.id[:8]}`" in session_field.value
+    assert "Provider Thread `hash:" in session_field.value
     assert "Optional capabilities" not in json.dumps(
         session_embed.to_dict(), ensure_ascii=False
     )

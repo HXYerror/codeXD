@@ -19,6 +19,7 @@ from codexd.domain.conversations import (
     ThreadProviderState,
     ThreadSnapshot,
 )
+from codexd.domain.ids import sha256_text
 from codexd.domain.models import ModelCatalogSnapshot, ModelDescriptor
 from codexd.domain.turns import InterruptOrigin, TurnInput, TurnSource, TurnState
 from codexd.errors import ConflictError, InvariantError
@@ -57,6 +58,35 @@ def test_revision_listing_does_not_hide_older_sessions(
     assert len(revisions) == 105
 
 
+def test_conversation_and_active_revision_are_read_as_one_snapshot(
+    storage_context: StorageContext,
+) -> None:
+    repository = storage_context.repository
+    revision = repository.activate_thread_revision(
+        conversation_id=storage_context.conversation.id,
+        identity=ThreadIdentity(
+            thread_id="snapshot-thread",
+            requested_thread_id=None,
+            provider_session_id="snapshot-session",
+            forked_from_thread_id=None,
+            parent_thread_id=None,
+            provider_version="test",
+        ),
+        config=ThreadConfig(
+            model=None,
+            personality=None,
+            sandbox=SandboxProfile.FULL_ACCESS,
+        ),
+    )
+
+    conversation, active = repository.conversation_with_active_revision(
+        storage_context.conversation.id
+    )
+
+    assert conversation.active_revision_id == revision.id
+    assert active == revision
+
+
 @pytest.mark.asyncio
 async def test_session_status_does_not_cold_start_runtime(
     storage_context: StorageContext,
@@ -89,10 +119,88 @@ async def test_session_status_does_not_cold_start_runtime(
         assert factory_calls == 0
         assert view.activity.runtime_state == "not_loaded"
         assert view.activity.runtime_generation == 0
+        assert view.provider_session_id is None
+        assert view.provider_session_hash is None
+        assert view.provider_thread_hash is None
         assert view.behavior.model.value == "provider default"
         assert view.behavior.model.source == "provider default"
         assert view.behavior.resolution == "resolves on next Turn"
         assert view.degraded_reason is None
+        session_field = next(
+            field
+            for field in session_status_embed(
+                view,
+                disclose_provider_session_id=True,
+            ).fields
+            if field.name == "Session"
+        )
+        assert "Provider Session ID\n`none`" in session_field.value
+    finally:
+        await lifecycle.close()
+        await supervisor.close()
+
+
+@pytest.mark.asyncio
+async def test_session_status_reads_active_provider_identity_without_cold_start(
+    storage_context: StorageContext,
+) -> None:
+    factory_calls = 0
+
+    async def factory(_slot: object, _generation: int) -> FakeCodexRuntime:
+        nonlocal factory_calls
+        factory_calls += 1
+        return FakeCodexRuntime()
+
+    revision = storage_context.repository.activate_thread_revision(
+        conversation_id=storage_context.conversation.id,
+        identity=ThreadIdentity(
+            thread_id="persisted-provider-thread",
+            requested_thread_id=None,
+            provider_session_id="persisted_provider_session",
+            forked_from_thread_id=None,
+            parent_thread_id=None,
+            provider_version="0.144.4",
+        ),
+        config=ThreadConfig(
+            model=None,
+            personality=None,
+            sandbox=SandboxProfile.FULL_ACCESS,
+        ),
+    )
+    supervisor = RuntimeSupervisor(
+        repository=storage_context.repository,
+        factory=factory,
+        topology="project_scoped",
+        environment={},
+        environment_hash="environment",
+        codex_home=None,
+        neutral_cwd=storage_context.root / ".runtime",
+        allowed_roots=(storage_context.root.parent,),
+    )
+    lifecycle = SessionLifecycleCoordinator(
+        repository=storage_context.repository,
+        runtimes=supervisor,
+        locks=ConversationLocks(),
+    )
+    try:
+        view = await lifecycle.status_view(storage_context.conversation.id)
+
+        assert factory_calls == 0
+        assert view.active_revision == revision
+        assert view.provider_session_id == "persisted_provider_session"
+        assert view.provider_thread_hash == sha256_text(
+            "persisted-provider-thread"
+        )[:12]
+        session_field = next(
+            field
+            for field in session_status_embed(
+                view,
+                disclose_provider_session_id=True,
+            ).fields
+            if field.name == "Session"
+        )
+        assert "`persisted_provider_session`" in session_field.value
+        assert "\\_" not in session_field.value
     finally:
         await lifecycle.close()
         await supervisor.close()
@@ -251,8 +359,14 @@ async def test_session_status_resolves_sources_and_active_turn_drift(
         assert view.activity.active_turn == running
         assert view.activity.active_settings_differ
         assert view.resume_verification == "verified by active provider Turn"
+        assert view.provider_session_id == "status-session"
+        assert view.provider_session_hash == sha256_text("status-session")[:12]
+        assert view.provider_thread_hash == sha256_text("status-thread")[:12]
 
-        embed = session_status_embed(view)
+        embed = session_status_embed(
+            view,
+            disclose_provider_session_id=True,
+        )
         payload = embed.to_dict()
         assert payload["title"] == "🟢 Session active"
         assert [field["name"] for field in payload["fields"]] == [
@@ -265,6 +379,8 @@ async def test_session_status_resolves_sources_and_active_turn_drift(
         assert "fake-model" in rendered
         assert "old-project-model" in rendered
         assert "differs from next Turn" in rendered
+        assert "`status-session`" in rendered
+        assert "Provider Thread `hash:" in rendered
         assert "Optional capabilities" not in rendered
         assert str(storage_context.root) not in rendered
     finally:
@@ -311,6 +427,162 @@ async def test_session_status_catalog_failure_degrades_without_failing(
 
 
 @pytest.mark.asyncio
+async def test_session_status_hides_invalid_provider_identity_and_records_incident(
+    storage_context: StorageContext,
+) -> None:
+    repository = storage_context.repository
+    revision = repository.activate_thread_revision(
+        conversation_id=storage_context.conversation.id,
+        identity=ThreadIdentity(
+            thread_id="valid-thread-before-corruption",
+            requested_thread_id=None,
+            provider_session_id="valid-session-before-corruption",
+            forked_from_thread_id=None,
+            parent_thread_id=None,
+            provider_version="test",
+        ),
+        config=ThreadConfig(
+            model=None,
+            personality=None,
+            sandbox=SandboxProfile.FULL_ACCESS,
+        ),
+    )
+    valid_session = "otherwise-valid-session"
+    hostile_thread = "bad\x00thread"
+    with storage_context.store.transaction() as connection:
+        connection.execute(
+            """
+            UPDATE thread_revisions
+            SET provider_session_id = ?, provider_thread_id = ?
+            WHERE id = ?
+            """,
+            (valid_session, hostile_thread, revision.id),
+        )
+    runtimes = Mock()
+    runtimes.project_status = AsyncMock(
+        return_value={"state": "not_loaded", "generation": 0, "failures": 0}
+    )
+    lifecycle = SessionLifecycleCoordinator(
+        repository=repository,
+        runtimes=runtimes,
+        locks=ConversationLocks(),
+    )
+
+    view = await lifecycle.status_view(storage_context.conversation.id)
+
+    assert view.provider_session_id is None
+    assert view.provider_session_hash is None
+    assert view.provider_thread_hash is None
+    rendered = json.dumps(
+        session_status_embed(
+            view,
+            disclose_provider_session_id=True,
+        ).to_dict(),
+        ensure_ascii=False,
+    )
+    assert valid_session not in rendered
+    assert hostile_thread not in rendered
+    assert "`unavailable`" in rendered
+    incident = storage_context.store.query_one(
+        """
+        SELECT details_json FROM incidents
+        WHERE conversation_id = ?
+          AND code = 'session_status_provider_identity_invalid'
+        """,
+        (storage_context.conversation.id,),
+    )
+    assert incident is not None
+    thread_details = json.loads(str(incident["details_json"]))
+    assert thread_details["revision_id"] == revision.id
+    assert thread_details["invalid_fields"] == ["provider_thread_id"]
+    assert valid_session not in str(incident["details_json"])
+    assert hostile_thread not in str(incident["details_json"])
+
+    hostile_session = "bad\n<@123>" + ("x" * 200)
+    with storage_context.store.transaction() as connection:
+        connection.execute(
+            """
+            UPDATE thread_revisions
+            SET provider_session_id = ?, provider_thread_id = ?
+            WHERE id = ?
+            """,
+            (hostile_session, "otherwise-valid-thread", revision.id),
+        )
+
+    second = await lifecycle.status_view(storage_context.conversation.id)
+
+    assert second.provider_session_id is None
+    updated_incident = storage_context.store.query_one(
+        """
+        SELECT details_json, occurrence_count FROM incidents
+        WHERE conversation_id = ?
+          AND code = 'session_status_provider_identity_invalid'
+        """,
+        (storage_context.conversation.id,),
+    )
+    assert updated_incident is not None
+    session_details = json.loads(str(updated_incident["details_json"]))
+    assert session_details["invalid_fields"] == ["provider_session_id"]
+    assert updated_incident["occurrence_count"] == 2
+    assert hostile_session not in str(updated_incident["details_json"])
+
+
+@pytest.mark.asyncio
+async def test_session_status_ignores_non_active_revision_pointer(
+    storage_context: StorageContext,
+) -> None:
+    repository = storage_context.repository
+    revision = repository.activate_thread_revision(
+        conversation_id=storage_context.conversation.id,
+        identity=ThreadIdentity(
+            thread_id="stale-thread",
+            requested_thread_id=None,
+            provider_session_id="stale-session",
+            forked_from_thread_id=None,
+            parent_thread_id=None,
+            provider_version="test",
+        ),
+        config=ThreadConfig(
+            model=None,
+            personality=None,
+            sandbox=SandboxProfile.FULL_ACCESS,
+        ),
+    )
+    with storage_context.store.transaction() as connection:
+        connection.execute(
+            "UPDATE thread_revisions SET state = 'superseded' WHERE id = ?",
+            (revision.id,),
+        )
+    runtimes = Mock()
+    runtimes.project_status = AsyncMock(
+        return_value={"state": "not_loaded", "generation": 0, "failures": 0}
+    )
+    lifecycle = SessionLifecycleCoordinator(
+        repository=repository,
+        runtimes=runtimes,
+        locks=ConversationLocks(),
+    )
+
+    view = await lifecycle.status_view(storage_context.conversation.id)
+
+    assert view.active_revision is None
+    assert view.provider_session_id is None
+    incident = storage_context.store.query_one(
+        """
+        SELECT details_json FROM incidents
+        WHERE conversation_id = ?
+          AND code = 'session_status_revision_not_active'
+        """,
+        (storage_context.conversation.id,),
+    )
+    assert incident is not None
+    assert json.loads(str(incident["details_json"])) == {
+        "revision_id": revision.id,
+        "revision_state": "superseded",
+    }
+
+
+@pytest.mark.asyncio
 async def test_session_lifecycle_uses_provider_threads_and_preserves_history(
     storage_context: StorageContext,
 ) -> None:
@@ -337,6 +609,9 @@ async def test_session_lifecycle_uses_provider_threads_and_preserves_history(
     try:
         first = await lifecycle.new(storage_context.conversation.id)
         assert first.provider_thread_id == "fake-thread-1"
+        first_status = await lifecycle.status_view(storage_context.conversation.id)
+        assert first_status.provider_session_id == first.provider_session_id
+        assert first_status.active_revision == first
 
         forked = await lifecycle.fork(storage_context.conversation.id)
         assert forked.parent_revision_id == first.id
@@ -344,15 +619,26 @@ async def test_session_lifecycle_uses_provider_threads_and_preserves_history(
         assert storage_context.repository.resolve_thread_revision(
             storage_context.conversation.id, first.id[:8]
         ).state == "superseded"
+        forked_status = await lifecycle.status_view(storage_context.conversation.id)
+        assert forked_status.provider_session_id == first.provider_session_id
+        assert forked_status.active_revision == forked
+        assert forked_status.provider_thread_hash != first_status.provider_thread_hash
 
         archived = await lifecycle.archive(storage_context.conversation.id)
         assert archived.state is ConversationState.ARCHIVED
+        archived_status = await lifecycle.status_view(storage_context.conversation.id)
+        assert archived_status.active_revision is None
+        assert archived_status.provider_session_id is None
 
         resumed = await lifecycle.resume(
             storage_context.conversation.id, forked.id[:8]
         )
         assert resumed.id == forked.id
         assert resumed.state == "active"
+        resumed_status = await lifecycle.status_view(storage_context.conversation.id)
+        assert resumed_status.provider_session_id == forked.provider_session_id
+        assert resumed_status.active_revision is not None
+        assert resumed_status.active_revision.id == forked.id
 
         web_search = await lifecycle.set_web_search(
             storage_context.conversation.id, "live"
@@ -431,7 +717,10 @@ async def test_session_lifecycle_uses_provider_threads_and_preserves_history(
         assert cleared.active_revision_id is None
         assert len(await lifecycle.list_revisions(cleared.id)) == 2
 
-        await lifecycle.new(storage_context.conversation.id)
+        new_revision = await lifecycle.new(storage_context.conversation.id)
+        new_status = await lifecycle.status_view(storage_context.conversation.id)
+        assert new_status.provider_session_id == new_revision.provider_session_id
+        assert new_status.provider_session_id != forked.provider_session_id
         await lifecycle.compact(storage_context.conversation.id)
         compacting = storage_context.repository.get_conversation(
             storage_context.conversation.id
