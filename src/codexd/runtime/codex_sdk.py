@@ -852,7 +852,12 @@ class CodexSDKRuntime:
         if leases.descriptors:
             self._file_input_leases[handle.id] = leases
         self._turn_handles[handle.id] = handle
-        identity = TurnIdentity(local_turn_id, handle.id, self.generation)
+        identity = TurnIdentity(
+            local_turn_id,
+            handle.id,
+            self.generation,
+            thread.thread_id,
+        )
 
         async def iterator() -> AsyncIterator[NormalizedEvent]:
             terminal_seen = False
@@ -3008,7 +3013,10 @@ def _adapter_error(
 ) -> AdapterError:
     chain = f"{type(exc).__name__}:{exc}"
     error_type: type[AdapterError]
-    if isinstance(exc, TransportClosedError):
+    if operation == "turn.stream" and _structured_client_aborted(exc):
+        code = "provider_client_aborted"
+        error_type = AdapterError
+    elif isinstance(exc, TransportClosedError):
         if operation in _UNKNOWN_OUTCOME_MUTATIONS:
             code = "provider_effect_outcome_unknown"
             error_type = ProviderOutcomeUnknown
@@ -3054,6 +3062,19 @@ def _adapter_error(
         cause_chain_hash=hashlib.sha256(chain.encode()).hexdigest(),
     )
     return error_type(failure)
+
+
+def _structured_client_aborted(exc: CodexError) -> bool:
+    if not isinstance(exc, JsonRpcError):
+        return False
+    message = getattr(exc, "message", None)
+    if isinstance(message, str) and message.casefold() == "client_aborted":
+        return True
+    data = getattr(exc, "data", None)
+    if isinstance(data, dict):
+        code = data.get("code") or data.get("error_code") or data.get("errorCode")
+        return isinstance(code, str) and code.casefold() == "client_aborted"
+    return False
 
 
 def _provider_outcome_unknown(

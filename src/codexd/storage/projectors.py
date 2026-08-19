@@ -47,6 +47,7 @@ _DURABLE_EVENT_KINDS = frozenset(
         "turn.interrupted",
         "turn.terminal_unparseable",
         "runtime.stream_interrupted",
+        "runtime.stream_lifecycle",
     }
 )
 _MAX_PROVIDER_EVENT_IDS_PER_TURN = 4096
@@ -142,6 +143,36 @@ class ProjectingEventSink:
             if scope is None:
                 raise NotFoundError(f"Turn not found: {turn_id}")
             if TurnState(str(scope["state"])).terminal:
+                if event.kind == "runtime.stream_lifecycle":
+                    if (
+                        scope["runtime_generation"] != runtime_generation
+                        or scope["lease_generation"] != runtime_generation
+                    ):
+                        self._record_incident(
+                            connection,
+                            severity="warning",
+                            code="stale_runtime_lifecycle",
+                            summary=(
+                                "Ignored stream lifecycle from a stale runtime generation"
+                            ),
+                            project_id=str(scope["project_id"]),
+                            conversation_id=str(scope["conversation_id"]),
+                            turn_id=turn_id,
+                            details={
+                                "expected_generation": scope["runtime_generation"],
+                                "received_generation": runtime_generation,
+                            },
+                            now=now,
+                        )
+                        return EventRecordResult(None, None)
+                    sequence, inserted = self._append_event(
+                        connection,
+                        scope,
+                        event,
+                        now,
+                        durable=True,
+                    )
+                    return EventRecordResult(sequence if inserted else None, None)
                 self._record_incident(
                     connection,
                     severity="warning",
@@ -1985,6 +2016,16 @@ def _durable_event_payload(event: NormalizedEvent) -> dict[str, Any]:
         "model.verification": ("verifications",),
         "turn.moderation": ("metadata_hash", "metadata_size"),
         "runtime.stream_interrupted": ("code",),
+        "runtime.stream_lifecycle": (
+            "stream_created",
+            "stream_claimed",
+            "stream_closed",
+            "terminal_notification",
+            "duration_ms",
+            "failure_code",
+            "provider_thread_hash",
+            "provider_turn_hash",
+        ),
     }
     allowed = allowed_by_kind.get(event.kind)
     if allowed is not None:

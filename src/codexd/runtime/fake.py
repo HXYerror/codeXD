@@ -223,7 +223,12 @@ class FakeCodexRuntime:
         self.started_inputs.append(input)
         self._turn_counter += 1
         provider_turn_id = f"fake-turn-{self._turn_counter}"
-        identity = TurnIdentity(local_turn_id, provider_turn_id, self.generation)
+        identity = TurnIdentity(
+            local_turn_id,
+            provider_turn_id,
+            self.generation,
+            thread.thread_id,
+        )
         events = self._scripts.popleft() if self._scripts else _default_events(provider_turn_id)
         self._turn_events[provider_turn_id] = events
         self._thread_states[thread.thread_id] = ThreadProviderState.ACTIVE

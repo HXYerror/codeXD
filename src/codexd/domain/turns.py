@@ -221,6 +221,7 @@ class TurnIdentity:
     local_turn_id: str
     provider_turn_id: str | None
     runtime_generation: int
+    provider_thread_id: str | None = None
 
 
 _TRANSITIONS: dict[TurnState, frozenset[TurnState]] = {

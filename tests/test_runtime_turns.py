@@ -35,6 +35,7 @@ from codexd.domain.turns import (
 )
 from codexd.errors import ConflictError, InvariantError
 from codexd.runtime.errors import (
+    AdapterError,
     AdapterFailure,
     AdapterInvariantError,
     EventJournalError,
@@ -44,7 +45,7 @@ from codexd.runtime.errors import (
 )
 from codexd.runtime.fake import FakeCodexRuntime
 from codexd.runtime.mailbox import MailboxRegistry
-from codexd.runtime.port import RuntimeSlotConfig, StartedTurn
+from codexd.runtime.port import RuntimeSlotConfig, StartedTurn, TurnStream
 from codexd.runtime.supervisor import RuntimeFactory, RuntimeSupervisor
 from codexd.security import private_files
 from codexd.storage.projectors import ProjectingEventSink
@@ -92,9 +93,39 @@ async def test_fake_runtime_turn_is_durable_end_to_end(
             "SELECT kind FROM events WHERE turn_id = ? ORDER BY local_event_index",
             (turn.id,),
         )
+        lifecycle = None
+        for _ in range(100):
+            lifecycle = storage_context.store.query_one(
+                """
+                SELECT payload_json FROM events
+                WHERE turn_id = ? AND kind = 'runtime.stream_lifecycle'
+                """,
+                (turn.id,),
+            )
+            if lifecycle is not None:
+                break
+            await asyncio.sleep(0.01)
+        assert lifecycle is not None
+        payload = json.loads(str(lifecycle["payload_json"]))
+        assert payload["stream_created"] is True
+        assert payload["stream_claimed"] is True
+        assert payload["stream_closed"] is True
+        assert payload["terminal_notification"] is True
+        assert set(payload) == {
+            "duration_ms",
+            "failure_code",
+            "provider_thread_hash",
+            "provider_turn_hash",
+            "stream_claimed",
+            "stream_closed",
+            "stream_created",
+            "terminal_notification",
+        }
+        assert payload["failure_code"] is None
         assert [row["kind"] for row in events] == [
             "turn.activity",
             "turn.completed",
+            "runtime.stream_lifecycle",
         ]
         outbox = storage_context.store.query_one(
             "SELECT operation, state FROM discord_outbox WHERE dedupe_key = ?",
@@ -561,6 +592,132 @@ async def test_unexpected_stream_end_interrupts_turn_and_retires_runtime(
 
 
 @pytest.mark.asyncio
+async def test_queued_followup_does_not_close_active_provider_stream(
+    storage_context: StorageContext,
+) -> None:
+    fake = FakeCodexRuntime(event_delay=0.01)
+
+    async def factory(_slot: object, _generation: int) -> FakeCodexRuntime:
+        return fake
+
+    supervisor = _runtime_supervisor(storage_context, factory)
+    coordinator = _turn_coordinator(storage_context, supervisor)
+    try:
+        first = await coordinator.enqueue(
+            conversation_id=storage_context.conversation.id,
+            source=TurnSource.DISCORD,
+            turn_input=TurnInput(text="long active turn"),
+            input_message_id="active-before-followup",
+        )
+        await _wait_for_state(storage_context, first.id, TurnState.RUNNING)
+        followup = await coordinator.enqueue(
+            conversation_id=storage_context.conversation.id,
+            source=TurnSource.DISCORD,
+            turn_input=TurnInput(text="queued followup"),
+            input_message_id="queued-followup",
+        )
+
+        first_terminal = await _wait_for_terminal(storage_context, first.id)
+
+        assert first_terminal.state is TurnState.COMPLETED
+        assert storage_context.repository.get_turn(followup.id).state is TurnState.QUEUED
+        lifecycle = storage_context.store.query_all(
+            """
+            SELECT payload_json FROM events
+            WHERE turn_id = ? AND kind = 'runtime.stream_lifecycle'
+            ORDER BY sequence
+            """,
+            (first.id,),
+        )
+        assert len(lifecycle) == 1
+        assert all(
+            json.loads(str(row["payload_json"]))["terminal_notification"] is True
+            for row in lifecycle
+        )
+    finally:
+        await coordinator.close(drain_seconds=1)
+        await supervisor.close()
+
+
+@pytest.mark.asyncio
+async def test_structured_provider_abort_has_distinct_terminal_source(
+    storage_context: StorageContext,
+) -> None:
+    class AbortedRuntime(FakeCodexRuntime):
+        async def start_turn(
+            self,
+            *,
+            local_turn_id: str,
+            thread: ThreadIdentity,
+            input: TurnInput,
+            config: TurnConfig,
+        ) -> StartedTurn:
+            started = await super().start_turn(
+                local_turn_id=local_turn_id,
+                thread=thread,
+                input=input,
+                config=config,
+            )
+
+            async def stream():
+                yield NormalizedEvent(
+                    "turn.started",
+                    {"provider_turn_id": started.identity.provider_turn_id},
+                )
+                raise AdapterError(
+                    AdapterFailure(
+                        code="provider_client_aborted",
+                        provider_exception="JsonRpcError",
+                        message="structured provider abort",
+                        retryable=False,
+                        runtime_generation=self.generation,
+                        thread_id=thread.thread_id,
+                        turn_id=started.identity.provider_turn_id,
+                    )
+                )
+
+            return StartedTurn(started.identity, TurnStream(stream))
+
+    fake = AbortedRuntime()
+
+    async def factory(_slot: object, _generation: int) -> FakeCodexRuntime:
+        return fake
+
+    supervisor = _runtime_supervisor(storage_context, factory)
+    coordinator = _turn_coordinator(storage_context, supervisor)
+    try:
+        turn = await coordinator.enqueue(
+            conversation_id=storage_context.conversation.id,
+            source=TurnSource.DISCORD,
+            turn_input=TurnInput(text="structured abort"),
+            input_message_id="structured-abort",
+        )
+        terminal = await _wait_for_terminal(storage_context, turn.id)
+        for _ in range(100):
+            lifecycle = storage_context.store.query_one(
+                """
+                SELECT payload_json FROM events
+                WHERE turn_id = ? AND kind = 'runtime.stream_lifecycle'
+                """,
+                (turn.id,),
+            )
+            if lifecycle is not None:
+                break
+            await asyncio.sleep(0.01)
+
+        assert terminal.state is TurnState.INTERRUPTED
+        assert terminal.terminal_code == "provider_client_aborted"
+        assert terminal.interrupt_origin is None
+        assert lifecycle is not None
+        assert json.loads(str(lifecycle["payload_json"]))["failure_code"] == (
+            "provider_client_aborted"
+        )
+    finally:
+        await coordinator.close(drain_seconds=1)
+        await supervisor.close()
+
+
+@pytest.mark.asyncio
 async def test_event_pump_batches_consecutive_stream_deltas(
     storage_context: StorageContext,
     monkeypatch: pytest.MonkeyPatch,
@@ -634,6 +791,59 @@ async def test_event_pump_batches_consecutive_stream_deltas(
         metrics = coordinator.event_metrics()
         assert metrics["count"] > 0
         assert metrics["p95_ms"] >= 0
+    finally:
+        await coordinator.close(drain_seconds=1)
+        await supervisor.close()
+
+
+@pytest.mark.asyncio
+async def test_slow_event_journal_does_not_close_provider_stream(
+    storage_context: StorageContext,
+) -> None:
+    fake = FakeCodexRuntime(event_delay=0.001)
+
+    async def factory(_slot: object, _generation: int) -> FakeCodexRuntime:
+        return fake
+
+    class SlowSink(ProjectingEventSink):
+        def record(self, **kwargs: object):
+            time.sleep(0.05)
+            return super().record(**kwargs)
+
+    supervisor = _runtime_supervisor(storage_context, factory)
+    coordinator = TurnCoordinator(
+        repository=storage_context.repository,
+        runtime_supervisor=supervisor,
+        event_sink=SlowSink(
+            storage_context.store,
+            correlation_key=b"s" * 32,
+        ),
+    )
+    try:
+        turn = await coordinator.enqueue(
+            conversation_id=storage_context.conversation.id,
+            source=TurnSource.DISCORD,
+            turn_input=TurnInput(text="slow durable sink"),
+            input_message_id="slow-durable-sink",
+        )
+        terminal = await _wait_for_terminal(storage_context, turn.id)
+        lifecycle = None
+        for _ in range(100):
+            lifecycle = storage_context.store.query_one(
+                """
+                SELECT payload_json FROM events
+                WHERE turn_id = ? AND kind = 'runtime.stream_lifecycle'
+                """,
+                (turn.id,),
+            )
+            if lifecycle is not None:
+                break
+            await asyncio.sleep(0.01)
+
+        assert terminal.state is TurnState.COMPLETED
+        assert lifecycle is not None
+        assert json.loads(str(lifecycle["payload_json"]))["failure_code"] is None
+        assert not fake.closed
     finally:
         await coordinator.close(drain_seconds=1)
         await supervisor.close()

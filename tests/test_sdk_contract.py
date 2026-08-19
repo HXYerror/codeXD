@@ -952,6 +952,27 @@ def test_known_turn_notification_is_normalized() -> None:
     assert event.payload["provider_turn_id"] == "provider-turn"
 
 
+def test_only_structured_jsonrpc_client_abort_gets_stable_code() -> None:
+    structured = _adapter_error(
+        JsonRpcError(-32000, "client_aborted"),
+        operation="turn.stream",
+        generation=3,
+        thread_id="thread",
+        turn_id="turn",
+    )
+    prompt_text = _adapter_error(
+        CodexError("user prompt mentioned client_aborted"),
+        operation="turn.stream",
+        generation=3,
+        thread_id="thread",
+        turn_id="turn",
+    )
+
+    assert structured.failure.code == "provider_client_aborted"
+    assert not structured.failure.retryable
+    assert prompt_text.failure.code == "provider_error"
+
+
 @pytest.mark.asyncio
 async def test_model_catalog_preserves_display_and_reasoning_descriptions(
     tmp_path: Path,

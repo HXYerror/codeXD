@@ -7,6 +7,7 @@ from collections import deque
 from dataclasses import dataclass
 
 from codexd.domain.events import NormalizedEvent
+from codexd.domain.ids import sha256_text
 from codexd.domain.turns import TurnState
 from codexd.runtime.errors import AdapterError, EventJournalError
 from codexd.runtime.port import StartedTurn
@@ -67,6 +68,14 @@ class EventPump:
         next_event: asyncio.Future[NormalizedEvent] | None = None
         buffered: NormalizedEvent | None = None
         flush_deadline: float | None = None
+        stream_created_at = time.monotonic()
+        lifecycle = {
+            "stream_created": True,
+            "stream_claimed": True,
+            "terminal_notification": False,
+            "stream_closed": False,
+        }
+        lifecycle_failure_code: str | None = None
 
         async def persist(event: NormalizedEvent) -> PumpResult | None:
             nonlocal stale_generation
@@ -79,6 +88,7 @@ class EventPump:
                 stale_generation = True
                 return None
             if recorded_terminal is not None:
+                lifecycle["terminal_notification"] = True
                 return PumpResult(*recorded_terminal)
             return None
 
@@ -161,6 +171,7 @@ class EventPump:
                 if result is not None:
                     return result
         except asyncio.CancelledError:
+            lifecycle_failure_code = "event_pump_cancelled"
             raise
         except EventJournalError:
             raise
@@ -168,9 +179,11 @@ class EventPump:
             code = (
                 exc.failure.code
                 if exc.failure.code.startswith(("runtime_", "stream_"))
+                or exc.failure.code == "provider_client_aborted"
                 else f"stream_{exc.failure.code}"
             )
             terminal = (TurnState.INTERRUPTED, code)
+            lifecycle_failure_code = code
             recorded = await self._record_stream_failure(
                 local_turn_id, started, code
             )
@@ -181,6 +194,7 @@ class EventPump:
             )
         except Exception as exc:
             code = f"stream_event_pump_{type(exc).__name__}"
+            lifecycle_failure_code = code
             recorded = await self._record_stream_failure(local_turn_id, started, code)
             return (
                 PumpResult(TurnState.INTERRUPTED, code)
@@ -195,6 +209,19 @@ class EventPump:
             close = getattr(stream, "aclose", None)
             if callable(close):
                 await close()
+            lifecycle["stream_closed"] = True
+            if (
+                lifecycle_failure_code is None
+                and not lifecycle["terminal_notification"]
+            ):
+                lifecycle_failure_code = "stream_ended_without_terminal"
+            await self._record_stream_lifecycle(
+                local_turn_id,
+                started,
+                lifecycle=lifecycle,
+                duration_ms=max(0, int((time.monotonic() - stream_created_at) * 1000)),
+                failure_code=lifecycle_failure_code,
+            )
         if terminal is None:
             recorded = await self._record_stream_failure(
                 local_turn_id, started, "stream_ended_without_terminal"
@@ -205,6 +232,42 @@ class EventPump:
                 )
             terminal = (TurnState.INTERRUPTED, "stream_ended_without_terminal")
         return PumpResult(*terminal)
+
+    async def _record_stream_lifecycle(
+        self,
+        turn_id: str,
+        started: StartedTurn,
+        *,
+        lifecycle: dict[str, bool],
+        duration_ms: int,
+        failure_code: str | None,
+    ) -> None:
+        event = NormalizedEvent(
+            "runtime.stream_lifecycle",
+            {
+                **lifecycle,
+                "duration_ms": duration_ms,
+                "failure_code": failure_code,
+                "provider_turn_hash": sha256_text(
+                    started.identity.provider_turn_id or "missing"
+                )[:16],
+                "provider_thread_hash": sha256_text(
+                    started.identity.provider_thread_id or "missing"
+                )[:16],
+            },
+            raw_type="runtime",
+        )
+        try:
+            await asyncio.to_thread(
+                self._sink.record,
+                turn_id=turn_id,
+                runtime_generation=started.identity.runtime_generation,
+                event=event,
+            )
+        except Exception:
+            # The Turn may already be terminal; lifecycle diagnostics must never
+            # replace or reopen its authoritative terminal state.
+            return
 
     async def _record_event(
         self,
