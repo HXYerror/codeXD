@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 import re
@@ -19,7 +20,7 @@ from codexd.domain.conversations import (
     ThreadProviderState,
     WebSearchMode,
 )
-from codexd.domain.ids import sha256_text
+from codexd.domain.ids import canonical_json, sha256_text
 from codexd.domain.models import ModelCatalogSnapshot, ModelDescriptor
 from codexd.errors import InvariantError, NotFoundError
 from codexd.runtime.errors import AdapterError, ProviderOutcomeUnknown
@@ -936,8 +937,86 @@ class SessionLifecycleCoordinator:
         project = await asyncio.to_thread(
             self._repository.get_project, conversation.project_id
         )
-        runtime, _lease = await self._runtimes.ensure(project)
-        return await runtime.list_models()
+        catalog, _generation = await self._runtimes.refresh_model_catalog(project)
+        return catalog
+
+    async def model_catalog_with_generation(
+        self,
+        conversation_id: str,
+    ) -> tuple[ModelCatalogSnapshot, int]:
+        conversation = await asyncio.to_thread(
+            self._repository.get_conversation,
+            conversation_id,
+        )
+        project = await asyncio.to_thread(
+            self._repository.get_project,
+            conversation.project_id,
+        )
+        return await self._runtimes.refresh_model_catalog(project)
+
+    async def assert_runtime_generation(
+        self,
+        conversation_id: str,
+        generation: int,
+    ) -> None:
+        conversation = await asyncio.to_thread(
+            self._repository.get_conversation,
+            conversation_id,
+        )
+        await self._runtimes.assert_generation(conversation.project_id, generation)
+
+    async def validate_catalog_choice(
+        self,
+        conversation_id: str,
+        *,
+        kind: str,
+        generation: int,
+        expected_hash: str,
+    ) -> None:
+        await self.assert_runtime_generation(conversation_id, generation)
+        catalog, observed_generation = await self.model_catalog_with_generation(
+            conversation_id
+        )
+        if observed_generation != generation:
+            raise InvariantError(
+                "Codex runtime changed; reopen the model or reasoning selector"
+            )
+        conversation = await asyncio.to_thread(
+            self._repository.get_conversation,
+            conversation_id,
+        )
+        if not catalog.complete:
+            raise InvariantError("Codex model catalog became incomplete")
+        values = (
+            ["default", *(model.model for model in catalog.models)]
+            if kind == "model"
+            else [
+                "default",
+                *_effective_model(
+                    catalog,
+                    conversation.model_override,
+                ).supported_reasoning_efforts,
+            ]
+        )
+        observed_hash = sha256_text(
+            canonical_json(
+                {"kind": kind, "generation": generation, "values": values}
+            )
+        )
+        if not hmac.compare_digest(observed_hash, expected_hash):
+            raise InvariantError(
+                "Codex catalog changed; reopen the model or reasoning selector"
+            )
+
+    async def model_catalog_if_loaded(
+        self,
+        conversation_id: str,
+    ) -> ModelCatalogSnapshot | None:
+        conversation = await asyncio.to_thread(
+            self._repository.get_conversation,
+            conversation_id,
+        )
+        return await self._runtimes.model_catalog_if_loaded(conversation.project_id)
 
     async def set_model(
         self,

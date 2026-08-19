@@ -105,6 +105,8 @@ class FakeCodexRuntime:
                 ModelDescriptor(
                     id="fake-model",
                     model="fake-model",
+                    display_name="Fake Model",
+                    description="Fake runtime model",
                     is_default=True,
                     input_modalities=("text", "image"),
                     supported_reasoning_efforts=("low", "medium", "high"),

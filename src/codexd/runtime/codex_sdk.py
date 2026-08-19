@@ -75,6 +75,7 @@ from codexd.domain.models import (
     AccountStatus,
     ModelCatalogSnapshot,
     ModelDescriptor,
+    ReasoningEffortDescriptor,
     ServiceTierDescriptor,
 )
 from codexd.domain.provider_failures import classify_provider_failure
@@ -471,12 +472,21 @@ class CodexSDKRuntime:
                 ModelDescriptor(
                     id=model.id,
                     model=model.model,
+                    display_name=model.display_name,
+                    description=model.description,
                     is_default=model.is_default,
                     input_modalities=tuple(
                         _enum_value(value) for value in model.input_modalities or []
                     ),
                     supported_reasoning_efforts=tuple(
                         _enum_value(option.reasoning_effort)
+                        for option in model.supported_reasoning_efforts
+                    ),
+                    reasoning_effort_options=tuple(
+                        ReasoningEffortDescriptor(
+                            value=_enum_value(option.reasoning_effort),
+                            description=option.description,
+                        )
                         for option in model.supported_reasoning_efforts
                     ),
                     default_reasoning_effort=_enum_value(model.default_reasoning_effort),

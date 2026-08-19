@@ -11,6 +11,12 @@ class ServiceTierDescriptor:
 
 
 @dataclass(frozen=True)
+class ReasoningEffortDescriptor:
+    value: str
+    description: str
+
+
+@dataclass(frozen=True)
 class ModelDescriptor:
     id: str
     model: str
@@ -22,6 +28,9 @@ class ModelDescriptor:
     service_tiers: tuple[ServiceTierDescriptor, ...]
     default_service_tier: str | None
     upgrade: dict[str, object] | None
+    display_name: str = ""
+    description: str = ""
+    reasoning_effort_options: tuple[ReasoningEffortDescriptor, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -37,4 +46,3 @@ class AccountStatus:
     account_type: str | None
     plan_type: str | None
     observed_at: int
-

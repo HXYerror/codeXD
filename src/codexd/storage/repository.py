@@ -54,6 +54,7 @@ from codexd.storage.progress import (
     supersede_coalesced_outbox,
 )
 from codexd.storage.records import (
+    CatalogChoiceIntentRecord,
     CommandIntentRecord,
     ConversationRecord,
     IngressMessageRecord,
@@ -243,6 +244,154 @@ class Repository:
             ).fetchone()
             assert row is not None
             return _modal_intent(row)
+
+    def create_catalog_choice_intent(
+        self,
+        *,
+        kind: str,
+        conversation_id: str,
+        guild_id: int,
+        channel_id: int,
+        owner_user_id: int,
+        runtime_generation: int,
+        catalog_hash: str,
+        allowed_values: Sequence[str],
+        nonce: str,
+        expires_at: int,
+    ) -> CatalogChoiceIntentRecord:
+        if kind not in {"model", "reasoning"}:
+            raise InvariantError("invalid catalog choice intent kind")
+        if runtime_generation < 1 or expires_at <= utc_now_ms():
+            raise InvariantError("invalid catalog choice intent lifetime")
+        values = tuple(dict.fromkeys(allowed_values))
+        if (
+            not values
+            or len(values) > 25
+            or any(not value or len(value) > 100 for value in values)
+        ):
+            raise InvariantError("catalog choices must contain 1 to 25 values")
+        intent_id = new_id()
+        now = utc_now_ms()
+        with self.store.transaction() as connection:
+            conversation = connection.execute(
+                "SELECT * FROM conversations WHERE id = ?",
+                (conversation_id,),
+            ).fetchone()
+            if conversation is None:
+                raise NotFoundError(f"Conversation not found: {conversation_id}")
+            if (
+                int(conversation["discord_guild_id"]) != guild_id
+                or int(conversation["discord_thread_id"]) != channel_id
+                or int(conversation["owner_user_id"]) != owner_user_id
+            ):
+                raise SecurityError("catalog choice Discord scope does not match")
+            connection.execute(
+                """
+                INSERT INTO catalog_choice_intents(
+                    id, kind, project_id, conversation_id,
+                    discord_guild_id, discord_channel_id, owner_user_id,
+                    runtime_generation, catalog_hash, allowed_values_json,
+                    nonce_hash, state, expires_at, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)
+                """,
+                (
+                    intent_id,
+                    kind,
+                    conversation["project_id"],
+                    conversation_id,
+                    str(guild_id),
+                    str(channel_id),
+                    str(owner_user_id),
+                    runtime_generation,
+                    catalog_hash,
+                    canonical_json(values),
+                    sha256_text(f"catalog-choice:{nonce}"),
+                    expires_at,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM catalog_choice_intents WHERE id = ?",
+                (intent_id,),
+            ).fetchone()
+            assert row is not None
+            return _catalog_choice_intent(row)
+
+    def consume_catalog_choice_intent(
+        self,
+        *,
+        intent_id: str,
+        kind: str,
+        value: str,
+        runtime_generation: int,
+        nonce: str,
+        interaction_id: str,
+        guild_id: int,
+        channel_id: int,
+        user_id: int,
+    ) -> CatalogChoiceIntentRecord:
+        now = utc_now_ms()
+        with self.store.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM catalog_choice_intents WHERE id = ?",
+                (intent_id,),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("catalog choice intent was not found")
+            if (
+                row["kind"] != kind
+                or int(row["runtime_generation"]) != runtime_generation
+                or not hmac.compare_digest(
+                    str(row["nonce_hash"]),
+                    sha256_text(f"catalog-choice:{nonce}"),
+                )
+            ):
+                raise SecurityError("catalog choice signature scope changed")
+            if (
+                int(row["discord_guild_id"]) != guild_id
+                or int(row["discord_channel_id"]) != channel_id
+                or int(row["owner_user_id"]) != user_id
+            ):
+                raise SecurityError("catalog choice Discord scope changed")
+            allowed = json.loads(str(row["allowed_values_json"]))
+            if not isinstance(allowed, list) or value not in allowed:
+                raise SecurityError("catalog choice value was not offered")
+            if row["state"] == "consumed":
+                raise ConflictError("catalog choice intent was already consumed")
+            if row["state"] == "expired" or now >= int(row["expires_at"]):
+                connection.execute(
+                    "UPDATE catalog_choice_intents SET state = 'expired' WHERE id = ?",
+                    (intent_id,),
+                )
+                raise ConflictError("catalog choices expired; run the command again")
+            changed = connection.execute(
+                """
+                UPDATE catalog_choice_intents
+                SET state = 'consumed', consumed_interaction_id = ?, consumed_at = ?
+                WHERE id = ? AND state = 'open'
+                """,
+                (interaction_id, now, intent_id),
+            ).rowcount
+            if changed != 1:
+                raise ConflictError("catalog choice intent changed concurrently")
+            updated = connection.execute(
+                "SELECT * FROM catalog_choice_intents WHERE id = ?",
+                (intent_id,),
+            ).fetchone()
+            assert updated is not None
+            return _catalog_choice_intent(updated)
+
+    def get_catalog_choice_intent(
+        self,
+        intent_id: str,
+    ) -> CatalogChoiceIntentRecord:
+        row = self.store.query_one(
+            "SELECT * FROM catalog_choice_intents WHERE id = ?",
+            (intent_id,),
+        )
+        if row is None:
+            raise NotFoundError("catalog choice intent was not found")
+        return _catalog_choice_intent(row)
 
     def get_modal_intent(self, intent_id: str) -> ModalIntentRecord:
         row = self.store.query_one(
@@ -6773,6 +6922,24 @@ def _modal_intent(row: sqlite3.Row) -> ModalIntentRecord:
             if row["consumed_interaction_id"] is not None
             else None
         ),
+        expires_at=int(row["expires_at"]),
+    )
+
+
+def _catalog_choice_intent(row: sqlite3.Row) -> CatalogChoiceIntentRecord:
+    return CatalogChoiceIntentRecord(
+        id=str(row["id"]),
+        kind=str(row["kind"]),
+        project_id=str(row["project_id"]),
+        conversation_id=str(row["conversation_id"]),
+        discord_guild_id=int(row["discord_guild_id"]),
+        discord_channel_id=int(row["discord_channel_id"]),
+        owner_user_id=int(row["owner_user_id"]),
+        runtime_generation=int(row["runtime_generation"]),
+        catalog_hash=str(row["catalog_hash"]),
+        allowed_values_json=str(row["allowed_values_json"]),
+        state=str(row["state"]),
+        consumed_interaction_id=row["consumed_interaction_id"],
         expires_at=int(row["expires_at"]),
     )
 

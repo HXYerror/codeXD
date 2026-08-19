@@ -209,6 +209,23 @@ class ModalIntentRecord:
 
 
 @dataclass(frozen=True)
+class CatalogChoiceIntentRecord:
+    id: str
+    kind: str
+    project_id: str
+    conversation_id: str
+    discord_guild_id: int
+    discord_channel_id: int
+    owner_user_id: int
+    runtime_generation: int
+    catalog_hash: str
+    allowed_values_json: str
+    state: str
+    consumed_interaction_id: str | None
+    expires_at: int
+
+
+@dataclass(frozen=True)
 class ScheduleRecord:
     id: str
     conversation_id: str

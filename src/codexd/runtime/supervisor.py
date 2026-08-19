@@ -46,6 +46,8 @@ class RuntimeSlot:
     startup_task: asyncio.Task[object] | None = None
     last_used_at: float = 0
     capacity_reserved: bool = False
+    model_catalog: ModelCatalogSnapshot | None = None
+    catalog_refresh_task: asyncio.Task[ModelCatalogSnapshot] | None = None
 
 
 class RuntimeSupervisor:
@@ -157,6 +159,7 @@ class RuntimeSupervisor:
             lease: RuntimeLeaseRecord | None = None
             runtime: CodexRuntime | None = None
             manifest: CapabilityManifest | None = None
+            catalog: ModelCatalogSnapshot | None = None
             try:
                 await self._reserve_capacity(slot)
                 lease = await asyncio.to_thread(
@@ -173,7 +176,7 @@ class RuntimeSupervisor:
                 slot.lease = lease
 
                 async def initialize_runtime() -> None:
-                    nonlocal manifest, runtime
+                    nonlocal catalog, manifest, runtime
                     runtime = await self._factory(slot_config, lease.generation)
                     if runtime.generation != lease.generation:
                         raise AdapterInvariantError(
@@ -292,6 +295,8 @@ class RuntimeSupervisor:
                 else:
                     slot.runtime = None
                     slot.lease = None
+                    slot.model_catalog = None
+                    slot.catalog_refresh_task = None
                     self._release_capacity(slot)
                 secondary_errors = tuple(
                     error
@@ -323,6 +328,7 @@ class RuntimeSupervisor:
             slot.ready_since = time.monotonic()
             slot.last_watchdog_at = slot.ready_since
             slot.last_used_at = slot.ready_since
+            slot.model_catalog = catalog
             if self._closing:
                 await self._close_ready_slot(
                     slot,
@@ -439,6 +445,8 @@ class RuntimeSupervisor:
                 if close_error is None:
                     slot.runtime = None
                     slot.lease = None
+                    slot.model_catalog = None
+                    slot.catalog_refresh_task = None
                     self._release_capacity(slot)
                 else:
                     slot.runtime = runtime
@@ -635,6 +643,13 @@ class RuntimeSupervisor:
             "failures": slot.failures,
         }
 
+    async def assert_generation(self, project_id: str, generation: int) -> None:
+        status = await self.project_status(project_id)
+        if status["state"] != "ready" or int(status["generation"]) != generation:
+            raise InvariantError(
+                "Codex runtime changed; reopen the model or reasoning selector"
+            )
+
     async def account_status_if_loaded(
         self,
         project_id: str,
@@ -667,7 +682,38 @@ class RuntimeSupervisor:
                 or slot.lease.state != "ready"
             ):
                 return None
-            return await slot.runtime.list_models()
+            return slot.model_catalog
+
+    async def refresh_model_catalog(
+        self,
+        project: ProjectRecord,
+    ) -> tuple[ModelCatalogSnapshot, int]:
+        runtime, lease = await self.ensure(project)
+        key = project.id if self._topology == "project_scoped" else "shared"
+        slot = await self._slot(key)
+        async with slot.lock:
+            if slot.runtime is not runtime or slot.lease is None:
+                raise InvariantError("runtime changed before catalog refresh")
+            task = slot.catalog_refresh_task
+            if task is None or task.done():
+                task = asyncio.create_task(
+                    runtime.list_models(),
+                    name=f"codexd-model-catalog-{lease.generation}",
+                )
+                slot.catalog_refresh_task = task
+        catalog = await task
+        async with slot.lock:
+            if (
+                slot.runtime is not runtime
+                or slot.lease is None
+                or slot.lease.id != lease.id
+                or slot.lease.generation != lease.generation
+            ):
+                raise InvariantError("runtime changed during catalog refresh")
+            slot.model_catalog = catalog
+            if slot.catalog_refresh_task is task:
+                slot.catalog_refresh_task = None
+        return catalog, lease.generation
 
     async def _slot(self, key: str) -> RuntimeSlot:
         async with self._slots_lock:
@@ -744,6 +790,8 @@ class RuntimeSupervisor:
         slot.ready_since = None
         slot.last_watchdog_at = 0
         slot.last_used_at = 0
+        slot.model_catalog = None
+        slot.catalog_refresh_task = None
         self._release_capacity(slot)
 
     async def _watchdog_slot(self, slot: RuntimeSlot) -> None:
