@@ -15,6 +15,7 @@ from codexd.storage.repository import Repository
 RuntimeStatus = Callable[[], Awaitable[dict[str, int | str]]]
 EventMetrics = Callable[[], dict[str, float | int]]
 DiscordEgressMetrics = Callable[[], dict[str, float | int]]
+DiscordReconnectStatus = Callable[[], dict[str, Any]]
 
 
 @dataclass
@@ -32,6 +33,7 @@ class HealthReporter:
     runtime_sqlite_size_budget_bytes: int = 1024 * 1024 * 1024
     event_metrics: EventMetrics | None = None
     discord_egress_metrics: DiscordEgressMetrics | None = None
+    discord_reconnect_status: DiscordReconnectStatus | None = None
     critical_failure: Callable[[BaseException], None] | None = None
 
     def __post_init__(self) -> None:
@@ -53,7 +55,11 @@ class HealthReporter:
 
     def observe_discord(self, status: str) -> None:
         if status in {"ready", "degraded"}:
-            if self._discord_ready_observed and self.discord == "disconnected":
+            if self._discord_ready_observed and self.discord in {
+                "connecting",
+                "disconnected",
+                "reconnecting",
+            }:
                 self.discord_reconnect_count += 1
             self._discord_ready_observed = True
         self.discord = status
@@ -107,6 +113,11 @@ class HealthReporter:
             self.discord_egress_metrics()
             if self.discord_egress_metrics is not None
             else {}
+        )
+        discord_connection = (
+            self.discord_reconnect_status()
+            if self.discord_reconnect_status is not None
+            else {"connection_state": self.discord}
         )
         storage["write_latency"] = write_latency
         pressure_reasons: list[str] = []
@@ -167,6 +178,7 @@ class HealthReporter:
             "unknown_provider_events": counts["unknown_provider_events"],
             "event_pump": event_metrics,
             "discord_egress": discord_egress,
+            "discord_connection": discord_connection,
             "discord_reconnect_count": self.discord_reconnect_count,
             "inbound_reconciliation": inbound,
             "database_size_bytes": (

@@ -35,6 +35,65 @@ from codexd.service.manager import (
     render_windows_task,
 )
 from codexd.service.process import current_process_identity, process_matches
+from codexd.transport.discord.reconnect import (
+    DISCORD_RECONNECT_DELAYS_SECONDS,
+    DiscordReconnectBackoff,
+)
+
+
+def test_discord_reconnect_backoff_has_fixed_ten_tiers_and_resets() -> None:
+    wall = [1_000_000]
+    policy = DiscordReconnectBackoff(
+        monotonic=lambda: 1.0,
+        wall_clock_ms=lambda: wall[0],
+    )
+
+    observed = [
+        policy.next_delay(error_code=f"failure-{index}")
+        for index in range(12)
+    ]
+
+    assert DISCORD_RECONNECT_DELAYS_SECONDS == (
+        1.0,
+        10.0,
+        30.0,
+        30.0,
+        60.0,
+        60.0,
+        60.0,
+        120.0,
+        240.0,
+        300.0,
+    )
+    assert observed == [*DISCORD_RECONNECT_DELAYS_SECONDS, 300.0, 300.0]
+    assert policy.tier == 10
+    policy.reset("resumed")
+    assert policy.tier == 0
+    assert policy.consecutive_failures == 0
+    assert policy.next_delay(error_code="after-resume") == 1.0
+
+
+def test_discord_server_retry_after_can_exceed_local_cap() -> None:
+    policy = DiscordReconnectBackoff()
+
+    delay = policy.next_delay(
+        error_code="discord_http_429",
+        retry_after=420.0,
+    )
+
+    assert delay == 420.0
+    assert policy.server_retry_after_seconds == 420.0
+
+
+@pytest.mark.asyncio
+async def test_discord_reconnect_wait_is_cancelled_promptly() -> None:
+    policy = DiscordReconnectBackoff()
+    waiting = asyncio.create_task(policy.wait(300.0))
+    await asyncio.sleep(0)
+
+    policy.stop()
+
+    assert not await asyncio.wait_for(waiting, timeout=0.1)
 
 
 @pytest.mark.asyncio
@@ -58,14 +117,11 @@ async def test_initial_discord_connection_retries_without_stopping_daemon(
         login=login,
         connect=connect,
         transport_initialized=False,
+        reconnect_backoff=DiscordReconnectBackoff(),
     )
     health = SimpleNamespace(observe_discord=Mock())
     reset = AsyncMock()
-    monkeypatch.setattr(
-        daemon_module,
-        "_DISCORD_INITIAL_RETRY_DELAYS_SECONDS",
-        (0.0,),
-    )
+    bot.reconnect_backoff.wait = AsyncMock(return_value=True)
     monkeypatch.setattr(daemon_module, "_reset_discord_client", reset)
 
     await _start_discord_with_initial_retries(
@@ -102,6 +158,7 @@ async def test_initial_discord_login_timeout_is_retried(
         login=login,
         connect=connect,
         transport_initialized=False,
+        reconnect_backoff=DiscordReconnectBackoff(),
     )
     reset = AsyncMock()
     monkeypatch.setattr(
@@ -109,11 +166,7 @@ async def test_initial_discord_login_timeout_is_retried(
         "_DISCORD_INITIAL_LOGIN_TIMEOUT_SECONDS",
         0.01,
     )
-    monkeypatch.setattr(
-        daemon_module,
-        "_DISCORD_INITIAL_RETRY_DELAYS_SECONDS",
-        (0.0,),
-    )
+    bot.reconnect_backoff.wait = AsyncMock(return_value=True)
     monkeypatch.setattr(daemon_module, "_reset_discord_client", reset)
 
     await _start_discord_with_initial_retries(
@@ -136,6 +189,7 @@ async def test_initial_discord_connection_does_not_retry_fatal_login(
         login=AsyncMock(side_effect=discord.LoginFailure("invalid token")),
         connect=AsyncMock(),
         transport_initialized=False,
+        reconnect_backoff=DiscordReconnectBackoff(),
     )
     reset = AsyncMock()
     monkeypatch.setattr(daemon_module, "_reset_discord_client", reset)
@@ -161,6 +215,7 @@ async def test_initialized_discord_transport_is_not_blindly_rebuilt(
         login=AsyncMock(side_effect=error),
         connect=AsyncMock(),
         transport_initialized=True,
+        reconnect_backoff=DiscordReconnectBackoff(),
     )
     reset = AsyncMock()
     monkeypatch.setattr(daemon_module, "_reset_discord_client", reset)
@@ -190,6 +245,7 @@ async def test_initial_discord_retry_backoff_stops_promptly(
         login=AsyncMock(side_effect=aiohttp.ClientConnectionError("offline")),
         connect=AsyncMock(),
         transport_initialized=False,
+        reconnect_backoff=DiscordReconnectBackoff(),
     )
     monkeypatch.setattr(daemon_module, "_reset_discord_client", reset)
 

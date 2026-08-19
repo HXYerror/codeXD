@@ -57,6 +57,11 @@ async def test_health_reports_runtime_sqlite_capacity_and_write_latency(
             "discord_429_count": 0,
             "route_turn_progress_edit_count": 4,
         },
+        discord_reconnect_status=lambda: {
+            "connection_state": "reconnecting",
+            "tier": 6,
+            "selected_delay_seconds": 60.0,
+        },
     )
 
     await reporter.write()
@@ -70,6 +75,11 @@ async def test_health_reports_runtime_sqlite_capacity_and_write_latency(
         "discord_429_count": 0,
         "route_turn_progress_edit_count": 4,
     }
+    assert payload["discord_connection"] == {
+        "connection_state": "reconnecting",
+        "tier": 6,
+        "selected_delay_seconds": 60.0,
+    }
     storage = payload["storage"]
     assert storage["runtime_sqlite_homes"] == 1
     assert storage["runtime_sqlite_database_bytes"] == 17
@@ -80,3 +90,24 @@ async def test_health_reports_runtime_sqlite_capacity_and_write_latency(
     assert storage["write_latency"]["p95_ms"] >= 0
     assert storage["growth_bytes_per_minute"] == 0
     assert storage["event_rows_per_minute"] == 0
+
+
+def test_health_counts_success_after_reconnecting(
+    storage_context: StorageContext,
+) -> None:
+    async def runtime_status() -> dict[str, int | str]:
+        return {}
+
+    reporter = HealthReporter(
+        path=storage_context.root / "health-reconnect.json",
+        repository=storage_context.repository,
+        runtime_status=runtime_status,
+        boot_id="reconnect-health",
+        process_start_token="process",
+        started_at=utc_now_ms(),
+    )
+    reporter.observe_discord("ready")
+    reporter.observe_discord("reconnecting")
+    reporter.observe_discord("ready")
+
+    assert reporter.discord_reconnect_count == 1

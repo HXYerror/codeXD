@@ -43,7 +43,6 @@ from codexd.storage.schedules import ScheduleRepository
 from codexd.storage.sqlite import SQLiteStore
 from codexd.transport.discord.bot import CodexDBot
 
-_DISCORD_INITIAL_RETRY_DELAYS_SECONDS = (1.0, 2.0, 5.0, 10.0, 30.0)
 _DISCORD_INITIAL_LOGIN_TIMEOUT_SECONDS = 30.0
 
 
@@ -313,6 +312,7 @@ async def _run_daemon(config: AppConfig, bootstrap_token: str | None) -> int:
             ),
             event_metrics=turns.event_metrics,
             discord_egress_metrics=lambda: bot.egress_metrics(),
+            discord_reconnect_status=lambda: bot.reconnect_status(),
             critical_failure=critical_failure,
         )
         retention = RetentionWorker(
@@ -494,7 +494,7 @@ async def _start_discord_with_initial_retries(
     health: HealthReporter,
     logger: logging.Logger,
 ) -> None:
-    attempt = 0
+    backoff = bot.reconnect_backoff
     while not stop.is_set():
         try:
             await asyncio.wait_for(
@@ -513,29 +513,54 @@ async def _start_discord_with_initial_retries(
         ) as exc:
             if bot.transport_initialized or not _retryable_discord_start_error(exc):
                 raise
-            delay = _DISCORD_INITIAL_RETRY_DELAYS_SECONDS[
-                min(attempt, len(_DISCORD_INITIAL_RETRY_DELAYS_SECONDS) - 1)
-            ]
-            attempt += 1
+            retry_after = (
+                float(getattr(exc, "retry_after", 0.0) or 0.0)
+                if isinstance(exc, discord.HTTPException) and exc.status == 429
+                else None
+            )
+            delay = backoff.next_delay(
+                error_code=_discord_connection_error_code(exc),
+                retry_after=retry_after,
+            )
             health.observe_discord("connecting")
             logger.warning(
                 "Discord initial connection failed; retrying",
                 extra={
                     "stable_code": "discord_initial_connection_retry",
-                    "attempt": attempt,
+                    "attempt": backoff.consecutive_failures,
+                    "tier": backoff.tier,
                     "retry_delay_seconds": delay,
                     "exception_type": type(exc).__name__,
                 },
             )
             await _reset_discord_client(bot)
-            try:
-                await asyncio.wait_for(stop.wait(), timeout=delay)
-            except TimeoutError:
+            waiter = asyncio.create_task(backoff.wait(delay))
+            stopper = asyncio.create_task(stop.wait())
+            done, pending = await asyncio.wait(
+                {waiter, stopper},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            if stopper in done and stopper.result():
+                backoff.stop()
+                break
+            if waiter in done and waiter.result():
                 continue
+            break
         else:
             break
     if not stop.is_set():
         await bot.connect(reconnect=True)
+
+
+def _discord_connection_error_code(exc: BaseException) -> str:
+    if isinstance(exc, discord.HTTPException):
+        return f"discord_http_{exc.status}"
+    if isinstance(exc, discord.ConnectionClosed):
+        return f"discord_gateway_close_{exc.code}"
+    return f"discord_{type(exc).__name__.casefold()}"
 
 
 def _retryable_discord_start_error(exc: BaseException) -> bool:
