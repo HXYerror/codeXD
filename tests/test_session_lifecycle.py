@@ -13,6 +13,7 @@ from codexd.application.conversation_locks import ConversationLocks
 from codexd.application.session_lifecycle import SessionLifecycleCoordinator
 from codexd.domain.conversations import (
     ConversationState,
+    SafetyFenceReason,
     SandboxProfile,
     ThreadConfig,
     ThreadIdentity,
@@ -56,6 +57,42 @@ def test_revision_listing_does_not_hide_older_sessions(
     )
 
     assert len(revisions) == 105
+
+
+def test_safety_fence_is_allowlisted_atomic_and_actionable(
+    storage_context: StorageContext,
+) -> None:
+    repository = storage_context.repository
+    repository.fence_conversation(
+        storage_context.conversation.id,
+        reason=SafetyFenceReason.PROVIDER_ROLLOUT_MISSING_OR_CORRUPT,
+        summary="Provider rollout is missing",
+        details={"recovery": "session_new"},
+    )
+
+    conversation = repository.get_conversation(storage_context.conversation.id)
+    incident = storage_context.store.query_one(
+        "SELECT code, details_json FROM incidents WHERE conversation_id = ?",
+        (conversation.id,),
+    )
+    audit = storage_context.store.query_one(
+        "SELECT payload_json FROM audit_log WHERE conversation_id = ? AND action = ?",
+        (conversation.id, "conversation.blocked"),
+    )
+    assert conversation.state is ConversationState.BLOCKED
+    assert (
+        conversation.recovery_reason
+        == SafetyFenceReason.PROVIDER_ROLLOUT_MISSING_OR_CORRUPT.value
+    )
+    assert incident is not None and incident["code"] == conversation.recovery_reason
+    assert json.loads(str(incident["details_json"])) == {"recovery": "session_new"}
+    assert audit is not None
+    with pytest.raises(InvariantError, match="allowlisted"):
+        repository.fence_conversation(  # type: ignore[arg-type]
+            conversation.id,
+            reason="runtime_unavailable",
+            summary="must be rejected",
+        )
 
 
 def test_conversation_and_active_revision_are_read_as_one_snapshot(
@@ -1128,9 +1165,9 @@ async def test_new_outcome_unknown_blocks_replay(
         assert conversation.state is ConversationState.BLOCKED
         assert conversation.provider_barrier_kind == "unknown_effect"
 
-        with pytest.raises((ConflictError, InvariantError)):
+        with pytest.raises(ProviderOutcomeUnknown):
             await lifecycle.new(storage_context.conversation.id)
-        assert fake.start_calls == 1
+        assert fake.start_calls == 2
     finally:
         await lifecycle.close()
         await supervisor.close()
@@ -1195,7 +1232,7 @@ async def test_existing_thread_mutation_outcome_unknown_blocks_replay(
         assert conversation.state is ConversationState.BLOCKED
         assert conversation.provider_barrier_kind == "unknown_effect"
 
-        with pytest.raises((ConflictError, InvariantError)):
+        with pytest.raises((ConflictError, InvariantError, ProviderOutcomeUnknown)):
             if operation == "fork":
                 await lifecycle.fork(storage_context.conversation.id)
             elif operation == "unarchive":
@@ -1205,7 +1242,7 @@ async def test_existing_thread_mutation_outcome_unknown_blocks_replay(
                 )
             else:
                 await lifecycle.archive(storage_context.conversation.id)
-        assert calls == 1
+        assert calls == (2 if operation == "unarchive" else 1)
     finally:
         await lifecycle.close()
         await supervisor.close()

@@ -40,6 +40,9 @@ class ConversationRecord:
     service_tier_override: str | None
     web_search_mode: str
     provider_barrier_kind: str | None
+    recovery_reason: str | None
+    provider_recovery_state: str | None
+    provider_recovery_since: int | None
 
 
 @dataclass(frozen=True)
@@ -59,6 +62,11 @@ class ThreadRevisionRecord:
     created_at: int
     activated_at: int | None
     archived_at: int | None
+    degraded_failure_code: str | None
+    degraded_fingerprint: str | None
+    consecutive_failure_count: int
+    first_failed_at: int | None
+    last_failed_at: int | None
 
 
 @dataclass(frozen=True)
@@ -116,6 +124,11 @@ class TurnRecord:
     terminal_code: str | None
     error_code: str | None
     error_message_redacted: str | None
+    provider_error_code: str | None
+    provider_error_underlying_code: str | None
+    provider_retry_count: int
+    provider_retry_limit: int | None
+    provider_http_status: int | None
     usage_scope: str | None
 
 

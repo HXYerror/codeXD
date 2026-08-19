@@ -3190,7 +3190,7 @@ async def test_malformed_outbox_payload_dead_letters_and_notifies_parent(
         FROM discord_outbox
         WHERE dedupe_key = ?
         """,
-        (f"conversation:{turn.conversation_id}:delivery-blocked",),
+            (f"conversation:{turn.conversation_id}:delivery-unavailable",),
     )
     assert notice is not None
     assert notice["destination_key"] == "channel:200"

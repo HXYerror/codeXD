@@ -14,6 +14,7 @@ from typing import Any, cast
 
 from codexd.domain.conversations import (
     ConversationState,
+    SafetyFenceReason,
     SandboxProfile,
     ThreadConfig,
     ThreadIdentity,
@@ -1766,6 +1767,8 @@ class Repository:
         conversation_id: str,
         *,
         reject_active_schedules: bool = False,
+        allow_safety_fence: bool = False,
+        allow_provider_barrier: bool = False,
     ) -> None:
         with self.store.transaction() as connection:
             conversation = connection.execute(
@@ -1780,8 +1783,13 @@ class Repository:
                 raise NotFoundError(f"conversation not found: {conversation_id}")
             if conversation["state"] == "deleted":
                 raise ConflictError("Conversation is deleted")
-            if conversation["provider_barrier_kind"] is not None:
+            if (
+                conversation["provider_barrier_kind"] is not None
+                and not allow_provider_barrier
+            ):
                 raise ConflictError("Conversation has an active provider barrier")
+            if conversation["state"] == "blocked" and not allow_safety_fence:
+                raise ConflictError("Conversation requires safety recovery")
             _assert_conversation_mutable(
                 connection,
                 conversation_id,
@@ -2254,8 +2262,10 @@ class Repository:
             identity.requested_thread_id is not None
             and identity.thread_id != identity.requested_thread_id
         ):
-            self.block_conversation(
-                conversation_id, reason="provider_thread_identity_mismatch"
+            self.fence_conversation(
+                conversation_id,
+                reason=SafetyFenceReason.PROVIDER_THREAD_IDENTITY_MISMATCH,
+                summary="Provider resumed a different Thread identity",
             )
             raise InvariantError("provider resumed a different thread identity")
         now = utc_now_ms()
@@ -2328,10 +2338,21 @@ class Repository:
                         revision_id,
                     ),
                 )
+            recovery_columns = (
+                "recovery_reason = NULL, provider_recovery_state = NULL, "
+                "provider_recovery_since = NULL, "
+                if _table_has_column(
+                    connection,
+                    table="conversations",
+                    column="recovery_reason",
+                )
+                else ""
+            )
             connection.execute(
-                """
+                f"""
                 UPDATE conversations
                 SET active_revision_id = ?, state = 'active',
+                    {recovery_columns}
                     model_override = CASE WHEN ? THEN ? ELSE model_override END,
                     personality_override = CASE WHEN ? THEN ? ELSE personality_override END,
                     service_tier_override = CASE WHEN ? THEN ? ELSE service_tier_override END,
@@ -2779,7 +2800,13 @@ class Repository:
             ).fetchone()
             if conversation is None:
                 raise NotFoundError(f"conversation not found: {conversation_id}")
-            if conversation["state"] in {"archived", "blocked", "deleted"}:
+            if conversation["state"] == "blocked":
+                reason = conversation["recovery_reason"] or "unknown"
+                raise ConflictError(
+                    "Safety recovery required: "
+                    f"{reason}. Run `/session new` or `/session resume`."
+                )
+            if conversation["state"] in {"archived", "deleted"}:
                 raise ConflictError(f"conversation is {conversation['state']}")
 
             id_column = "input_message_id" if source is TurnSource.DISCORD else "schedule_fire_id"
@@ -3391,7 +3418,6 @@ class Repository:
         *,
         code: str,
         message: str,
-        block_conversation: bool = False,
     ) -> None:
         now = utc_now_ms()
         result_json = canonical_json({"code": code, "message": message})
@@ -3460,30 +3486,6 @@ class Repository:
                         },
                         now=now,
                     )
-            if block_conversation:
-                connection.execute(
-                    """
-                    UPDATE conversations
-                    SET state = 'blocked',
-                        provider_barrier_kind = 'unknown_effect',
-                        updated_at = ?
-                    WHERE id = ? AND state <> 'deleted'
-                    """,
-                    (now, conversation_id),
-                )
-                self._insert_audit(
-                    connection,
-                    actor_kind="system",
-                    actor_id=None,
-                    action="conversation.blocked",
-                    project_id=row["project_id"],
-                    conversation_id=conversation_id,
-                    turn_id=None,
-                    schedule_id=None,
-                    payload={"reason": code},
-                    now=now,
-                )
-
     def provider_barrier_conversation_ids(self) -> tuple[str, ...]:
         return tuple(
             str(row["id"])
@@ -3544,7 +3546,9 @@ class Repository:
             connection.execute(
                 """
                 UPDATE conversations
-                SET provider_barrier_kind = NULL,
+                SET state = CASE WHEN state = 'blocked' THEN 'active' ELSE state END,
+                    recovery_reason = NULL,
+                    provider_barrier_kind = NULL,
                     provider_barrier_intent_id = NULL,
                     provider_barrier_since = NULL,
                     updated_at = ?
@@ -3584,16 +3588,33 @@ class Repository:
                 ),
             )
 
-    def block_conversation(self, conversation_id: str, *, reason: str) -> None:
+    def fence_conversation(
+        self,
+        conversation_id: str,
+        *,
+        reason: SafetyFenceReason,
+        summary: str,
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
+        if not isinstance(reason, SafetyFenceReason):
+            raise InvariantError("safety fence reason is not allowlisted")
         now = utc_now_ms()
         with self.store.transaction() as connection:
+            conversation = connection.execute(
+                "SELECT project_id FROM conversations WHERE id = ?",
+                (conversation_id,),
+            ).fetchone()
+            if conversation is None:
+                raise NotFoundError(f"conversation not found: {conversation_id}")
             changed = connection.execute(
                 """
                 UPDATE conversations
-                SET state = 'blocked', updated_at = ?
+                SET state = 'blocked', recovery_reason = ?,
+                    provider_recovery_state = NULL,
+                    provider_recovery_since = NULL, updated_at = ?
                 WHERE id = ? AND state <> 'deleted'
                 """,
-                (now, conversation_id),
+                (reason.value, now, conversation_id),
             ).rowcount
             if changed != 1:
                 raise NotFoundError(f"conversation not found or deleted: {conversation_id}")
@@ -3603,8 +3624,150 @@ class Repository:
                     id, actor_kind, action, conversation_id, payload_json, occurred_at
                 ) VALUES (?, 'system', 'conversation.blocked', ?, ?, ?)
                 """,
-                (new_id(), conversation_id, canonical_json({"reason": reason}), now),
+                (
+                    new_id(),
+                    conversation_id,
+                    canonical_json({"reason": reason.value}),
+                    now,
+                ),
             )
+            _upsert_incident(
+                connection,
+                severity="critical",
+                code=reason.value,
+                summary=summary,
+                now=now,
+                project_id=str(conversation["project_id"]),
+                conversation_id=conversation_id,
+                details=details,
+            )
+
+    def prepare_explicit_session_recovery(
+        self,
+        conversation_id: str,
+        *,
+        action: str,
+    ) -> None:
+        if action not in {"session_new", "session_resume"}:
+            raise InvariantError("invalid explicit session recovery action")
+        now = utc_now_ms()
+        with self.store.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM conversations WHERE id = ?",
+                (conversation_id,),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"conversation not found: {conversation_id}")
+            if row["state"] != "blocked":
+                return
+            if row["recovery_reason"] is None:
+                raise ConflictError("blocked Conversation has no safety recovery reason")
+            interaction_id = row["provider_barrier_intent_id"]
+            if interaction_id is not None:
+                intent = connection.execute(
+                    "SELECT * FROM command_intents WHERE interaction_id = ?",
+                    (interaction_id,),
+                ).fetchone()
+                if intent is not None and intent["state"] in {
+                    "effect_in_flight",
+                    "reconciling",
+                }:
+                    connection.execute(
+                        """
+                        UPDATE command_intents
+                        SET state = 'unknown', result_json = ?,
+                            completed_at = ?, updated_at = ?
+                        WHERE interaction_id = ?
+                          AND state IN ('effect_in_flight', 'reconciling')
+                        """,
+                        (
+                            canonical_json(
+                                {
+                                    "code": "superseded_by_explicit_recovery",
+                                    "message": (
+                                        "The owner explicitly selected a safe Session "
+                                        "recovery action."
+                                    ),
+                                }
+                            ),
+                            now,
+                            now,
+                            interaction_id,
+                        ),
+                    )
+            connection.execute(
+                """
+                UPDATE conversations
+                SET provider_barrier_kind = NULL,
+                    provider_barrier_intent_id = NULL,
+                    provider_barrier_since = NULL,
+                    updated_at = ?
+                WHERE id = ? AND state = 'blocked'
+                """,
+                (now, conversation_id),
+            )
+            if action == "session_new":
+                connection.execute(
+                    """
+                    UPDATE conversations
+                    SET active_revision_id = NULL, state = 'uninitialized',
+                        recovery_reason = NULL, updated_at = ?
+                    WHERE id = ? AND state = 'blocked'
+                    """,
+                    (now, conversation_id),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE conversations
+                    SET state = 'active', recovery_reason = NULL, updated_at = ?
+                    WHERE id = ? AND state = 'blocked'
+                    """,
+                    (now, conversation_id),
+                )
+            self._insert_audit(
+                connection,
+                actor_kind="system",
+                actor_id=None,
+                action="conversation.explicit_safety_recovery",
+                project_id=str(row["project_id"]),
+                conversation_id=conversation_id,
+                turn_id=None,
+                schedule_id=None,
+                correlation_id=None,
+                payload={"action": action, "reason": row["recovery_reason"]},
+                now=now,
+            )
+
+    def begin_provider_thread_recovery(self, conversation_id: str) -> None:
+        now = utc_now_ms()
+        with self.store.transaction() as connection:
+            changed = connection.execute(
+                """
+                UPDATE conversations
+                SET provider_recovery_state = 'thread_reconciling',
+                    provider_recovery_since = COALESCE(provider_recovery_since, ?),
+                    updated_at = ?
+                WHERE id = ? AND state IN ('uninitialized', 'active')
+                """,
+                (now, now, conversation_id),
+            ).rowcount
+            if changed != 1:
+                raise ConflictError("Conversation cannot begin provider recovery")
+
+    def end_provider_thread_recovery(self, conversation_id: str) -> None:
+        with self.store.transaction() as connection:
+            changed = connection.execute(
+                """
+                UPDATE conversations
+                SET provider_recovery_state = NULL,
+                    provider_recovery_since = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (utc_now_ms(), conversation_id),
+            ).rowcount
+            if changed != 1:
+                raise NotFoundError(f"conversation not found: {conversation_id}")
 
     def record_incident(
         self,
@@ -5056,37 +5219,6 @@ class Repository:
                     now=now,
                 )
                 return
-            if conversation_id is not None:
-                connection.execute(
-                    """
-                    UPDATE conversations
-                    SET state = 'blocked', updated_at = ?
-                    WHERE id = ? AND state IN ('uninitialized', 'active')
-                    """,
-                    (now, conversation_id),
-                )
-                connection.execute(
-                    """
-                    INSERT INTO audit_log(
-                        id, actor_kind, action, project_id, conversation_id,
-                        turn_id, payload_json, occurred_at
-                    ) VALUES (?, 'system', 'conversation.blocked', ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        new_id(),
-                        project_id,
-                        conversation_id,
-                        scoped_turn_id,
-                        canonical_json(
-                            {
-                                "reason": "permanent_discord_delivery_failure",
-                                "error_code": error_code,
-                                "outbox_id": outbox_id,
-                            }
-                        ),
-                        now,
-                    ),
-                )
             if schedule_id is not None:
                 connection.execute(
                     """
@@ -5119,7 +5251,7 @@ class Repository:
                 and scope is not None
                 and str(outbox["destination_key"]).startswith("thread:")
             ):
-                notice_key = f"conversation:{conversation_id}:delivery-blocked"
+                notice_key = f"conversation:{conversation_id}:delivery-unavailable"
                 connection.execute(
                     """
                     INSERT OR IGNORE INTO discord_outbox(
@@ -5135,11 +5267,11 @@ class Repository:
                             {
                                 "kind": "notice",
                                 "level": "error",
-                                "title": "Conversation delivery blocked",
+                                "title": "Conversation delivery unavailable",
                                 "content": (
                                     "codexD could not deliver updates to a Conversation "
-                                    f"thread (`{error_code}`). The Conversation was blocked; "
-                                    "run `/diag status` before retrying."
+                                    f"thread (`{error_code}`). Provider work remains usable; "
+                                    "restore Discord access before retrying delivery."
                                 ),
                             }
                         ),
@@ -5164,7 +5296,7 @@ class Repository:
                     conversation_id,
                     scoped_turn_id,
                     schedule_id,
-                    "Discord delivery failed permanently; durable work was blocked",
+                    "Discord delivery failed permanently; durable provider work remains usable",
                     canonical_json(
                         {"error_code": error_code, "outbox_id": outbox_id}
                     ),
@@ -6658,10 +6790,29 @@ def _conversation(row: sqlite3.Row) -> ConversationRecord:
         service_tier_override=row["service_tier_override"],
         web_search_mode=str(row["web_search_mode"]),
         provider_barrier_kind=row["provider_barrier_kind"],
+        recovery_reason=(
+            str(row["recovery_reason"])
+            if "recovery_reason" in tuple(row.keys())
+            and row["recovery_reason"] is not None
+            else None
+        ),
+        provider_recovery_state=(
+            str(row["provider_recovery_state"])
+            if "provider_recovery_state" in tuple(row.keys())
+            and row["provider_recovery_state"] is not None
+            else None
+        ),
+        provider_recovery_since=(
+            int(row["provider_recovery_since"])
+            if "provider_recovery_since" in tuple(row.keys())
+            and row["provider_recovery_since"] is not None
+            else None
+        ),
     )
 
 
 def _revision(row: sqlite3.Row) -> ThreadRevisionRecord:
+    keys = tuple(row.keys())
     return ThreadRevisionRecord(
         id=str(row["id"]),
         conversation_id=str(row["conversation_id"]),
@@ -6680,6 +6831,29 @@ def _revision(row: sqlite3.Row) -> ThreadRevisionRecord:
             int(row["activated_at"]) if row["activated_at"] is not None else None
         ),
         archived_at=int(row["archived_at"]) if row["archived_at"] is not None else None,
+        degraded_failure_code=(
+            row["degraded_failure_code"]
+            if "degraded_failure_code" in keys
+            else None
+        ),
+        degraded_fingerprint=(
+            row["degraded_fingerprint"] if "degraded_fingerprint" in keys else None
+        ),
+        consecutive_failure_count=(
+            int(row["consecutive_failure_count"])
+            if "consecutive_failure_count" in keys
+            else 0
+        ),
+        first_failed_at=(
+            int(row["first_failed_at"])
+            if "first_failed_at" in keys and row["first_failed_at"] is not None
+            else None
+        ),
+        last_failed_at=(
+            int(row["last_failed_at"])
+            if "last_failed_at" in keys and row["last_failed_at"] is not None
+            else None
+        ),
     )
 
 
@@ -6746,6 +6920,33 @@ def _turn(row: sqlite3.Row) -> TurnRecord:
         terminal_code=row["terminal_code"],
         error_code=row["error_code"],
         error_message_redacted=row["error_message_redacted"],
+        provider_error_code=(
+            row["provider_error_code"]
+            if "provider_error_code" in tuple(row.keys())
+            else None
+        ),
+        provider_error_underlying_code=(
+            row["provider_error_underlying_code"]
+            if "provider_error_underlying_code" in tuple(row.keys())
+            else None
+        ),
+        provider_retry_count=(
+            int(row["provider_retry_count"])
+            if "provider_retry_count" in tuple(row.keys())
+            else 0
+        ),
+        provider_retry_limit=(
+            int(row["provider_retry_limit"])
+            if "provider_retry_limit" in tuple(row.keys())
+            and row["provider_retry_limit"] is not None
+            else None
+        ),
+        provider_http_status=(
+            int(row["provider_http_status"])
+            if "provider_http_status" in tuple(row.keys())
+            and row["provider_http_status"] is not None
+            else None
+        ),
         usage_scope=row["usage_scope"],
     )
 

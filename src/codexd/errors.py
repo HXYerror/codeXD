@@ -27,6 +27,10 @@ class ConflictError(CodexDError):
     code = "conflict"
 
 
+class ProviderThreadRecoveryRequired(ConflictError):
+    code = "provider_thread_recovery_required"
+
+
 class AttachmentIntegrityError(ConflictError, InvariantError):
     """A durable attachment no longer matches its validated snapshot."""
 

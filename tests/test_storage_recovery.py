@@ -1467,7 +1467,7 @@ def test_channel_binding_migration_preserves_legacy_conversation_identity(
             )
 
         monkeypatch.setattr(sqlite_module, "_load_migrations", lambda: migrations)
-        assert store.migrate() == 23
+        assert store.migrate() == 24
         assert store.foreign_key_check() == ()
         repository = Repository(store)
         project = repository.get_project("legacy-project")
@@ -1598,7 +1598,7 @@ def test_terminal_progress_cleanup_migration_preserves_rollout_boundary(
         )
 
         monkeypatch.setattr(sqlite_module, "_load_migrations", lambda: migrations)
-        assert store.migrate() == 23
+        assert store.migrate() == 24
         active_row = store.query_one(
             """
             SELECT discord_message_id, cleanup_state, deleted_at
@@ -1772,7 +1772,7 @@ def test_component_scope_migrations_expire_and_guard_legacy_pending_drafts(
             )
 
         monkeypatch.setattr(sqlite_module, "_load_migrations", lambda: migrations)
-        assert store.migrate() == 23
+        assert store.migrate() == 24
         row = store.query_one(
             """
             SELECT state, discord_guild_id, discord_channel_id
@@ -1896,7 +1896,7 @@ def test_turn_enqueue_sequence_migration_backfills_existing_turns(
                 )
 
         monkeypatch.setattr(sqlite_module, "_load_migrations", lambda: migrations)
-        assert store.migrate() == 23
+        assert store.migrate() == 24
         repository = Repository(store)
         third = repository.enqueue_turn(
             conversation_id="upgrade-conversation",
@@ -2003,7 +2003,7 @@ def test_schedule_fire_turn_fk_upgrade_preserves_pairs(
             )
 
         monkeypatch.setattr(sqlite_module, "_load_migrations", lambda: migrations)
-        assert store.migrate() == 23
+        assert store.migrate() == 24
         assert store.foreign_key_check() == ()
         fire_fks = store.query_all("PRAGMA foreign_key_list(schedule_fires)")
         assert any(
@@ -3546,7 +3546,7 @@ def test_terminal_progress_reconciles_running_send_before_terminal_revision(
     assert sent is None
 
 
-def test_permanent_discord_failure_blocks_conversation_and_records_incident(
+def test_permanent_discord_failure_keeps_conversation_usable_and_records_incident(
     storage_context: StorageContext,
 ) -> None:
     repository = storage_context.repository
@@ -3566,7 +3566,7 @@ def test_permanent_discord_failure_blocks_conversation_and_records_incident(
         error_code="discord_forbidden",
     )
 
-    assert repository.get_conversation(turn.conversation_id).state.value == "blocked"
+    assert repository.get_conversation(turn.conversation_id).state.value == "uninitialized"
     incident = storage_context.store.query_one(
         "SELECT code, turn_id FROM incidents WHERE conversation_id = ?",
         (turn.conversation_id,),
@@ -3578,7 +3578,7 @@ def test_permanent_discord_failure_blocks_conversation_and_records_incident(
     )
     notice = storage_context.store.query_one(
         "SELECT destination_key FROM discord_outbox WHERE dedupe_key = ?",
-        (f"conversation:{turn.conversation_id}:delivery-blocked",),
+        (f"conversation:{turn.conversation_id}:delivery-unavailable",),
     )
     assert notice is not None
     assert notice["destination_key"] == "channel:200"
