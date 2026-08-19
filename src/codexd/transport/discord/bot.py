@@ -1533,6 +1533,9 @@ class CodexDBot(discord.Client):
             return
         data = cast(Mapping[str, object], interaction.data or {})
         custom_id = str(data.get("custom_id", ""))
+        if custom_id.startswith("cc:v1:"):
+            await self._handle_catalog_choice_component(interaction, custom_id)
+            return
         if custom_id == TABLE_COPY_CUSTOM_ID:
             try:
                 await self._handle_table_copy_component(interaction)
@@ -1600,6 +1603,97 @@ class CodexDBot(discord.Client):
                     "`internal_error`: task-card update failed.",
                     ephemeral=True,
                 )
+
+    async def _handle_catalog_choice_component(
+        self,
+        interaction: discord.Interaction[Any],
+        custom_id: str,
+    ) -> None:
+        try:
+            action = self.signer.verify_catalog_choice_id(custom_id)
+            value = _component_selected_value(interaction.data)
+            await self._run_intent_action(
+                interaction,
+                command_name=f"{action.kind} select",
+                request={
+                    "choice_intent_id": action.intent_id,
+                    "kind": action.kind,
+                    "value": value,
+                    "runtime_generation": action.runtime_generation,
+                },
+                action=lambda staged: self._apply_catalog_choice(
+                    staged,
+                    intent_id=action.intent_id,
+                    kind=action.kind,
+                    value=value,
+                    runtime_generation=action.runtime_generation,
+                    nonce=action.nonce,
+                ),
+            )
+        except asyncio.CancelledError:
+            raise
+        except (CodexDError, ValueError) as exc:
+            await self._send_component_error(
+                interaction,
+                message=f"`{getattr(exc, 'code', 'invalid_input')}`: {exc}",
+                title="Catalog selection rejected",
+            )
+
+    async def _apply_catalog_choice(
+        self,
+        interaction: discord.Interaction[Any],
+        *,
+        intent_id: str,
+        kind: str,
+        value: str,
+        runtime_generation: int,
+        nonce: str,
+    ) -> None:
+        await self._defer_owner(interaction)
+        if interaction.guild_id is None or interaction.channel_id is None:
+            raise SecurityError("catalog choice has no Discord scope")
+        intent = await asyncio.to_thread(
+            self.repository.get_catalog_choice_intent,
+            intent_id,
+        )
+        conversation = await self._conversation(interaction)
+        if conversation.id != intent.conversation_id:
+            raise SecurityError("catalog choice belongs to another Conversation")
+        await self.session_lifecycle.validate_catalog_choice(
+            conversation.id,
+            kind=kind,
+            generation=runtime_generation,
+            expected_hash=intent.catalog_hash,
+        )
+        await asyncio.to_thread(
+            self.repository.consume_catalog_choice_intent,
+            intent_id=intent_id,
+            kind=kind,
+            value=value,
+            runtime_generation=runtime_generation,
+            nonce=nonce,
+            interaction_id=str(interaction.id),
+            guild_id=interaction.guild_id,
+            channel_id=interaction.channel_id,
+            user_id=interaction.user.id,
+        )
+        selected = None if value == "default" else value
+        if kind == "model":
+            await self.session_lifecycle.set_model(
+                conversation.id,
+                selected,
+                interaction_id=str(interaction.id),
+            )
+        else:
+            await self.session_lifecycle.set_reasoning_effort(
+                conversation.id,
+                selected,
+                interaction_id=str(interaction.id),
+            )
+        await interaction.followup.send(
+            f"{kind.title()} override: `{selected or 'default'}`.",
+            ephemeral=True,
+        )
 
     @staticmethod
     async def _send_component_error(
@@ -1880,9 +1974,10 @@ class CodexDBot(discord.Client):
         model.command(name="show", description="Show current model")(
             intent("model show", self._model_show)
         )
-        model.command(name="set", description="Set model for future Turns")(
-            intent("model set", self._model_set)
-        )
+        model_set: app_commands.Command[Any, ..., Any] = model.command(
+            name="set", description="Set model for future Turns"
+        )(intent("model set", self._model_set))
+        model_set.autocomplete("model")(self._model_autocomplete)
         if self._optional_available("turn.service_tier"):
             model_tier = app_commands.Group(
                 name="tier",
@@ -1904,9 +1999,10 @@ class CodexDBot(discord.Client):
         reasoning.command(name="show", description="Show reasoning effort")(
             intent("reasoning show", self._reasoning_show)
         )
-        reasoning.command(name="set", description="Set reasoning effort")(
-            intent("reasoning set", self._reasoning_set)
-        )
+        reasoning_set: app_commands.Command[Any, ..., Any] = reasoning.command(
+            name="set", description="Set reasoning effort"
+        )(intent("reasoning set", self._reasoning_set))
+        reasoning_set.autocomplete("effort")(self._reasoning_autocomplete)
         if self._optional_available("turn.reasoning_summary"):
             reasoning_summary = app_commands.Group(
                 name="summary",
@@ -2828,6 +2924,12 @@ class CodexDBot(discord.Client):
             "\n".join(
                 (
                     f"Effective model: `{selected.model}` (`{selected.id}`)",
+                    f"Display: **{_safe_embed_text(selected.display_name or selected.model)}**",
+                    (
+                        f"Description: {_safe_embed_text(selected.description)}"
+                        if selected.description
+                        else "Description: `not provided`"
+                    ),
                     "Source: "
                     f"`{_model_source(conversation.model_override)}`",
                     f"Catalog: `{'complete' if catalog.complete else 'incomplete'}` · "
@@ -2851,19 +2953,28 @@ class CodexDBot(discord.Client):
         conversation = await self._conversation(interaction)
         catalog = await self.session_lifecycle.model_catalog(conversation.id)
         text = "\n".join(
+            f"**{_safe_embed_text(model.display_name or model.model)}** · "
             f"`{model.model}`{' **default**' if model.is_default else ''} · "
             f"input {', '.join(model.input_modalities)} · "
             f"reasoning {', '.join(model.supported_reasoning_efforts) or 'provider default'}"
+            f"{' · ' + _safe_embed_text(model.description) if model.description else ''}"
             for model in catalog.models
         ) or "Codex returned an empty model catalog."
         suffix = "" if catalog.complete else "\n-# Catalog is incomplete."
         await interaction.followup.send(text + suffix, ephemeral=True)
 
     async def _model_set(
-        self, interaction: discord.Interaction[Any], model: str
+        self, interaction: discord.Interaction[Any], model: str | None = None
     ) -> None:
         await self._defer_owner(interaction)
         conversation = await self._conversation(interaction)
+        if model is None:
+            await self._send_catalog_selector(
+                interaction,
+                conversation=conversation,
+                kind="model",
+            )
+            return
         value = None if model == "default" else model
         await self.session_lifecycle.set_model(
             conversation.id,
@@ -2871,6 +2982,49 @@ class CodexDBot(discord.Client):
             interaction_id=str(interaction.id),
         )
         await interaction.followup.send(f"Model override: `{value or 'default'}`", ephemeral=True)
+
+    async def _model_autocomplete(
+        self,
+        interaction: discord.Interaction[Any],
+        current: str,
+    ) -> list[app_commands.Choice[str]]:
+        if (
+            not self._authorized_interaction(interaction)
+            or interaction.user.id != self.config.discord.owner_user_id
+        ):
+            return []
+        try:
+            conversation = await self._conversation(interaction)
+            catalog = await asyncio.wait_for(
+                self.session_lifecycle.model_catalog_if_loaded(conversation.id),
+                timeout=0.4,
+            )
+        except (CodexDError, TimeoutError):
+            return []
+        if catalog is None or not catalog.complete:
+            return []
+        query = current.casefold().strip()
+        candidates = [
+            app_commands.Choice(
+                name=_model_choice_label(model),
+                value=model.model,
+            )
+            for model in catalog.models
+            if not query
+            or query
+            in " ".join(
+                (model.id, model.model, model.display_name, model.description)
+            ).casefold()
+        ]
+        candidate_values = [candidate.value for candidate in candidates]
+        if len(candidate_values) != len(set(candidate_values)):
+            return []
+        default = app_commands.Choice(
+            name="Provider/model default (clear override)",
+            value="default",
+        )
+        choices = [default, *candidates]
+        return choices if len(choices) <= 25 else []
 
     async def _model_tier_show(
         self, interaction: discord.Interaction[Any]
@@ -2951,10 +3105,17 @@ class CodexDBot(discord.Client):
         )
 
     async def _reasoning_set(
-        self, interaction: discord.Interaction[Any], effort: str
+        self, interaction: discord.Interaction[Any], effort: str | None = None
     ) -> None:
         await self._defer_owner(interaction)
         conversation = await self._conversation(interaction)
+        if effort is None:
+            await self._send_catalog_selector(
+                interaction,
+                conversation=conversation,
+                kind="reasoning",
+            )
+            return
         value = None if effort == "default" else effort
         await self.session_lifecycle.set_reasoning_effort(
             conversation.id,
@@ -2963,6 +3124,165 @@ class CodexDBot(discord.Client):
         )
         await interaction.followup.send(
             f"Reasoning effort: `{value or 'default'}`", ephemeral=True
+        )
+
+    async def _reasoning_autocomplete(
+        self,
+        interaction: discord.Interaction[Any],
+        current: str,
+    ) -> list[app_commands.Choice[str]]:
+        if (
+            not self._authorized_interaction(interaction)
+            or interaction.user.id != self.config.discord.owner_user_id
+        ):
+            return []
+        try:
+            conversation = await self._conversation(interaction)
+            catalog = await asyncio.wait_for(
+                self.session_lifecycle.model_catalog_if_loaded(conversation.id),
+                timeout=0.4,
+            )
+        except (CodexDError, TimeoutError):
+            return []
+        if catalog is None or not catalog.complete:
+            return []
+        selected = _effective_model(catalog.models, conversation.model_override)
+        query = current.casefold().strip()
+        descriptions = {
+            option.value: option.description
+            for option in selected.reasoning_effort_options
+        }
+        candidates = [
+            app_commands.Choice(
+                name=_reasoning_choice_label(
+                    effort,
+                    descriptions.get(effort, ""),
+                    is_default=effort == selected.default_reasoning_effort,
+                ),
+                value=effort,
+            )
+            for effort in selected.supported_reasoning_efforts
+            if not query
+            or query in f"{effort} {descriptions.get(effort, '')}".casefold()
+        ]
+        candidate_values = [candidate.value for candidate in candidates]
+        if len(candidate_values) != len(set(candidate_values)):
+            return []
+        choices = [
+            app_commands.Choice(
+                name="Model default (clear override)",
+                value="default",
+            ),
+            *candidates,
+        ]
+        return choices if len(choices) <= 25 else []
+
+    async def _send_catalog_selector(
+        self,
+        interaction: discord.Interaction[Any],
+        *,
+        conversation: ConversationRecord,
+        kind: str,
+    ) -> None:
+        catalog, generation = (
+            await self.session_lifecycle.model_catalog_with_generation(
+                conversation.id
+            )
+        )
+        if not catalog.complete:
+            raise InvariantError(
+                "Codex model catalog is incomplete; selection is disabled"
+            )
+        if kind == "model":
+            choices = [
+                (model.model, _model_choice_label(model))
+                for model in catalog.models
+            ]
+        else:
+            selected = _effective_model(
+                catalog.models,
+                conversation.model_override,
+            )
+            descriptions = {
+                option.value: option.description
+                for option in selected.reasoning_effort_options
+            }
+            choices = [
+                (
+                    effort,
+                    _reasoning_choice_label(
+                        effort,
+                        descriptions.get(effort, ""),
+                        is_default=effort == selected.default_reasoning_effort,
+                    ),
+                )
+                for effort in selected.supported_reasoning_efforts
+            ]
+        choices.insert(0, ("default", "Provider/model default (clear override)"))
+        values = [value for value, _label in choices]
+        if (
+            len(choices) > 25
+            or len(set(values)) != len(values)
+            or any(len(value) > 100 for value in values)
+        ):
+            raise InvariantError(
+                "Codex returned ambiguous or excessive choices; filter with autocomplete"
+            )
+        nonce = secrets.token_urlsafe(9)
+        expires_at = utc_now_ms() + 10 * 60 * 1000
+        catalog_hash = sha256_text(
+            canonical_json(
+                {
+                    "kind": kind,
+                    "generation": generation,
+                    "values": values,
+                }
+            )
+        )
+        intent = await asyncio.to_thread(
+            self.repository.create_catalog_choice_intent,
+            kind=kind,
+            conversation_id=conversation.id,
+            guild_id=conversation.discord_guild_id,
+            channel_id=conversation.discord_thread_id,
+            owner_user_id=conversation.owner_user_id,
+            runtime_generation=generation,
+            catalog_hash=catalog_hash,
+            allowed_values=values,
+            nonce=nonce,
+            expires_at=expires_at,
+        )
+        custom_id = self.signer.catalog_choice_id(
+            intent_id=intent.id,
+            kind=kind,
+            runtime_generation=generation,
+            nonce=nonce,
+        )
+        select: discord.ui.Select[discord.ui.View] = discord.ui.Select(
+            placeholder=f"Select {kind}",
+            custom_id=custom_id,
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(label=label[:100], value=value)
+                for value, label in choices
+            ],
+        )
+        view = discord.ui.View(timeout=600)
+        view.add_item(select)
+        suffix = (
+            " Settings affect future Turns only."
+            if await asyncio.to_thread(
+                self.repository.active_turn_for_conversation,
+                conversation.id,
+            )
+            is not None
+            else ""
+        )
+        await interaction.followup.send(
+            f"Choose a live SDK {kind} candidate.{suffix}",
+            view=view,
+            ephemeral=True,
         )
 
     async def _reasoning_summary_show(
@@ -3723,6 +4043,20 @@ def _modal_values(data: object) -> dict[str, str]:
     return values
 
 
+def _component_selected_value(data: object) -> str:
+    if not isinstance(data, Mapping):
+        raise ConflictError("catalog selection payload is missing")
+    values = data.get("values")
+    if (
+        not isinstance(values, list)
+        or len(values) != 1
+        or not isinstance(values[0], str)
+        or not values[0]
+    ):
+        raise ConflictError("catalog selection must contain exactly one value")
+    return values[0]
+
+
 def _bounded_response(value: str) -> str:
     if len(value) <= 1900:
         return value
@@ -3825,6 +4159,23 @@ def _effective_reasoning(
         or model.default_reasoning_effort
         or "provider default"
     )
+
+
+def _model_choice_label(model: ModelDescriptor) -> str:
+    display = model.display_name.strip() or model.model
+    suffix = " · default" if model.is_default else ""
+    return f"{display} · {model.model}{suffix}"[:100]
+
+
+def _reasoning_choice_label(
+    effort: str,
+    description: str,
+    *,
+    is_default: bool,
+) -> str:
+    detail = description.strip()
+    suffix = " · model default" if is_default else ""
+    return f"{effort}{suffix}{' · ' + detail if detail else ''}"[:100]
 
 
 def _effective_model(

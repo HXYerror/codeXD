@@ -518,7 +518,7 @@ def test_input_file_migration_preserves_images_and_enforces_shared_ordinals(
         )
 
         monkeypatch.setattr(sqlite_module, "_load_migrations", lambda: migrations)
-        assert store.migrate() == 24
+        assert store.migrate() == 25
         assert store.integrity_check() == "ok"
         assert store.foreign_key_check() == ()
         assert repository.load_turn_input(image_turn.id).images[0].attachment_id == "legacy-image"
@@ -577,7 +577,7 @@ def test_file_snapshot_survives_database_reopen(tmp_path: Path) -> None:
         )
 
     with SQLiteStore(database) as reopened:
-        assert reopened.migrate() == 24
+        assert reopened.migrate() == 25
         restored = Repository(reopened).load_turn_input(turn.id)
     assert restored.files == (file,)
 

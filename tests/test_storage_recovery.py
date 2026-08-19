@@ -21,7 +21,7 @@ from codexd.domain.conversations import (
     WebSearchMode,
 )
 from codexd.domain.events import NormalizedEvent
-from codexd.domain.ids import canonical_json, sha256_text
+from codexd.domain.ids import canonical_json, sha256_text, utc_now_ms
 from codexd.domain.schedules import MisfirePolicy, ScheduleKind, ScheduleState
 from codexd.domain.turns import (
     InterruptOrigin,
@@ -408,6 +408,63 @@ def test_identical_progress_update_is_a_durable_noop(
     assert duplicate is None
     assert after is not None
     assert after["content_revision"] == before["content_revision"]
+
+
+def test_catalog_choice_intent_is_scoped_and_single_use(
+    storage_context: StorageContext,
+) -> None:
+    repository = storage_context.repository
+    intent = repository.create_catalog_choice_intent(
+        kind="model",
+        conversation_id=storage_context.conversation.id,
+        guild_id=100,
+        channel_id=300,
+        owner_user_id=400,
+        runtime_generation=7,
+        catalog_hash="a" * 64,
+        allowed_values=("default", "gpt-live"),
+        nonce="choice-nonce",
+        expires_at=utc_now_ms() + 60_000,
+    )
+
+    consumed = repository.consume_catalog_choice_intent(
+        intent_id=intent.id,
+        kind="model",
+        value="gpt-live",
+        runtime_generation=7,
+        nonce="choice-nonce",
+        interaction_id="choice-interaction",
+        guild_id=100,
+        channel_id=300,
+        user_id=400,
+    )
+
+    assert consumed.state == "consumed"
+    with pytest.raises(ConflictError, match="already consumed"):
+        repository.consume_catalog_choice_intent(
+            intent_id=intent.id,
+            kind="model",
+            value="gpt-live",
+            runtime_generation=7,
+            nonce="choice-nonce",
+            interaction_id="choice-replay",
+            guild_id=100,
+            channel_id=300,
+            user_id=400,
+        )
+    with pytest.raises(SecurityError):
+        repository.create_catalog_choice_intent(
+            kind="model",
+            conversation_id=storage_context.conversation.id,
+            guild_id=100,
+            channel_id=301,
+            owner_user_id=400,
+            runtime_generation=7,
+            catalog_hash="b" * 64,
+            allowed_values=("default",),
+            nonce="wrong-scope",
+            expires_at=utc_now_ms() + 60_000,
+        )
 
 
 def test_assistant_text_stays_plain_and_does_not_replace_tool_progress(
@@ -1507,7 +1564,7 @@ def test_channel_binding_migration_preserves_legacy_conversation_identity(
             )
 
         monkeypatch.setattr(sqlite_module, "_load_migrations", lambda: migrations)
-        assert store.migrate() == 24
+        assert store.migrate() == 25
         assert store.foreign_key_check() == ()
         repository = Repository(store)
         project = repository.get_project("legacy-project")
@@ -1638,7 +1695,7 @@ def test_terminal_progress_cleanup_migration_preserves_rollout_boundary(
         )
 
         monkeypatch.setattr(sqlite_module, "_load_migrations", lambda: migrations)
-        assert store.migrate() == 24
+        assert store.migrate() == 25
         active_row = store.query_one(
             """
             SELECT discord_message_id, cleanup_state, deleted_at
@@ -1812,7 +1869,7 @@ def test_component_scope_migrations_expire_and_guard_legacy_pending_drafts(
             )
 
         monkeypatch.setattr(sqlite_module, "_load_migrations", lambda: migrations)
-        assert store.migrate() == 24
+        assert store.migrate() == 25
         row = store.query_one(
             """
             SELECT state, discord_guild_id, discord_channel_id
@@ -1936,7 +1993,7 @@ def test_turn_enqueue_sequence_migration_backfills_existing_turns(
                 )
 
         monkeypatch.setattr(sqlite_module, "_load_migrations", lambda: migrations)
-        assert store.migrate() == 24
+        assert store.migrate() == 25
         repository = Repository(store)
         third = repository.enqueue_turn(
             conversation_id="upgrade-conversation",
@@ -2043,7 +2100,7 @@ def test_schedule_fire_turn_fk_upgrade_preserves_pairs(
             )
 
         monkeypatch.setattr(sqlite_module, "_load_migrations", lambda: migrations)
-        assert store.migrate() == 24
+        assert store.migrate() == 25
         assert store.foreign_key_check() == ()
         fire_fks = store.query_all("PRAGMA foreign_key_list(schedule_fires)")
         assert any(

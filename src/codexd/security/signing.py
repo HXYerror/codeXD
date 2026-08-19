@@ -31,6 +31,14 @@ class ModalAction:
     nonce: str
 
 
+@dataclass(frozen=True)
+class CatalogChoiceAction:
+    intent_id: str
+    kind: str
+    runtime_generation: int
+    nonce: str
+
+
 class ComponentSigner:
     def __init__(self, key: bytes) -> None:
         if len(key) < 32:
@@ -159,6 +167,45 @@ class ComponentSigner:
         except ValueError as exc:
             raise SecurityError("invalid modal custom ID expiry") from exc
         return ModalAction(intent_id, kind, expires_at, nonce)
+
+    def catalog_choice_id(
+        self,
+        *,
+        intent_id: str,
+        kind: str,
+        runtime_generation: int,
+        nonce: str,
+    ) -> str:
+        kind_code = {"model": "m", "reasoning": "r"}.get(kind)
+        if kind_code is None or runtime_generation < 1 or not nonce or ":" in nonce:
+            raise ValueError("invalid catalog choice identity")
+        generation = _base36(runtime_generation)
+        body = f"cc:v1:{intent_id}:{kind_code}:{generation}:{nonce}"
+        value = f"{body}:{self._signature(body)}"
+        if len(value) > 100:
+            raise ValueError("catalog choice custom ID exceeds Discord's limit")
+        return value
+
+    def verify_catalog_choice_id(self, value: str) -> CatalogChoiceAction:
+        try:
+            prefix, version, intent_id, kind_code, generation_raw, nonce, signature = (
+                value.split(":")
+            )
+        except ValueError as exc:
+            raise SecurityError("invalid catalog choice component ID") from exc
+        kind = {"m": "model", "r": "reasoning"}.get(kind_code)
+        if prefix != "cc" or version != "v1" or kind is None:
+            raise SecurityError("invalid catalog choice component ID")
+        body = (
+            f"{prefix}:{version}:{intent_id}:{kind_code}:{generation_raw}:{nonce}"
+        )
+        if not hmac.compare_digest(signature, self._signature(body)):
+            raise SecurityError("invalid catalog choice component signature")
+        try:
+            generation = int(generation_raw, 36)
+        except ValueError as exc:
+            raise SecurityError("invalid catalog choice runtime generation") from exc
+        return CatalogChoiceAction(intent_id, kind, generation, nonce)
 
     def _signature(self, value: str) -> str:
         digest = hmac.new(self._key, value.encode(), hashlib.sha256).digest()[:9]

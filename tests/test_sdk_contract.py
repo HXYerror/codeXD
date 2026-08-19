@@ -36,6 +36,11 @@ from openai_codex.generated.v2_all import (
     CodexErrorInfo,
     CodexErrorInfoValue,
     ErrorNotification,
+    InputModality,
+    Model,
+    ModelListResponse,
+    ReasoningEffort,
+    ReasoningEffortOption,
     ReasoningSummaryPartAddedNotification,
     ResponseStreamDisconnected,
     ResponseStreamDisconnectedCodexErrorInfo,
@@ -945,6 +950,51 @@ def test_known_turn_notification_is_normalized() -> None:
 
     assert event.kind == "turn.completed"
     assert event.payload["provider_turn_id"] == "provider-turn"
+
+
+@pytest.mark.asyncio
+async def test_model_catalog_preserves_display_and_reasoning_descriptions(
+    tmp_path: Path,
+) -> None:
+    response = ModelListResponse(
+        data=[
+            Model(
+                id="gpt-live",
+                model="gpt-live",
+                displayName="GPT Live",
+                description="Latest live model",
+                hidden=False,
+                isDefault=True,
+                inputModalities=[InputModality.text],
+                supportedReasoningEfforts=[
+                    ReasoningEffortOption(
+                        reasoningEffort=ReasoningEffort.xhigh,
+                        description="Deepest available reasoning",
+                    )
+                ],
+                defaultReasoningEffort=ReasoningEffort.xhigh,
+            )
+        ],
+        nextCursor=None,
+    )
+    runtime = CodexSDKRuntime(
+        client=cast(Any, SimpleNamespace(models=AsyncMock(return_value=response))),
+        slot=_runtime_slot(tmp_path),
+        generation=7,
+        manifest=_capability_manifest(),
+    )
+
+    catalog = await runtime.list_models()
+
+    model = catalog.models[0]
+    assert (model.display_name, model.description) == (
+        "GPT Live",
+        "Latest live model",
+    )
+    assert model.supported_reasoning_efforts == ("xhigh",)
+    assert model.reasoning_effort_options[0].description == (
+        "Deepest available reasoning"
+    )
 
 
 @pytest.mark.parametrize(

@@ -1075,6 +1075,84 @@ async def test_exact_runtime_retire_ignores_stale_generation(
 
 
 @pytest.mark.asyncio
+async def test_model_catalog_snapshot_is_generation_scoped(
+    storage_context: StorageContext,
+) -> None:
+    async def factory(_slot: object, generation: int) -> FakeCodexRuntime:
+        return FakeCodexRuntime(generation=generation)
+
+    supervisor = _runtime_supervisor(storage_context, factory)
+    _runtime, lease_one = await supervisor.ensure(storage_context.project)
+    first = await supervisor.model_catalog_if_loaded(storage_context.project.id)
+    assert first is not None
+    await supervisor.assert_generation(
+        storage_context.project.id,
+        lease_one.generation,
+    )
+    await supervisor.retire(
+        storage_context.project,
+        expected_lease_id=lease_one.id,
+        expected_generation=lease_one.generation,
+        reason="catalog_generation_test",
+    )
+    assert await supervisor.model_catalog_if_loaded(storage_context.project.id) is None
+    _runtime, lease_two = await supervisor.ensure(storage_context.project)
+    try:
+        assert lease_two.generation > lease_one.generation
+        with pytest.raises(InvariantError, match="runtime changed"):
+            await supervisor.assert_generation(
+                storage_context.project.id,
+                lease_one.generation,
+            )
+    finally:
+        await supervisor.close()
+
+
+@pytest.mark.asyncio
+async def test_model_catalog_refresh_is_singleflight(
+    storage_context: StorageContext,
+) -> None:
+    release = asyncio.Event()
+
+    class CatalogRuntime(FakeCodexRuntime):
+        def __init__(self, generation: int) -> None:
+            super().__init__(generation=generation)
+            self.catalog_calls = 0
+
+        async def list_models(self) -> ModelCatalogSnapshot:
+            self.catalog_calls += 1
+            if self.catalog_calls > 1:
+                await release.wait()
+            return await super().list_models()
+
+    runtime: CatalogRuntime | None = None
+
+    async def factory(_slot: object, generation: int) -> CatalogRuntime:
+        nonlocal runtime
+        runtime = CatalogRuntime(generation)
+        return runtime
+
+    supervisor = _runtime_supervisor(storage_context, factory)
+    await supervisor.ensure(storage_context.project)
+    assert runtime is not None
+    first = asyncio.create_task(supervisor.refresh_model_catalog(storage_context.project))
+    second = asyncio.create_task(supervisor.refresh_model_catalog(storage_context.project))
+    for _ in range(100):
+        if runtime.catalog_calls == 2:
+            break
+        await asyncio.sleep(0)
+    else:
+        raise AssertionError("catalog refresh did not start")
+    assert runtime.catalog_calls == 2
+    release.set()
+    try:
+        await asyncio.gather(first, second)
+        assert runtime.catalog_calls == 2
+    finally:
+        await supervisor.close()
+
+
+@pytest.mark.asyncio
 async def test_system_error_retires_stale_runtime_and_continues_queued_turn(
     storage_context: StorageContext,
 ) -> None:

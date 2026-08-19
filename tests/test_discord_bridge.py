@@ -4,6 +4,7 @@ import asyncio
 import json
 import threading
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -35,6 +36,7 @@ from codexd.domain.models import (
     AccountStatus,
     ModelCatalogSnapshot,
     ModelDescriptor,
+    ReasoningEffortDescriptor,
     ServiceTierDescriptor,
 )
 from codexd.domain.schedules import MisfirePolicy, ScheduleKind
@@ -161,6 +163,144 @@ def _storage_bot(
         capability_manifest=capability_manifest(),
         boot_id="bridge-infrastructure",
     )
+
+
+@pytest.mark.asyncio
+async def test_live_catalog_autocomplete_uses_sdk_snapshot_and_fails_closed(
+    storage_context: StorageContext,
+    tmp_path: Path,
+) -> None:
+    bot = _storage_bot(storage_context, tmp_path)
+    conversation = storage_context.repository.get_conversation(
+        storage_context.conversation.id
+    )
+    model = ModelDescriptor(
+        id="gpt-live",
+        model="gpt-live",
+        is_default=True,
+        input_modalities=("text",),
+        supported_reasoning_efforts=("max", "ultra"),
+        default_reasoning_effort="max",
+        supports_personality=False,
+        service_tiers=(),
+        default_service_tier=None,
+        upgrade=None,
+        display_name="GPT Live",
+        description="Live catalog model",
+        reasoning_effort_options=(
+            ReasoningEffortDescriptor("max", "Maximum reasoning"),
+            ReasoningEffortDescriptor("ultra", "Ultra reasoning"),
+        ),
+    )
+    catalog = ModelCatalogSnapshot((model,), complete=True, next_cursor=None)
+    bot.session_lifecycle.model_catalog_if_loaded = AsyncMock(return_value=catalog)
+    thread = Mock(spec=discord.Thread)
+    thread.id = 300
+    thread.parent_id = 200
+    interaction = _interaction(7100, thread=thread, text_channel=Mock(), in_thread=True)
+
+    models = await bot._model_autocomplete(interaction, "live")
+    reasoning = await bot._reasoning_autocomplete(interaction, "ultra")
+
+    assert [(choice.name, choice.value) for choice in models] == [
+        ("Provider/model default (clear override)", "default"),
+        ("GPT Live · gpt-live · default", "gpt-live"),
+    ]
+    assert [(choice.name, choice.value) for choice in reasoning] == [
+        ("Model default (clear override)", "default"),
+        ("ultra · Ultra reasoning", "ultra"),
+    ]
+    assert conversation.model_override is None
+
+    bot.session_lifecycle.model_catalog_if_loaded.return_value = ModelCatalogSnapshot(
+        tuple(replace(model, id=f"m-{index}", model=f"m-{index}") for index in range(25)),
+        complete=True,
+        next_cursor=None,
+    )
+    assert await bot._model_autocomplete(interaction, "") == []
+
+
+@pytest.mark.asyncio
+async def test_catalog_selector_survives_restart_and_is_single_use(
+    storage_context: StorageContext,
+    tmp_path: Path,
+) -> None:
+    signer_key = b"catalog-choice-restart".ljust(32, b"-")
+    conversation = storage_context.repository.get_conversation(
+        storage_context.conversation.id
+    )
+    model = ModelDescriptor(
+        id="gpt-live",
+        model="gpt-live",
+        is_default=True,
+        input_modalities=("text",),
+        supported_reasoning_efforts=("high",),
+        default_reasoning_effort="high",
+        supports_personality=False,
+        service_tiers=(),
+        default_service_tier=None,
+        upgrade=None,
+        display_name="GPT Live",
+    )
+    catalog = ModelCatalogSnapshot((model,), complete=True, next_cursor=None)
+    first = _storage_bot(storage_context, tmp_path)
+    first.signer = ComponentSigner(signer_key)
+    first.session_lifecycle.model_catalog_with_generation = AsyncMock(
+        return_value=(catalog, 7)
+    )
+    thread, text_channel = _thread_channels()
+    launch = _interaction(
+        20_080,
+        thread=thread,
+        text_channel=text_channel,
+        in_thread=True,
+    )
+
+    await first._model_set(launch, None)
+
+    view = launch.followup.send.await_args.kwargs["view"]
+    custom_id = view.children[0].custom_id
+    assert isinstance(custom_id, str)
+    restarted = _storage_bot(storage_context, tmp_path)
+    restarted.signer = ComponentSigner(signer_key)
+    restarted.session_lifecycle.validate_catalog_choice = AsyncMock()
+    restarted.session_lifecycle.set_model = AsyncMock(return_value=conversation)
+    submit = _interaction(
+        20_081,
+        thread=thread,
+        text_channel=text_channel,
+        in_thread=True,
+    )
+    submit.type = discord.InteractionType.component
+    submit.data = {"custom_id": custom_id, "values": ["gpt-live"]}
+
+    await restarted.on_interaction(submit)
+
+    restarted.session_lifecycle.validate_catalog_choice.assert_awaited_once()
+    restarted.session_lifecycle.set_model.assert_awaited_once_with(
+        conversation.id,
+        "gpt-live",
+        interaction_id="20081",
+    )
+    action = restarted.signer.verify_catalog_choice_id(custom_id)
+    assert storage_context.repository.get_catalog_choice_intent(action.intent_id).state == (
+        "consumed"
+    )
+    replay = _interaction(
+        20_082,
+        thread=thread,
+        text_channel=text_channel,
+        in_thread=True,
+    )
+    replay.type = discord.InteractionType.component
+    replay.data = {"custom_id": custom_id, "values": ["gpt-live"]}
+
+    await restarted.on_interaction(replay)
+
+    assert restarted.session_lifecycle.set_model.await_count == 1
+    error_call = replay.followup.send.await_args
+    error_embed = error_call.kwargs["embed"]
+    assert "already consumed" in error_embed.description
 
 
 def _thread_channels() -> tuple[discord.Thread, discord.TextChannel]:
@@ -434,10 +574,18 @@ async def test_every_registered_discord_command_executes_through_bridge(
         ),
         default_service_tier="fast",
         upgrade=None,
+        display_name="GPT Test",
+        description="Test model description",
+        reasoning_effort_options=(
+            ReasoningEffortDescriptor("low", "Fast"),
+            ReasoningEffortDescriptor("medium", "Balanced"),
+            ReasoningEffortDescriptor("high", "Deep"),
+        ),
     )
     catalog = ModelCatalogSnapshot((model,), complete=True, next_cursor=None)
     lifecycle = Mock()
     lifecycle.model_catalog = AsyncMock(return_value=catalog)
+    lifecycle.model_catalog_if_loaded = AsyncMock(return_value=catalog)
     lifecycle.list_revisions = AsyncMock(return_value=(revision,))
     lifecycle.status = AsyncMock(
         return_value=SessionStatus(conversation, revision)

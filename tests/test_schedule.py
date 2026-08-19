@@ -500,6 +500,27 @@ def test_schedule_draft_component_signature() -> None:
         signer.verify_schedule_draft_id(component_id.replace("confirm", "cancel"))
 
 
+def test_catalog_choice_signature_binds_kind_and_generation() -> None:
+    signer = ComponentSigner(b"c" * 32)
+    custom_id = signer.catalog_choice_id(
+        intent_id="choice-intent",
+        kind="model",
+        runtime_generation=41,
+        nonce="choice-nonce",
+    )
+
+    action = signer.verify_catalog_choice_id(custom_id)
+
+    assert (action.intent_id, action.kind, action.runtime_generation, action.nonce) == (
+        "choice-intent",
+        "model",
+        41,
+        "choice-nonce",
+    )
+    with pytest.raises(SecurityError):
+        signer.verify_catalog_choice_id(custom_id.replace(":m:", ":r:"))
+
+
 def test_modal_intent_signature_and_restart_safe_consumption(
     storage_context: StorageContext,
 ) -> None:
