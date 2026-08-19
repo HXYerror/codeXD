@@ -1164,12 +1164,28 @@ async def test_persistent_system_error_keeps_discord_turn_pending(
             turn_input=TurnInput(text="wait for recovery"),
             input_message_id="persistent-system-error",
         )
-        await asyncio.sleep(0.05)
-
-        current = storage_context.repository.get_turn(turn.id)
-        conversation = storage_context.repository.get_conversation(
-            storage_context.conversation.id
-        )
+        for _ in range(200):
+            current = storage_context.repository.get_turn(turn.id)
+            conversation = storage_context.repository.get_conversation(
+                storage_context.conversation.id
+            )
+            incident = storage_context.store.query_one(
+                """
+                SELECT 1 FROM incidents
+                WHERE conversation_id = ?
+                  AND code = 'provider_thread_system_error_persistent'
+                """,
+                (storage_context.conversation.id,),
+            )
+            if (
+                current.state is TurnState.QUEUED
+                and conversation.provider_recovery_state is None
+                and incident is not None
+            ):
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("persistent systemError recovery did not settle")
         assert current.state is TurnState.QUEUED
         assert conversation.state is ConversationState.ACTIVE
         assert conversation.provider_recovery_state is None
