@@ -43,6 +43,10 @@ class DiscordConfig:
     archive_max_path_depth: int = 16
     archive_max_path_chars: int = 240
     archive_extract_timeout_seconds: int = 15
+    progress_update_ms: int = 5000
+    task_card_update_ms: int = 5000
+    channel_write_interval_ms: int = 250
+    global_write_interval_ms: int = 50
 
 
 @dataclass(frozen=True)
@@ -217,6 +221,10 @@ def _discord_config(raw: dict[str, Any], env: Mapping[str, str]) -> DiscordConfi
             "archive_max_path_depth",
             "archive_max_path_chars",
             "archive_extract_timeout_seconds",
+            "progress_update_ms",
+            "task_card_update_ms",
+            "channel_write_interval_ms",
+            "global_write_interval_ms",
         },
         "discord",
     )
@@ -333,6 +341,22 @@ def _discord_config(raw: dict[str, Any], env: Mapping[str, str]) -> DiscordConfi
         archive_max_path_depth=archive_max_path_depth,
         archive_max_path_chars=archive_max_path_chars,
         archive_extract_timeout_seconds=archive_extract_timeout_seconds,
+        progress_update_ms=_positive_int(
+            raw.get("progress_update_ms", 5000),
+            "discord.progress_update_ms",
+        ),
+        task_card_update_ms=_positive_int(
+            raw.get("task_card_update_ms", 5000),
+            "discord.task_card_update_ms",
+        ),
+        channel_write_interval_ms=_positive_int(
+            raw.get("channel_write_interval_ms", 250),
+            "discord.channel_write_interval_ms",
+        ),
+        global_write_interval_ms=_positive_int(
+            raw.get("global_write_interval_ms", 50),
+            "discord.global_write_interval_ms",
+        ),
     )
 
 

@@ -315,6 +315,7 @@ def test_tool_progress_updates_are_durably_throttled_and_terminal_is_immediate(
         storage_context.store,
         correlation_key=b"s" * 32,
         stream_update_ms=1000,
+        progress_update_ms=5000,
     )
 
     clock[0] = 10_010
@@ -370,6 +371,43 @@ def test_tool_progress_updates_are_durably_throttled_and_terminal_is_immediate(
     assert int(rows[-1]["next_attempt_at"]) == 10_030
     assert terminal["state"] == "terminal"
     assert "plain_text" not in terminal
+
+
+def test_identical_progress_update_is_a_durable_noop(
+    storage_context: StorageContext,
+) -> None:
+    turn, _lease = _running_turn(storage_context, "progress-noop")
+    with storage_context.store.transaction() as connection:
+        first = insert_progress_update(
+            connection,
+            turn_id=turn.id,
+            state="running",
+            content="Running · same visible state",
+            now=10_000,
+            min_interval_ms=5000,
+        )
+        assert first is not None
+        before = connection.execute(
+            "SELECT content_revision FROM turn_progress_views WHERE turn_id = ?",
+            (turn.id,),
+        ).fetchone()
+        assert before is not None
+        duplicate = insert_progress_update(
+            connection,
+            turn_id=turn.id,
+            state="running",
+            content="Running · same visible state",
+            now=10_001,
+            min_interval_ms=5000,
+        )
+        after = connection.execute(
+            "SELECT content_revision FROM turn_progress_views WHERE turn_id = ?",
+            (turn.id,),
+        ).fetchone()
+
+    assert duplicate is None
+    assert after is not None
+    assert after["content_revision"] == before["content_revision"]
 
 
 def test_assistant_text_stays_plain_and_does_not_replace_tool_progress(
@@ -4397,7 +4435,7 @@ def test_activity_only_subagents_create_and_finalize_task_cards(
         (turn.id,),
     )
     assert len({str(row["id"]) for row in projected}) == 3
-    assert {int(row["content_revision"]) for row in projected} == {2}
+    assert {int(row["content_revision"]) for row in projected} == {1}
     assert [
         {
             "source_type": row["source_type"],

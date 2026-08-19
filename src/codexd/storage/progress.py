@@ -186,14 +186,6 @@ def insert_progress_update(
     if view is None or str(view["cleanup_state"]) != "active":
         return None
     revision = int(view["content_revision"]) + 1
-    connection.execute(
-        """
-        UPDATE turn_progress_views
-        SET content_revision = ?, state = ?, updated_at = ?
-        WHERE turn_id = ?
-        """,
-        (revision, state, now, turn_id),
-    )
     coalesce_key = f"turn:{turn_id}:progress"
     next_attempt_at = now
     previous = connection.execute(
@@ -207,6 +199,7 @@ def insert_progress_update(
         (coalesce_key,),
     ).fetchone()
     previous_content = "Running · Codex is working"
+    previous_payload: dict[str, object] = {}
     if previous is not None:
         try:
             previous_payload = json.loads(str(previous["payload_json"]))
@@ -221,6 +214,21 @@ def insert_progress_update(
     resolved_content = content if content is not None else previous_content
     if not resolved_content:
         raise ValueError("progress content cannot be empty")
+    if (
+        previous is not None
+        and state != "terminal"
+        and previous_payload.get("state") == state
+        and previous_content == resolved_content[:1900]
+    ):
+        return None
+    connection.execute(
+        """
+        UPDATE turn_progress_views
+        SET content_revision = ?, state = ?, updated_at = ?
+        WHERE turn_id = ?
+        """,
+        (revision, state, now, turn_id),
+    )
     if state != "terminal" and min_interval_ms and previous is not None:
         previous_state = str(previous["state"])
         if previous_state == "sent":
@@ -229,7 +237,14 @@ def insert_progress_update(
                 int(previous["updated_at"]) + min_interval_ms,
             )
         elif previous_state == "pending":
-            next_attempt_at = max(now, int(previous["next_attempt_at"]))
+            if str(previous["operation"]) == "send":
+                next_attempt_at = max(now, int(previous["next_attempt_at"]))
+            else:
+                next_attempt_at = (
+                    int(previous["next_attempt_at"])
+                    if int(previous["next_attempt_at"]) > now
+                    else now + min_interval_ms
+                )
         else:
             next_attempt_at = max(
                 now + min_interval_ms,

@@ -194,6 +194,7 @@ class CodexDBot(discord.Client):
         self._codex_auth_status = codex_auth_status or (lambda _status: None)
         self._http_session: aiohttp.ClientSession | None = None
         self._attachment_ingestor: DiscordAttachmentIngestor | None = None
+        self._transport: DiscordOutboxTransport | None = None
         self._outbox: OutboxWorker | None = None
         self._command_sync_task: asyncio.Task[None] | None = None
         self._startup_recovery_task: asyncio.Task[None] | None = None
@@ -235,6 +236,11 @@ class CodexDBot(discord.Client):
     def transport_initialized(self) -> bool:
         return self._outbox is not None
 
+    def egress_metrics(self) -> dict[str, int | float]:
+        if self._transport is None:
+            return {}
+        return self._transport.egress_metrics()
+
     async def setup_hook(self) -> None:
         self._http_session = aiohttp.ClientSession()
         self._attachment_ingestor = DiscordAttachmentIngestor(
@@ -254,7 +260,16 @@ class CodexDBot(discord.Client):
             renderer=self.renderer,
             signer=self.signer,
             volatile_turns=self.turns.volatile_turns,
+            channel_write_interval_ms=(
+                self.config.discord.channel_write_interval_ms
+            ),
+            global_write_interval_ms=(
+                self.config.discord.global_write_interval_ms
+            ),
+            progress_update_ms=self.config.discord.progress_update_ms,
+            task_card_update_ms=self.config.discord.task_card_update_ms,
         )
+        self._transport = transport
         self._outbox = OutboxWorker(
             repository=self.repository,
             transport=transport,

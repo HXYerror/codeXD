@@ -7,6 +7,7 @@ import inspect
 import io
 import json
 import logging
+import time
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
@@ -79,6 +80,140 @@ class DeliveryError(RuntimeError):
 
 class OutboxTransport(Protocol):
     async def deliver(self, record: OutboxRecord) -> DeliveryResult: ...
+
+
+@dataclass(frozen=True)
+class DiscordEgressPermit:
+    route_kind: str
+    operation_kind: str
+    destination_key: str
+    message_key: str | None
+
+
+class DiscordEgressGovernor:
+    def __init__(
+        self,
+        *,
+        channel_interval_ms: int = 250,
+        global_interval_ms: int = 50,
+        progress_interval_ms: int = 5000,
+        task_card_interval_ms: int = 5000,
+    ) -> None:
+        if min(
+            channel_interval_ms,
+            global_interval_ms,
+            progress_interval_ms,
+            task_card_interval_ms,
+        ) < 1:
+            raise ValueError("Discord egress intervals must be positive")
+        self._channel_interval = channel_interval_ms / 1000
+        self._global_interval = global_interval_ms / 1000
+        self._message_intervals = {
+            "turn_progress": progress_interval_ms / 1000,
+            "task_card": task_card_interval_ms / 1000,
+        }
+        self._lock = asyncio.Lock()
+        self._global_ready_at = 0.0
+        self._channel_ready_at: dict[str, float] = {}
+        self._message_ready_at: dict[str, float] = {}
+        self._verified_messages: dict[str, str] = {}
+        self._wait_count = 0
+        self._wait_seconds = 0.0
+        self._rate_limit_count = 0
+        self._last_retry_after_seconds = 0.0
+        self._route_counts: dict[str, int] = {}
+        self._route_wait_counts: dict[str, int] = {}
+
+    async def acquire(self, permit: DiscordEgressPermit) -> None:
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                ready_at = max(
+                    self._global_ready_at,
+                    self._channel_ready_at.get(permit.destination_key, 0.0),
+                    (
+                        self._message_ready_at.get(permit.message_key, 0.0)
+                        if permit.message_key is not None
+                        else 0.0
+                    ),
+                )
+                delay = ready_at - now
+                if delay <= 0:
+                    route_key = _metric_route_key(permit)
+                    self._route_counts[route_key] = (
+                        self._route_counts.get(route_key, 0) + 1
+                    )
+                    self._global_ready_at = now + self._global_interval
+                    self._channel_ready_at[permit.destination_key] = (
+                        now + self._channel_interval
+                    )
+                    message_interval = self._message_intervals.get(
+                        permit.route_kind
+                    )
+                    if permit.message_key is not None and message_interval is not None:
+                        self._message_ready_at[permit.message_key] = (
+                            now + message_interval
+                        )
+                    return
+                self._wait_count += 1
+                self._wait_seconds += delay
+                route_key = _metric_route_key(permit)
+                self._route_wait_counts[route_key] = (
+                    self._route_wait_counts.get(route_key, 0) + 1
+                )
+            await asyncio.sleep(delay)
+
+    async def penalize(
+        self,
+        permit: DiscordEgressPermit,
+        *,
+        retry_after: float,
+    ) -> None:
+        cooldown = max(0.001, retry_after)
+        async with self._lock:
+            ready_at = time.monotonic() + cooldown
+            self._rate_limit_count += 1
+            self._last_retry_after_seconds = cooldown
+            self._global_ready_at = max(self._global_ready_at, ready_at)
+            self._channel_ready_at[permit.destination_key] = max(
+                self._channel_ready_at.get(permit.destination_key, 0.0),
+                ready_at,
+            )
+            if permit.message_key is not None:
+                self._message_ready_at[permit.message_key] = max(
+                    self._message_ready_at.get(permit.message_key, 0.0),
+                    ready_at,
+                )
+
+    def metrics(self) -> dict[str, int | float]:
+        metrics: dict[str, int | float] = {
+            "governor_wait_count": self._wait_count,
+            "governor_wait_seconds": round(self._wait_seconds, 3),
+            "discord_429_count": self._rate_limit_count,
+            "last_retry_after_seconds": round(
+                self._last_retry_after_seconds,
+                3,
+            ),
+        }
+        metrics.update(
+            {
+                f"route_{key}_count": value
+                for key, value in sorted(self._route_counts.items())
+            }
+        )
+        metrics.update(
+            {
+                f"route_{key}_wait_count": value
+                for key, value in sorted(self._route_wait_counts.items())
+            }
+        )
+        return metrics
+
+    def message_verified(self, message_key: str, message_id: str) -> bool:
+        return self._verified_messages.get(message_key) == message_id
+
+    def verify_message(self, message_key: str, message_id: str) -> None:
+        self._verified_messages[message_key] = message_id
 
 
 class OutboxWorker:
@@ -372,6 +507,11 @@ class DiscordOutboxTransport:
         renderer: DiscordRenderPlanner,
         signer: ComponentSigner,
         volatile_turns: VolatileTurnStore | None = None,
+        governor: DiscordEgressGovernor | None = None,
+        channel_write_interval_ms: int = 250,
+        global_write_interval_ms: int = 50,
+        progress_update_ms: int = 5000,
+        task_card_update_ms: int = 5000,
     ) -> None:
         nonce_support = inspect.signature(discord.abc.Messageable.send).parameters.get(
             "nonce"
@@ -385,6 +525,12 @@ class DiscordOutboxTransport:
         self._renderer = renderer
         self._signer = signer
         self._volatile_turns = volatile_turns or VolatileTurnStore()
+        self._governor = governor or DiscordEgressGovernor(
+            channel_interval_ms=channel_write_interval_ms,
+            global_interval_ms=global_write_interval_ms,
+            progress_interval_ms=progress_update_ms,
+            task_card_interval_ms=task_card_update_ms,
+        )
 
     def acknowledged(self, record: OutboxRecord) -> None:
         try:
@@ -396,6 +542,9 @@ class DiscordOutboxTransport:
             if isinstance(turn_id, str):
                 self._volatile_turns.discard(turn_id)
 
+    def egress_metrics(self) -> dict[str, int | float]:
+        return self._governor.metrics()
+
     async def deliver(self, record: OutboxRecord) -> DeliveryResult:
         try:
             payload = json.loads(record.payload_json)
@@ -403,6 +552,8 @@ class DiscordOutboxTransport:
             raise DeliveryError("payload_invalid", permanent=True) from exc
         if not isinstance(payload, dict):
             raise DeliveryError("payload_invalid", permanent=True)
+        permit = _egress_permit(record, payload)
+        await self._governor.acquire(permit)
         try:
             if record.operation == "delete":
                 return await self._deliver_turn_progress_delete(
@@ -475,6 +626,13 @@ class DiscordOutboxTransport:
                 nonce=_delivery_nonce(record.delivery_marker),
             )
             return DeliveryResult(str(message.id))
+        except DeliveryError as exc:
+            if exc.retry_after is not None:
+                await self._governor.penalize(
+                    permit,
+                    retry_after=exc.retry_after,
+                )
+            raise
         except (KeyError, TypeError, ValueError) as exc:
             raise DeliveryError("payload_invalid", permanent=True) from exc
         except discord.Forbidden as exc:
@@ -482,6 +640,11 @@ class DiscordOutboxTransport:
         except discord.NotFound as exc:
             raise DeliveryError("discord_destination_not_found", permanent=True) from exc
         except discord.HTTPException as exc:
+            if exc.status == 429:
+                await self._governor.penalize(
+                    permit,
+                    retry_after=float(getattr(exc, "retry_after", 1.0) or 1.0),
+                )
             permanent = 400 <= exc.status < 500 and exc.status != 429
             raise _discord_http_error(
                 exc,
@@ -1226,11 +1389,24 @@ class DiscordOutboxTransport:
                 self._repository.task_card_message, view_id
             )
             if message_id:
+                message_key = f"task-card:{view_id}"
+                if self._governor.message_verified(message_key, message_id):
+                    partial = await _try_partial_edit(
+                        channel,
+                        message_id,
+                        content=content,
+                        embed=embed,
+                        view=view,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                    if partial is not None:
+                        return DeliveryResult(str(partial.id), view_id)
                 try:
                     message = await channel.fetch_message(int(message_id))
                 except discord.NotFound:
                     pass
                 else:
+                    self._governor.verify_message(message_key, message_id)
                     await message.edit(
                         content=content,
                         embed=embed,
@@ -1250,6 +1426,7 @@ class DiscordOutboxTransport:
             allowed_mentions=discord.AllowedMentions.none(),
             nonce=_delivery_nonce(marker),
         )
+        self._governor.verify_message(f"task-card:{view_id}", str(message.id))
         return DeliveryResult(str(message.id), view_id)
 
     async def _deliver_schedule_draft_card(
@@ -1414,16 +1591,32 @@ class DiscordOutboxTransport:
                 turn_id,
             )
             if message_id:
+                visible_text = plain_text
+                message_key = f"turn-progress:{turn_id}"
+                if self._governor.message_verified(message_key, message_id):
+                    partial = await _try_partial_edit(
+                        channel,
+                        message_id,
+                        content=_bounded_message_content(visible_text),
+                        embed=embed,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                    if partial is not None:
+                        return DeliveryResult(
+                            str(partial.id),
+                            turn_progress_id=turn_id,
+                        )
                 try:
                     message = await channel.fetch_message(int(message_id))
                 except discord.NotFound:
                     pass
                 else:
-                    visible_text = plain_text or _without_hidden_marker(
+                    self._governor.verify_message(message_key, message_id)
+                    fallback_text = visible_text or _without_hidden_marker(
                         message.content if isinstance(message.content, str) else ""
                     )
                     await message.edit(
-                        content=_bounded_message_content(visible_text),
+                        content=_bounded_message_content(fallback_text),
                         embed=embed,
                         allowed_mentions=discord.AllowedMentions.none(),
                         suppress=False,
@@ -1446,6 +1639,7 @@ class DiscordOutboxTransport:
             allowed_mentions=discord.AllowedMentions.none(),
             nonce=_delivery_nonce(marker),
         )
+        self._governor.verify_message(f"turn-progress:{turn_id}", str(message.id))
         return DeliveryResult(
             str(message.id),
             turn_progress_id=turn_id,
@@ -1779,6 +1973,25 @@ async def _send_files(
             file.close()
 
 
+async def _try_partial_edit(
+    channel: discord.TextChannel | discord.Thread,
+    message_id: str,
+    **fields: object,
+) -> discord.PartialMessage | None:
+    try:
+        partial = channel.get_partial_message(int(message_id))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    edit = getattr(partial, "edit", None)
+    if not callable(edit) or not inspect.iscoroutinefunction(edit):
+        return None
+    try:
+        await edit(**fields)
+    except discord.NotFound:
+        return None
+    return partial
+
+
 def _attachment_bytes(
     attachment: RenderedAttachment | DurableRenderedAttachment,
 ) -> bytes:
@@ -1823,6 +2036,50 @@ def _bounded_message_content(content: str) -> str:
 
 def _delivery_nonce(marker: str) -> int:
     return int(sha256_text(f"discord-delivery-nonce:{marker}")[:16], 16)
+
+
+def _egress_permit(
+    record: OutboxRecord,
+    payload: Mapping[str, object],
+) -> DiscordEgressPermit:
+    kind = str(payload.get("kind") or "unknown")
+    message_key: str | None = None
+    if kind == "turn_progress":
+        turn_id = payload.get("turn_id")
+        if isinstance(turn_id, str):
+            message_key = f"turn-progress:{turn_id}"
+        if payload.get("state") == "terminal":
+            message_key = None
+    elif kind == "task_card":
+        view_id = payload.get("view_id")
+        if isinstance(view_id, str):
+            message_key = f"task-card:{view_id}"
+        if payload.get("state") in {
+            "completed",
+            "errored",
+            "interrupted",
+            "shutdown",
+            "not_found",
+        }:
+            message_key = None
+    return DiscordEgressPermit(
+        route_kind=kind,
+        operation_kind=record.operation,
+        destination_key=record.destination_key,
+        message_key=message_key,
+    )
+
+
+def _metric_route_key(permit: DiscordEgressPermit) -> str:
+    route = "".join(
+        character if character.isalnum() else "_"
+        for character in permit.route_kind.casefold()
+    ).strip("_") or "unknown"
+    operation = "".join(
+        character if character.isalnum() else "_"
+        for character in permit.operation_kind.casefold()
+    ).strip("_") or "unknown"
+    return f"{route}_{operation}"
 
 
 def _hidden_delivery_marker(marker: str) -> str:

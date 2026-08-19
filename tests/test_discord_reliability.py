@@ -50,6 +50,8 @@ from codexd.transport.discord.bot import (
 from codexd.transport.discord.outbox import (
     DeliveryError,
     DeliveryResult,
+    DiscordEgressGovernor,
+    DiscordEgressPermit,
     DiscordOutboxTransport,
     OutboxWorker,
     _attachment_failure_guidance,
@@ -81,6 +83,76 @@ def test_delivery_nonce_is_stable_and_content_has_no_hidden_marker() -> None:
         nonce=_delivery_nonce("turn-other"),
     )
     assert all(not ("\ufe00" <= character <= "\ufe0f") for character in "visible text")
+
+
+@pytest.mark.asyncio
+async def test_shared_egress_governor_enforces_message_channel_and_global_budgets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [100.0]
+    sleeps: list[float] = []
+
+    async def advance(delay: float) -> None:
+        sleeps.append(delay)
+        clock[0] += delay
+
+    monkeypatch.setattr("codexd.transport.discord.outbox.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("codexd.transport.discord.outbox.asyncio.sleep", advance)
+    governor = DiscordEgressGovernor(
+        channel_interval_ms=250,
+        global_interval_ms=50,
+        progress_interval_ms=5000,
+        task_card_interval_ms=5000,
+    )
+    progress = DiscordEgressPermit(
+        "turn_progress",
+        "edit",
+        "thread:1",
+        "turn-progress:1",
+    )
+    other_channel = DiscordEgressPermit(
+        "notice",
+        "send",
+        "thread:2",
+        None,
+    )
+
+    await governor.acquire(progress)
+    await governor.acquire(other_channel)
+    await governor.acquire(progress)
+
+    assert sleeps == pytest.approx([0.05, 4.95])
+    assert governor.metrics()["governor_wait_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_429_penalty_cools_shared_bucket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [200.0]
+    sleeps: list[float] = []
+
+    async def advance(delay: float) -> None:
+        sleeps.append(delay)
+        clock[0] += delay
+
+    monkeypatch.setattr("codexd.transport.discord.outbox.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("codexd.transport.discord.outbox.asyncio.sleep", advance)
+    governor = DiscordEgressGovernor(
+        channel_interval_ms=1,
+        global_interval_ms=1,
+        progress_interval_ms=1,
+        task_card_interval_ms=1,
+    )
+    permit = DiscordEgressPermit("notice", "send", "thread:1", None)
+    await governor.acquire(permit)
+    await governor.penalize(permit, retry_after=7.25)
+    await governor.acquire(
+        DiscordEgressPermit("turn_final", "send", "thread:2", None)
+    )
+
+    assert sleeps == pytest.approx([7.25])
+    assert governor.metrics()["discord_429_count"] == 1
 
 
 def _volatile_final(
@@ -1499,6 +1571,75 @@ async def test_turn_progress_uses_one_editable_rich_embed() -> None:
         for character in existing.edit.await_args.kwargs["content"]
     )
     assert "Ordinary assistant text" in existing.edit.await_args.kwargs["content"]
+
+
+@pytest.mark.asyncio
+async def test_verified_progress_uses_partial_edit_without_fetch() -> None:
+    thread = Mock(spec=discord.Thread)
+    thread.archived = False
+    thread.locked = False
+    thread.send = AsyncMock(return_value=Mock(id=601))
+    partial = Mock(spec=discord.PartialMessage)
+    partial.id = 601
+    partial.edit = AsyncMock()
+    thread.get_partial_message.return_value = partial
+    thread.fetch_message = AsyncMock(side_effect=AssertionError("unexpected fetch"))
+    client = Mock(spec=discord.Client)
+    client.user = Mock(id=999)
+    client.get_channel.return_value = thread
+    repository = Mock()
+    repository.turn_progress_message.return_value = "601"
+    transport = DiscordOutboxTransport(
+        client=client,
+        repository=repository,
+        renderer=Mock(),
+        signer=Mock(),
+        channel_write_interval_ms=1,
+        global_write_interval_ms=1,
+        progress_update_ms=1,
+        task_card_update_ms=1,
+    )
+    await transport.deliver(
+        OutboxRecord(
+            id="progress-create-partial",
+            destination_key="thread:300",
+            operation="send",
+            payload_json=canonical_json(
+                {
+                    "kind": "turn_progress",
+                    "turn_id": "turn-partial",
+                    "state": "running",
+                    "content": "Running · first",
+                }
+            ),
+            delivery_marker="progress-create-partial",
+            state="pending",
+            attempts=0,
+            lease_owner="worker",
+        )
+    )
+    await transport.deliver(
+        OutboxRecord(
+            id="progress-edit-partial",
+            destination_key="thread:300",
+            operation="edit",
+            payload_json=canonical_json(
+                {
+                    "kind": "turn_progress",
+                    "turn_id": "turn-partial",
+                    "state": "running",
+                    "content": "Running · latest",
+                }
+            ),
+            delivery_marker="progress-edit-partial",
+            state="pending",
+            attempts=0,
+            lease_owner="worker",
+        )
+    )
+
+    partial.edit.assert_awaited_once()
+    thread.fetch_message.assert_not_awaited()
 
 
 def _claim_terminal_progress_cleanup(
