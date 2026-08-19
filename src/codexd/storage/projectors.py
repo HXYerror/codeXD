@@ -218,6 +218,7 @@ class ProjectingEventSink:
                     sequence,
                     terminal[0],
                     terminal[1],
+                    event,
                     now,
                 )
                 self._forget_provider_events(str(scope["id"]))
@@ -505,6 +506,8 @@ class ProjectingEventSink:
                 event,
                 now,
             )
+        if event.kind == "provider.error":
+            self._project_provider_error(connection, scope, sequence, event, now)
         if event.kind.startswith("review_mode.") and event.payload.get(
             "lifecycle"
         ) == "completed":
@@ -606,6 +609,66 @@ class ProjectingEventSink:
             event_sequence=sequence,
             now=now,
         )
+
+    def _project_provider_error(
+        self,
+        connection: sqlite3.Connection,
+        scope: sqlite3.Row,
+        sequence: int,
+        event: NormalizedEvent,
+        now: int,
+    ) -> None:
+        retry_count = int(event.payload.get("retry_count") or 0)
+        retry_limit = event.payload.get("retry_limit")
+        http_status = event.payload.get("http_status")
+        connection.execute(
+            """
+            UPDATE turns
+            SET provider_error_code = COALESCE(?, provider_error_code),
+                provider_retry_count = MAX(provider_retry_count, ?),
+                provider_retry_limit = COALESCE(?, provider_retry_limit),
+                provider_http_status = COALESCE(?, provider_http_status)
+            WHERE id = ?
+            """,
+            (
+                event.payload.get("failure_code"),
+                retry_count,
+                retry_limit if isinstance(retry_limit, int) else None,
+                http_status if isinstance(http_status, int) else None,
+                scope["id"],
+            ),
+        )
+        if event.payload.get("will_retry"):
+            suffix = (
+                f" `{retry_count}/{retry_limit}`"
+                if retry_count and isinstance(retry_limit, int)
+                else ""
+            )
+            self._project_progress(
+                connection,
+                scope,
+                sequence,
+                state="running",
+                content=f"Running · Codex reconnecting{suffix}",
+                now=now,
+            )
+        if event.payload.get("unknown_typed"):
+            self._record_incident(
+                connection,
+                severity="warning",
+                code="provider_error_type_unknown",
+                summary="Codex returned an unknown typed provider error",
+                project_id=str(scope["project_id"]),
+                conversation_id=str(scope["conversation_id"]),
+                turn_id=str(scope["id"]),
+                details={
+                    "typed_code_hash": sha256_text(
+                        str(event.payload.get("typed_code") or "unknown")
+                    ),
+                    "http_status": event.payload.get("http_status"),
+                },
+                now=now,
+            )
 
     def _project_policy_notice(
         self,
@@ -1340,6 +1403,7 @@ class ProjectingEventSink:
         sequence: int,
         target: TurnState,
         terminal_code: str,
+        event: NormalizedEvent,
         now: int,
     ) -> None:
         current = TurnState(scope["state"])
@@ -1349,12 +1413,68 @@ class ProjectingEventSink:
         connection.execute(
             """
             UPDATE turns
-            SET state = ?, terminal_code = ?, ended_at = ?,
+            SET state = ?, terminal_code = ?, error_code = ?, ended_at = ?,
+                provider_error_code = COALESCE(?, provider_error_code),
+                provider_error_underlying_code = COALESCE(?, provider_error_underlying_code),
+                provider_retry_count = MAX(provider_retry_count, ?),
+                provider_retry_limit = COALESCE(?, provider_retry_limit),
+                provider_http_status = COALESCE(?, provider_http_status),
                 queued_input_text = NULL, queued_skill_inputs_json = NULL
             WHERE id = ?
             """,
-            (target.value, terminal_code, now, scope["id"]),
+            (
+                target.value,
+                terminal_code,
+                terminal_code if target is TurnState.FAILED else None,
+                now,
+                event.payload.get("failure_code"),
+                event.payload.get("underlying_typed_code")
+                or event.payload.get("typed_code"),
+                int(event.payload.get("retry_count") or 0),
+                event.payload.get("retry_limit"),
+                event.payload.get("http_status"),
+                scope["id"],
+            ),
         )
+        if (
+            target is TurnState.FAILED
+            and scope["thread_revision_id"] is not None
+            and isinstance(event.payload.get("failure_fingerprint"), str)
+        ):
+            fingerprint = event.payload.get("failure_fingerprint")
+            connection.execute(
+                """
+                UPDATE thread_revisions
+                SET consecutive_failure_count = CASE
+                        WHEN degraded_fingerprint = ?
+                        THEN consecutive_failure_count + 1 ELSE 1 END,
+                    degraded_failure_code = ?, degraded_fingerprint = ?,
+                    first_failed_at = CASE
+                        WHEN degraded_fingerprint = ? THEN first_failed_at ELSE ? END,
+                    last_failed_at = ?
+                WHERE id = ?
+                """,
+                (
+                    fingerprint,
+                    terminal_code,
+                    fingerprint,
+                    fingerprint,
+                    now,
+                    now,
+                    scope["thread_revision_id"],
+                ),
+            )
+        elif target is TurnState.COMPLETED and scope["thread_revision_id"] is not None:
+            connection.execute(
+                """
+                UPDATE thread_revisions
+                SET degraded_failure_code = NULL, degraded_fingerprint = NULL,
+                    consecutive_failure_count = 0,
+                    first_failed_at = NULL, last_failed_at = NULL
+                WHERE id = ?
+                """,
+                (scope["thread_revision_id"],),
+            )
         self._volatile_turns.finalize(
             str(scope["id"]),
             fallback=_terminal_fallback(target),
@@ -1426,6 +1546,21 @@ class ProjectingEventSink:
                 "input_channel_id": input_channel_id,
                 "discord_guild_id": scope["discord_guild_id"],
                 "usage": usage,
+                "provider_error_code": event.payload.get("failure_code"),
+                "provider_error_underlying_code": (
+                    event.payload.get("underlying_typed_code")
+                    or event.payload.get("typed_code")
+                ),
+                "provider_retry_count": int(event.payload.get("retry_count") or 0),
+                "provider_retry_limit": event.payload.get("retry_limit"),
+                "provider_http_status": event.payload.get("http_status"),
+                "provider_safe_message": event.payload.get("safe_message"),
+                "provider_degraded": self._revision_is_degraded(
+                    connection,
+                    str(scope["thread_revision_id"])
+                    if scope["thread_revision_id"] is not None
+                    else None,
+                ),
                 "content_storage": "volatile",
             },
             dedupe_key=f"turn:{scope['id']}:final",
@@ -1434,6 +1569,19 @@ class ProjectingEventSink:
             depends_on_outbox_id=progress_outbox_id,
             now=now,
         )
+
+    @staticmethod
+    def _revision_is_degraded(
+        connection: sqlite3.Connection,
+        revision_id: str | None,
+    ) -> bool:
+        if revision_id is None:
+            return False
+        row = connection.execute(
+            "SELECT consecutive_failure_count FROM thread_revisions WHERE id = ?",
+            (revision_id,),
+        ).fetchone()
+        return bool(row is not None and int(row["consecutive_failure_count"]) >= 2)
 
     def _finalize_open_tasks(
         self,
@@ -1746,6 +1894,13 @@ def _durable_event_payload(event: NormalizedEvent) -> dict[str, Any]:
     if event.kind == "provider.error":
         result = {
             "will_retry": bool(payload.get("will_retry")),
+            "failure_code": payload.get("failure_code"),
+            "typed_code": payload.get("typed_code"),
+            "http_status": payload.get("http_status"),
+            "retry_count": payload.get("retry_count"),
+            "retry_limit": payload.get("retry_limit"),
+            "failure_fingerprint": payload.get("failure_fingerprint"),
+            "unknown_typed": bool(payload.get("unknown_typed")),
         }
         result.update(_content_metadata("message", payload.get("message")))
         return result
@@ -1758,6 +1913,13 @@ def _durable_event_payload(event: NormalizedEvent) -> dict[str, Any]:
         result = {
             "provider_turn_id": payload.get("provider_turn_id"),
             "status": payload.get("status"),
+            "failure_code": payload.get("failure_code"),
+            "typed_code": payload.get("typed_code"),
+            "http_status": payload.get("http_status"),
+            "retry_count": payload.get("retry_count"),
+            "retry_limit": payload.get("retry_limit"),
+            "failure_fingerprint": payload.get("failure_fingerprint"),
+            "unknown_typed": bool(payload.get("unknown_typed")),
         }
         result.update(_content_metadata("error", payload.get("error")))
         return result
@@ -1847,7 +2009,8 @@ def terminal_state_for_event(
     if event.kind == "turn.completed":
         return TurnState.COMPLETED, "provider_completed"
     if event.kind == "turn.failed":
-        return TurnState.FAILED, "provider_failed"
+        code = event.payload.get("failure_code")
+        return TurnState.FAILED, code if isinstance(code, str) else "provider_failed"
     if event.kind == "turn.interrupted":
         if interrupt_origin is InterruptOrigin.USER:
             return TurnState.CANCELLED, "user_interrupted"

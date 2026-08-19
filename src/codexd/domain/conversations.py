@@ -31,6 +31,14 @@ class RuntimeLeaseState(StrEnum):
     FAILED = "failed"
 
 
+class SafetyFenceReason(StrEnum):
+    PROVIDER_THREAD_IDENTITY_MISMATCH = "provider_thread_identity_mismatch"
+    PROVIDER_EFFECT_OUTCOME_UNKNOWN = "provider_effect_outcome_unknown"
+    PROVIDER_MUTATION_COMMIT_FAILED = "provider_mutation_commit_failed"
+    PROVIDER_ROLLOUT_MISSING_OR_CORRUPT = "provider_rollout_missing_or_corrupt"
+    PROVIDER_PROTOCOL_TERMINAL_UNPARSEABLE = "provider_protocol_terminal_unparseable"
+
+
 class SandboxProfile(StrEnum):
     FULL_ACCESS = "full_access"
     WORKSPACE_WRITE = "workspace_write"

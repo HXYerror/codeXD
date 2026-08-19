@@ -12,6 +12,7 @@ from codexd.application.conversation_locks import ConversationLocks
 from codexd.domain.conversations import (
     ApprovalPolicy,
     ConversationState,
+    SafetyFenceReason,
     SandboxProfile,
     ThreadConfig,
     ThreadIdentity,
@@ -176,6 +177,16 @@ class SessionLifecycleCoordinator:
         elif runtime_status["state"] in {"starting", "unhealthy"}:
             degraded_reason = f"runtime {runtime_status['state']}"
 
+        if (
+            revision is not None
+            and revision.consecutive_failure_count >= 2
+            and revision.degraded_failure_code is not None
+        ):
+            degraded_reason = (
+                f"revision degraded after {revision.consecutive_failure_count} "
+                f"matching failures ({revision.degraded_failure_code}); run /session new"
+            )
+
         behavior = _session_behavior(conversation, project, catalog)
         if degraded_reason is None and behavior.resolution in {
             "catalog incomplete",
@@ -260,8 +271,17 @@ class SessionLifecycleCoordinator:
     ) -> ThreadRevisionRecord:
         async with self._locks.hold(conversation_id):
             conversation, project, config = await self._context(
-                conversation_id, reject_active_schedules=False
+                conversation_id,
+                reject_active_schedules=False,
+                allow_safety_fence=True,
+                allow_provider_barrier=True,
             )
+            if conversation.state is ConversationState.BLOCKED:
+                await asyncio.to_thread(
+                    self._repository.prepare_explicit_session_recovery,
+                    conversation_id,
+                    action="session_new",
+                )
             runtime, _lease = await self._runtimes.ensure(project)
             await self._begin_provider_effect(
                 conversation.id,
@@ -302,8 +322,17 @@ class SessionLifecycleCoordinator:
     ) -> ThreadRevisionRecord:
         async with self._locks.hold(conversation_id):
             conversation, project, _current_config = await self._context(
-                conversation_id, reject_active_schedules=False
+                conversation_id,
+                reject_active_schedules=False,
+                allow_safety_fence=True,
+                allow_provider_barrier=True,
             )
+            if conversation.state is ConversationState.BLOCKED:
+                await asyncio.to_thread(
+                    self._repository.prepare_explicit_session_recovery,
+                    conversation_id,
+                    action="session_resume",
+                )
             target = await asyncio.to_thread(
                 self._repository.resolve_thread_revision,
                 conversation_id,
@@ -709,6 +738,14 @@ class SessionLifecycleCoordinator:
         def discard(completed: asyncio.Task[None]) -> None:
             if self._barrier_tasks.get(conversation_id) is completed:
                 self._barrier_tasks.pop(conversation_id, None)
+            if not self._closed and not completed.cancelled():
+                try:
+                    error = completed.exception()
+                except Exception:
+                    error = None
+                if error is not None:
+                    loop = completed.get_loop()
+                    loop.call_later(2, self.monitor_provider_barrier, conversation_id)
 
         task.add_done_callback(discard)
 
@@ -736,11 +773,6 @@ class SessionLifecycleCoordinator:
                     conversation_id=conversation_id,
                     details={"exception_type": type(exc).__name__},
                 )
-                await asyncio.to_thread(
-                    self._repository.block_conversation,
-                    conversation_id,
-                    reason="provider_barrier_monitor_failed",
-                )
             except Exception:
                 logger.exception(
                     "Could not persist provider barrier monitor failure",
@@ -759,6 +791,7 @@ class SessionLifecycleCoordinator:
                 await self._block_barrier(
                     conversation,
                     code="provider_effect_outcome_unknown",
+                    reason=SafetyFenceReason.PROVIDER_EFFECT_OUTCOME_UNKNOWN,
                 )
                 return
             revision = await asyncio.to_thread(
@@ -769,6 +802,7 @@ class SessionLifecycleCoordinator:
                 await self._block_barrier(
                     conversation,
                     code="provider_barrier_revision_missing",
+                    reason=SafetyFenceReason.PROVIDER_ROLLOUT_MISSING_OR_CORRUPT,
                 )
                 return
             project = await asyncio.to_thread(
@@ -777,7 +811,7 @@ class SessionLifecycleCoordinator:
             )
             config = _decode_thread_config(revision.thread_config_json)
             try:
-                runtime, _lease = await self._runtimes.ensure(project)
+                runtime, lease = await self._runtimes.ensure(project)
                 try:
                     snapshot = await runtime.read_thread(
                         revision.provider_thread_id
@@ -809,12 +843,8 @@ class SessionLifecycleCoordinator:
                 if exc.failure.retryable:
                     await asyncio.sleep(2)
                     continue
-                await asyncio.to_thread(
-                    self._repository.block_conversation,
-                    conversation_id,
-                    reason="provider_barrier_observation_failed",
-                )
-                return
+                await asyncio.sleep(2)
+                continue
             if snapshot.state is ThreadProviderState.IDLE:
                 await asyncio.to_thread(
                     self._repository.resolve_idle_provider_barrier,
@@ -849,15 +879,27 @@ class SessionLifecycleCoordinator:
                         conversation_id=conversation_id,
                         details={"adapter_code": exc.failure.code},
                     )
-                    if not exc.failure.retryable:
-                        await asyncio.to_thread(
-                            self._repository.block_conversation,
-                            conversation_id,
-                            reason="provider_barrier_resume_failed",
-                        )
-                        return
                 await asyncio.sleep(1)
                 continue
+            if snapshot.state is ThreadProviderState.SYSTEM_ERROR:
+                retired = await self._runtimes.retire(
+                    project,
+                    expected_lease_id=lease.id,
+                    expected_generation=lease.generation,
+                    reason="provider_barrier_system_error",
+                )
+                if retired:
+                    await asyncio.sleep(0)
+                else:
+                    await asyncio.sleep(1)
+                continue
+            if snapshot.state is ThreadProviderState.UNKNOWN:
+                await self._block_barrier(
+                    conversation,
+                    code="provider_protocol_terminal_unparseable",
+                    reason=SafetyFenceReason.PROVIDER_PROTOCOL_TERMINAL_UNPARSEABLE,
+                )
+                return
             await self._block_barrier(
                 conversation,
                 code=f"provider_barrier_{snapshot.state.value}",
@@ -869,6 +911,7 @@ class SessionLifecycleCoordinator:
         conversation: ConversationRecord,
         *,
         code: str,
+        reason: SafetyFenceReason = SafetyFenceReason.PROVIDER_MUTATION_COMMIT_FAILED,
     ) -> None:
         await asyncio.to_thread(
             self._repository.record_incident,
@@ -879,9 +922,11 @@ class SessionLifecycleCoordinator:
             conversation_id=conversation.id,
         )
         await asyncio.to_thread(
-            self._repository.block_conversation,
+            self._repository.fence_conversation,
             conversation.id,
-            reason=code,
+            reason=reason,
+            summary="Provider session requires safety recovery",
+            details={"cause_code": code},
         )
 
     async def model_catalog(self, conversation_id: str) -> ModelCatalogSnapshot:
@@ -1139,17 +1184,29 @@ class SessionLifecycleCoordinator:
         conversation_id: str,
         *,
         reject_active_schedules: bool,
+        allow_safety_fence: bool = False,
+        allow_provider_barrier: bool = False,
     ) -> tuple[ConversationRecord, ProjectRecord, ThreadConfig]:
+        conversation = await asyncio.to_thread(
+            self._repository.get_conversation, conversation_id
+        )
+        if conversation.state is ConversationState.DELETED:
+            raise InvariantError("Conversation is deleted")
+        if conversation.state is ConversationState.BLOCKED and not allow_safety_fence:
+            reason = conversation.recovery_reason or "unknown"
+            raise InvariantError(
+                "Safety recovery required: "
+                f"{reason}. Run `/session new` or `/session resume`."
+            )
+        if conversation.provider_barrier_kind is not None and not allow_provider_barrier:
+            raise InvariantError("Conversation has an active provider barrier")
         await asyncio.to_thread(
             self._repository.assert_conversation_mutable,
             conversation_id,
             reject_active_schedules=reject_active_schedules,
+            allow_safety_fence=allow_safety_fence,
+            allow_provider_barrier=allow_provider_barrier,
         )
-        conversation = await asyncio.to_thread(
-            self._repository.get_conversation, conversation_id
-        )
-        if conversation.state is ConversationState.BLOCKED:
-            raise InvariantError("Conversation is blocked pending operator recovery")
         project = await asyncio.to_thread(
             self._repository.get_project, conversation.project_id
         )
@@ -1226,18 +1283,15 @@ class SessionLifecycleCoordinator:
                     "The provider mutation may have completed, but codexD could "
                     "not commit a deterministic local outcome."
                 ),
-                block_conversation=True,
             )
         except Exception as exc:
             failures.append(exc)
         try:
             await asyncio.to_thread(
-                self._repository.record_incident,
-                severity="critical",
-                code="provider_effect_outcome_unknown",
+                self._repository.fence_conversation,
+                conversation.id,
+                reason=SafetyFenceReason.PROVIDER_EFFECT_OUTCOME_UNKNOWN,
                 summary="Provider mutation outcome could not be committed safely",
-                project_id=conversation.project_id,
-                conversation_id=conversation.id,
                 details={"operation": operation},
             )
         except Exception as exc:
@@ -1297,18 +1351,11 @@ class SessionLifecycleCoordinator:
         details: Mapping[str, str | None],
     ) -> None:
         await asyncio.to_thread(
-            self._repository.record_incident,
-            severity="critical",
-            code=code,
-            summary="Provider session mutation succeeded but local commit failed",
-            project_id=conversation.project_id,
-            conversation_id=conversation.id,
-            details=details,
-        )
-        await asyncio.to_thread(
-            self._repository.block_conversation,
+            self._repository.fence_conversation,
             conversation.id,
-            reason=code,
+            reason=SafetyFenceReason.PROVIDER_MUTATION_COMMIT_FAILED,
+            summary="Provider session mutation succeeded but local commit failed",
+            details={"cause_code": code, **details},
         )
 
     async def _validate_identity(
@@ -1348,9 +1395,22 @@ class SessionLifecycleCoordinator:
             },
         )
         await asyncio.to_thread(
-            self._repository.block_conversation,
+            self._repository.fence_conversation,
             conversation_id,
-            reason="provider_thread_identity_mismatch",
+            reason=SafetyFenceReason.PROVIDER_THREAD_IDENTITY_MISMATCH,
+            summary="Provider returned an unexpected Thread identity",
+            details={
+                "expected_thread_hash": sha256_text(
+                    revision.provider_thread_id
+                )[:16],
+                "actual_thread_hash": sha256_text(identity.thread_id)[:16],
+                "expected_session_hash": sha256_text(
+                    revision.provider_session_id
+                )[:16],
+                "actual_session_hash": sha256_text(
+                    identity.provider_session_id
+                )[:16],
+            },
         )
         raise InvariantError("provider resumed a different thread identity")
 

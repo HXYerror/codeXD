@@ -11,9 +11,11 @@ from codexd.application.conversation_locks import ConversationLocks
 from codexd.application.volatile_turns import VolatileTurnStore
 from codexd.domain.conversations import (
     ApprovalPolicy,
+    SafetyFenceReason,
     ThreadConfig,
     ThreadIdentity,
     ThreadProviderState,
+    ThreadSnapshot,
     TurnConfig,
     WebSearchMode,
 )
@@ -25,6 +27,7 @@ from codexd.errors import (
     ConflictError,
     InvariantError,
     NotFoundError,
+    ProviderThreadRecoveryRequired,
     SecurityError,
 )
 from codexd.runtime.errors import (
@@ -55,6 +58,7 @@ class ActiveTurn:
 
 
 _PROVIDER_CLEANUP_TIMEOUT_SECONDS = 5.0
+_SYSTEM_ERROR_RECOVERY_ATTEMPTS = 2
 
 
 class TurnCoordinator:
@@ -409,11 +413,6 @@ class TurnCoordinator:
         except (SecurityError, InvariantError) as exc:
             if self._closing:
                 return None
-            await asyncio.to_thread(
-                self._repository.block_conversation,
-                conversation.id,
-                reason=getattr(exc, "code", "runtime_configuration_invalid"),
-            )
             await self._terminal_before_provider(
                 queued,
                 project,
@@ -554,20 +553,43 @@ class TurnCoordinator:
                         )
                         self._provider_barrier_observer(conversation.id)
                         return 2.0
-                if snapshot.state in {
-                    ThreadProviderState.SYSTEM_ERROR,
-                    ThreadProviderState.UNKNOWN,
-                }:
+                if snapshot.state is ThreadProviderState.SYSTEM_ERROR:
+                    recovered = await self._recover_system_error_thread(
+                        conversation_id=conversation.id,
+                        project=project,
+                        revision=revision,
+                        config=thread_config,
+                        stale_lease=lease,
+                    )
+                    if recovered is None:
+                        if queued.source_kind is TurnSource.SCHEDULE:
+                            await asyncio.to_thread(
+                                self._repository.terminal_turn,
+                                queued.id,
+                                target=TurnState.INTERRUPTED,
+                                terminal_code="provider_thread_systemError",
+                                error_code="provider_thread_systemError",
+                            )
+                            return None
+                        raise ProviderThreadRecoveryRequired(
+                            "Provider Thread remained in systemError after bounded recovery"
+                        )
+                    runtime, lease, revision, snapshot = recovered
+                    thread_identity = snapshot.identity
+                if snapshot.state is ThreadProviderState.UNKNOWN:
                     await asyncio.to_thread(
-                        self._repository.block_conversation,
+                        self._repository.fence_conversation,
                         conversation.id,
-                        reason=f"provider_thread_{snapshot.state.value}",
+                        reason=(
+                            SafetyFenceReason.PROVIDER_PROTOCOL_TERMINAL_UNPARSEABLE
+                        ),
+                        summary="Codex returned an unrecognized Thread terminal state",
                     )
                     await asyncio.to_thread(
                         self._repository.terminal_turn,
                         queued.id,
                         target=TurnState.INTERRUPTED,
-                        terminal_code=f"provider_thread_{snapshot.state.value}",
+                        terminal_code="provider_thread_unknown",
                     )
                     return None
                 if conversation.provider_barrier_kind == "external_active":
@@ -586,6 +608,8 @@ class TurnCoordinator:
                     failure_code=exc.failure.code,
                 )
             return None
+        except ProviderThreadRecoveryRequired:
+            return 5.0
         except (ConflictError, InvariantError) as exc:
             await self._terminal_before_provider(
                 queued, project, getattr(exc, "code", "thread_identity_error")
@@ -930,11 +954,111 @@ class TurnCoordinator:
         if not mismatch:
             return
         await asyncio.to_thread(
-            self._repository.block_conversation,
+            self._repository.fence_conversation,
             conversation_id,
-            reason="provider_thread_identity_mismatch",
+            reason=SafetyFenceReason.PROVIDER_THREAD_IDENTITY_MISMATCH,
+            summary="Provider returned an unexpected Thread identity",
         )
         raise InvariantError("provider resumed a different Thread identity")
+
+    async def _recover_system_error_thread(
+        self,
+        *,
+        conversation_id: str,
+        project: ProjectRecord,
+        revision: ThreadRevisionRecord,
+        config: ThreadConfig,
+        stale_lease: RuntimeLeaseRecord,
+    ) -> tuple[
+        CodexRuntime,
+        RuntimeLeaseRecord,
+        ThreadRevisionRecord,
+        ThreadSnapshot,
+    ] | None:
+        await asyncio.to_thread(
+            self._repository.begin_provider_thread_recovery,
+            conversation_id,
+        )
+        try:
+            await self._runtime_supervisor.retire(
+                project,
+                expected_lease_id=stale_lease.id,
+                expected_generation=stale_lease.generation,
+                reason="provider_thread_system_error",
+            )
+            for _attempt in range(_SYSTEM_ERROR_RECOVERY_ATTEMPTS):
+                runtime, lease = await self._runtime_supervisor.ensure(project)
+                identity = await runtime.resume_thread(
+                    thread_id=revision.provider_thread_id,
+                    cwd=project.root_path,
+                    config=config,
+                )
+                await self._validate_revision_identity(
+                    conversation_id,
+                    revision,
+                    identity,
+                    require_requested_id=True,
+                )
+                snapshot = await runtime.read_thread(identity.thread_id)
+                await self._validate_revision_identity(
+                    conversation_id,
+                    revision,
+                    snapshot.identity,
+                    require_requested_id=False,
+                )
+                if snapshot.state is ThreadProviderState.IDLE:
+                    revision = await asyncio.to_thread(
+                        self._repository.activate_thread_revision,
+                        conversation_id=conversation_id,
+                        identity=identity,
+                        config=config,
+                    )
+                    return runtime, lease, revision, snapshot
+                if snapshot.state is ThreadProviderState.ACTIVE:
+                    await asyncio.to_thread(
+                        self._repository.set_provider_barrier,
+                        conversation_id,
+                        "external_active",
+                    )
+                    self._provider_barrier_observer(conversation_id)
+                    return None
+                if snapshot.state is ThreadProviderState.UNKNOWN:
+                    await asyncio.to_thread(
+                        self._repository.fence_conversation,
+                        conversation_id,
+                        reason=(
+                            SafetyFenceReason.PROVIDER_PROTOCOL_TERMINAL_UNPARSEABLE
+                        ),
+                        summary="Codex returned an unrecognized Thread terminal state",
+                    )
+                    return None
+                retired = await self._runtime_supervisor.retire(
+                    project,
+                    expected_lease_id=lease.id,
+                    expected_generation=lease.generation,
+                    reason="provider_thread_system_error_repeated",
+                )
+                if not retired:
+                    break
+            await asyncio.to_thread(
+                self._repository.record_incident,
+                severity="warning",
+                code="provider_thread_system_error_persistent",
+                summary=(
+                    "Provider Thread remained in systemError after bounded recovery"
+                ),
+                project_id=project.id,
+                conversation_id=conversation_id,
+                details={"recovery_attempts": _SYSTEM_ERROR_RECOVERY_ATTEMPTS},
+            )
+            return None
+        finally:
+            await asyncio.shield(
+                asyncio.to_thread(
+                    self._repository.end_provider_thread_recovery,
+                    conversation_id,
+                )
+            )
 
     @staticmethod
     def _validate_started_turn_identity(
@@ -1031,9 +1155,11 @@ class TurnCoordinator:
         failures: list[Exception] = []
         try:
             await asyncio.to_thread(
-                self._repository.block_conversation,
+                self._repository.fence_conversation,
                 conversation_id,
-                reason="provider_effect_outcome_unknown",
+                reason=SafetyFenceReason.PROVIDER_EFFECT_OUTCOME_UNKNOWN,
+                summary="Provider mutation outcome could not be committed safely",
+                details={"operation": operation},
             )
         except Exception as exc:
             failures.append(exc)

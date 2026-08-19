@@ -18,6 +18,7 @@ from codexd.domain.conversations import (
     SandboxProfile,
     ThreadConfig,
     ThreadIdentity,
+    ThreadProviderState,
     TurnConfig,
 )
 from codexd.domain.events import NormalizedEvent
@@ -1035,6 +1036,161 @@ async def test_stale_failure_does_not_close_replacement_generation(
         assert not runtimes[lease_two.generation].closed
         assert runtime_one is runtimes[lease_one.generation]
     finally:
+        await supervisor.close()
+
+
+@pytest.mark.asyncio
+async def test_exact_runtime_retire_ignores_stale_generation(
+    storage_context: StorageContext,
+) -> None:
+    runtimes: dict[int, FakeCodexRuntime] = {}
+
+    async def factory(_slot: object, generation: int) -> FakeCodexRuntime:
+        runtime = FakeCodexRuntime(generation=generation)
+        runtimes[generation] = runtime
+        return runtime
+
+    supervisor = _runtime_supervisor(storage_context, factory)
+    runtime_one, lease_one = await supervisor.ensure(storage_context.project)
+    assert await supervisor.retire(
+        storage_context.project,
+        expected_lease_id=lease_one.id,
+        expected_generation=lease_one.generation,
+        reason="test_recovery",
+    )
+    runtime_two, lease_two = await supervisor.ensure(storage_context.project)
+    try:
+        assert runtime_one.closed
+        assert lease_two.generation > lease_one.generation
+        assert not await supervisor.retire(
+            storage_context.project,
+            expected_lease_id=lease_one.id,
+            expected_generation=lease_one.generation,
+            reason="stale_recovery",
+        )
+        assert runtime_two is runtimes[lease_two.generation]
+        assert not runtime_two.closed
+    finally:
+        await supervisor.close()
+
+
+@pytest.mark.asyncio
+async def test_system_error_retires_stale_runtime_and_continues_queued_turn(
+    storage_context: StorageContext,
+) -> None:
+    config = storage_context.repository.effective_thread_config(
+        storage_context.conversation.id
+    )
+    seed = FakeCodexRuntime()
+    identity = await seed.start_thread(cwd=storage_context.root, config=config)
+    storage_context.repository.activate_thread_revision(
+        conversation_id=storage_context.conversation.id,
+        identity=identity,
+        config=config,
+    )
+
+    class RecoveryRuntime(FakeCodexRuntime):
+        def __init__(self, generation: int, *, stale: bool) -> None:
+            super().__init__(generation=generation)
+            self._threads[identity.thread_id] = identity
+            self._thread_states[identity.thread_id] = (
+                ThreadProviderState.SYSTEM_ERROR
+                if stale
+                else ThreadProviderState.IDLE
+            )
+
+    created: list[RecoveryRuntime] = []
+
+    async def factory(_slot: object, generation: int) -> RecoveryRuntime:
+        runtime = RecoveryRuntime(generation, stale=not created)
+        created.append(runtime)
+        return runtime
+
+    supervisor = _runtime_supervisor(storage_context, factory)
+    coordinator = _turn_coordinator(storage_context, supervisor)
+    try:
+        turn = await coordinator.enqueue(
+            conversation_id=storage_context.conversation.id,
+            source=TurnSource.DISCORD,
+            turn_input=TurnInput(text="recover stale runtime"),
+            input_message_id="recover-stale-runtime",
+        )
+        terminal = await _wait_for_terminal(storage_context, turn.id)
+        conversation = storage_context.repository.get_conversation(
+            storage_context.conversation.id
+        )
+
+        assert terminal.state is TurnState.COMPLETED
+        assert len(created) == 2
+        assert created[0].closed
+        assert not created[1].closed
+        assert conversation.state is ConversationState.ACTIVE
+        assert conversation.provider_recovery_state is None
+    finally:
+        await coordinator.close(drain_seconds=1)
+        await supervisor.close()
+
+
+@pytest.mark.asyncio
+async def test_persistent_system_error_keeps_discord_turn_pending(
+    storage_context: StorageContext,
+) -> None:
+    config = storage_context.repository.effective_thread_config(
+        storage_context.conversation.id
+    )
+    seed = FakeCodexRuntime()
+    identity = await seed.start_thread(cwd=storage_context.root, config=config)
+    storage_context.repository.activate_thread_revision(
+        conversation_id=storage_context.conversation.id,
+        identity=identity,
+        config=config,
+    )
+
+    class BrokenRuntime(FakeCodexRuntime):
+        def __init__(self, generation: int) -> None:
+            super().__init__(generation=generation)
+            self._threads[identity.thread_id] = identity
+            self._thread_states[identity.thread_id] = ThreadProviderState.SYSTEM_ERROR
+
+    async def factory(_slot: object, generation: int) -> BrokenRuntime:
+        return BrokenRuntime(generation)
+
+    supervisor = _runtime_supervisor(storage_context, factory)
+    coordinator = _turn_coordinator(storage_context, supervisor)
+    try:
+        turn = await coordinator.enqueue(
+            conversation_id=storage_context.conversation.id,
+            source=TurnSource.DISCORD,
+            turn_input=TurnInput(text="wait for recovery"),
+            input_message_id="persistent-system-error",
+        )
+        for _ in range(200):
+            current = storage_context.repository.get_turn(turn.id)
+            conversation = storage_context.repository.get_conversation(
+                storage_context.conversation.id
+            )
+            incident = storage_context.store.query_one(
+                """
+                SELECT 1 FROM incidents
+                WHERE conversation_id = ?
+                  AND code = 'provider_thread_system_error_persistent'
+                """,
+                (storage_context.conversation.id,),
+            )
+            if (
+                current.state is TurnState.QUEUED
+                and conversation.provider_recovery_state is None
+                and incident is not None
+            ):
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("persistent systemError recovery did not settle")
+        assert current.state is TurnState.QUEUED
+        assert conversation.state is ConversationState.ACTIVE
+        assert conversation.provider_recovery_state is None
+    finally:
+        await coordinator.close(drain_seconds=0.1)
         await supervisor.close()
 
 

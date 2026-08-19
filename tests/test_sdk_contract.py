@@ -33,9 +33,17 @@ from openai_codex import (
     TransportClosedError,
 )
 from openai_codex.generated.v2_all import (
+    CodexErrorInfo,
+    CodexErrorInfoValue,
+    ErrorNotification,
     ReasoningSummaryPartAddedNotification,
+    ResponseStreamDisconnected,
+    ResponseStreamDisconnectedCodexErrorInfo,
+    ResponseTooManyFailedAttempts,
+    ResponseTooManyFailedAttemptsCodexErrorInfo,
     Turn,
     TurnCompletedNotification,
+    TurnError,
 )
 from openai_codex.models import Notification, UnknownNotification
 from openai_codex.types import TurnStatus
@@ -937,6 +945,114 @@ def test_known_turn_notification_is_normalized() -> None:
 
     assert event.kind == "turn.completed"
     assert event.payload["provider_turn_id"] == "provider-turn"
+
+
+@pytest.mark.parametrize(
+    ("typed", "expected"),
+    [
+        (CodexErrorInfoValue.context_window_exceeded, "provider_context_window_exceeded"),
+        (CodexErrorInfoValue.session_budget_exceeded, "provider_session_budget_exceeded"),
+        (CodexErrorInfoValue.usage_limit_exceeded, "provider_usage_limit_exceeded"),
+        (CodexErrorInfoValue.server_overloaded, "provider_overloaded"),
+        (CodexErrorInfoValue.cyber_policy, "provider_policy_blocked"),
+        (CodexErrorInfoValue.internal_server_error, "provider_internal_error"),
+        (CodexErrorInfoValue.unauthorized, "provider_unauthorized"),
+        (CodexErrorInfoValue.bad_request, "provider_bad_request"),
+        (CodexErrorInfoValue.thread_rollback_failed, "provider_thread_rollback_failed"),
+        (CodexErrorInfoValue.sandbox_error, "provider_sandbox_error"),
+        (CodexErrorInfoValue.other, "provider_failed"),
+    ],
+)
+def test_all_scalar_codex_error_info_variants_are_stable(
+    typed: CodexErrorInfoValue,
+    expected: str,
+) -> None:
+    error = TurnError(message="safe", codexErrorInfo=CodexErrorInfo(root=typed))
+    event = _normalize_notification(
+        Notification(
+            "error",
+            ErrorNotification(
+                error=error,
+                threadId="thread",
+                turnId="turn",
+                willRetry=False,
+            ),
+        ),
+        cwd=Path("/workspace"),
+    )
+
+    assert event.payload["failure_code"] == expected
+    assert event.payload["typed_code"] == typed.value
+
+
+def test_transport_error_preserves_http_retry_and_safe_message() -> None:
+    project = Path("/workspace/project")
+    error = TurnError(
+        message=(
+            "Reconnecting... 5/5 Authorization: Bearer secret-value "
+            "at /private/elsewhere/file <@123> @everyone\x00"
+        ),
+        codexErrorInfo=CodexErrorInfo(
+            root=ResponseStreamDisconnectedCodexErrorInfo(
+                responseStreamDisconnected=ResponseStreamDisconnected(
+                    httpStatusCode=502
+                )
+            )
+        ),
+    )
+    event = _normalize_notification(
+        Notification(
+            "error",
+            ErrorNotification(
+                error=error,
+                threadId="thread",
+                turnId="turn",
+                willRetry=False,
+            ),
+        ),
+        cwd=project,
+    )
+
+    assert event.payload["failure_code"] == "provider_stream_disconnected"
+    assert event.payload["http_status"] == 502
+    assert (event.payload["retry_count"], event.payload["retry_limit"]) == (5, 5)
+    safe = str(event.payload["safe_message"])
+    assert "secret-value" not in safe
+    assert "/private/elsewhere" not in safe
+    assert "<@123>" not in safe
+    assert "@everyone" not in safe
+    assert "\x00" not in safe
+
+
+def test_retry_exhausted_variant_is_stable() -> None:
+    error = TurnError(
+        message="failed after reconnects",
+        codexErrorInfo=CodexErrorInfo(
+            root=ResponseTooManyFailedAttemptsCodexErrorInfo(
+                responseTooManyFailedAttempts=ResponseTooManyFailedAttempts(
+                    httpStatusCode=503
+                )
+            )
+        ),
+    )
+    event = _normalize_notification(
+        Notification(
+            "error",
+            ErrorNotification(
+                error=error,
+                threadId="thread",
+                turnId="turn",
+                willRetry=False,
+            ),
+        ),
+        cwd=Path("/workspace"),
+        retry_count=5,
+        retry_limit=5,
+    )
+
+    assert event.payload["failure_code"] == "provider_retry_exhausted"
+    assert event.payload["http_status"] == 503
+    assert (event.payload["retry_count"], event.payload["retry_limit"]) == (5, 5)
 
 
 def test_unknown_notification_is_hashed_not_persisted_raw() -> None:

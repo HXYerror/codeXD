@@ -77,6 +77,7 @@ from codexd.domain.models import (
     ModelDescriptor,
     ServiceTierDescriptor,
 )
+from codexd.domain.provider_failures import classify_provider_failure
 from codexd.domain.turns import MaterializedTurnFile, TurnIdentity, TurnInput
 from codexd.errors import AttachmentIntegrityError, InvariantError, NotFoundError
 from codexd.runtime.app_server import (
@@ -845,6 +846,9 @@ class CodexSDKRuntime:
 
         async def iterator() -> AsyncIterator[NormalizedEvent]:
             terminal_seen = False
+            retry_count = 0
+            retry_limit: int | None = None
+            last_retry_failure: dict[str, object] | None = None
             try:
                 async for notification in handle.stream():
                     _assert_notification_route(
@@ -867,7 +871,39 @@ class CodexSDKRuntime:
                         and isinstance(notification.payload, UnknownNotification)
                     )
                     agent_thread_id = _subagent_thread_id(notification)
-                    event = _normalize_notification(notification, cwd=config.cwd)
+                    event = _normalize_notification(
+                        notification,
+                        cwd=config.cwd,
+                        retry_count=retry_count,
+                        retry_limit=retry_limit,
+                    )
+                    if event.kind == "provider.error":
+                        retry_count = max(
+                            retry_count,
+                            int(event.payload.get("retry_count") or 0),
+                        )
+                        raw_limit = event.payload.get("retry_limit")
+                        if isinstance(raw_limit, int):
+                            retry_limit = max(retry_limit or 0, raw_limit)
+                        if event.payload.get("will_retry"):
+                            last_retry_failure = dict(event.payload)
+                    elif event.kind == "turn.failed" and last_retry_failure is not None:
+                        terminal_typed = event.payload.get("typed_code")
+                        if terminal_typed == "responseTooManyFailedAttempts":
+                            event = replace(
+                                event,
+                                payload={
+                                    **event.payload,
+                                    "failure_code": last_retry_failure.get(
+                                        "failure_code",
+                                        event.payload.get("failure_code"),
+                                    ),
+                                    "underlying_typed_code": last_retry_failure.get(
+                                        "typed_code"
+                                    ),
+                                    "retry_exhausted": True,
+                                },
+                            )
                     if agent_thread_id is not None:
                         detail = await self._subagent_detail(
                             agent_thread_id=agent_thread_id,
@@ -1034,7 +1070,10 @@ class CodexSDKRuntime:
                         expected_turn_id=handle.id,
                         generation=self.generation,
                     )
-                    event = _normalize_notification(notification, cwd=turn_config.cwd)
+                    event = _normalize_notification(
+                        notification,
+                        cwd=turn_config.cwd,
+                    )
                     terminal = event.kind in {
                         "turn.completed",
                         "turn.failed",
@@ -2097,8 +2136,19 @@ def _thread_identity(
     )
 
 
-def _normalize_notification(notification: Notification, *, cwd: Path) -> NormalizedEvent:
-    event = _normalize_notification_unredacted(notification, cwd=cwd)
+def _normalize_notification(
+    notification: Notification,
+    *,
+    cwd: Path,
+    retry_count: int = 0,
+    retry_limit: int | None = None,
+) -> NormalizedEvent:
+    event = _normalize_notification_unredacted(
+        notification,
+        cwd=cwd,
+        retry_count=retry_count,
+        retry_limit=retry_limit,
+    )
     payload = (
         dict(event.payload)
         if event.kind == "usage.updated"
@@ -2377,6 +2427,8 @@ def _normalize_notification_unredacted(
     notification: Notification,
     *,
     cwd: Path,
+    retry_count: int = 0,
+    retry_limit: int | None = None,
 ) -> NormalizedEvent:
     method = notification.method
     # The SDK models method/payload correlation at runtime, but its type is an
@@ -2428,6 +2480,12 @@ def _normalize_notification_unredacted(
             TurnStatus.interrupted.value: "turn.interrupted",
         }.get(status, "turn.terminal_unparseable")
         error = payload.turn.error
+        failure = classify_provider_failure(
+            error,
+            project_root=cwd,
+            retry_count=retry_count,
+            retry_limit=retry_limit,
+        )
         return NormalizedEvent(
             kind,
             {
@@ -2438,6 +2496,7 @@ def _normalize_notification_unredacted(
                     if error
                     else None
                 ),
+                **(failure.payload() if error is not None else {}),
             },
             provider_event_id=f"turn:{payload.turn.id}:completed",
             raw_type=method,
@@ -2520,11 +2579,18 @@ def _normalize_notification_unredacted(
             raw_type=method,
         )
     if method == "error":
+        failure = classify_provider_failure(
+            payload.error,
+            project_root=cwd,
+            retry_count=retry_count,
+            retry_limit=retry_limit,
+        )
         return NormalizedEvent(
             "provider.error",
             {
                 "message": _bounded(redact_text(payload.error.message, project_root=cwd)),
                 "will_retry": payload.will_retry,
+                **failure.payload(),
             },
             raw_type=method,
         )

@@ -107,6 +107,12 @@ _DISCORD_BROADCAST_MENTION = re.compile(
     r"@(?:everyone|here)(?![A-Za-z0-9_])",
     re.IGNORECASE,
 )
+_ABSOLUTE_POSIX_PATH = re.compile(
+    r"(?<![A-Za-z0-9_.<>-])/(?:[^/\s]+/)+[^/\s,;:]+"
+)
+_ABSOLUTE_WINDOWS_PATH = re.compile(
+    r"(?i)(?<![A-Za-z0-9_])[A-Z]:\\(?:[^\\\s]+\\)*[^\\\s,;:]+"
+)
 _NON_TEXT_SUMMARY = "[non-text input]"
 _THREAD_TITLE_SUMMARY_MAX_CHARS = 72
 _DIFF_PATH_HEADER = re.compile(
@@ -162,7 +168,11 @@ def redacted_summary(
 ) -> str:
     if max_chars < 4:
         raise ValueError("max_chars must be at least 4")
-    summary = " ".join(redact_text(value, project_root=project_root).split())
+    redacted = redact_text(value, project_root=project_root)
+    redacted = _strip_discord_mentions(redacted)
+    redacted = _ABSOLUTE_WINDOWS_PATH.sub("<path>", redacted)
+    redacted = _ABSOLUTE_POSIX_PATH.sub("<path>", redacted)
+    summary = " ".join(redacted.split())
     if not summary:
         return _NON_TEXT_SUMMARY
     return _truncate_summary(summary, max_chars)

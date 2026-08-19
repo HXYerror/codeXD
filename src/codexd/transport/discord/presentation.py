@@ -138,6 +138,14 @@ def session_status_embed(
     embed.add_field(name="Session", value="\n".join(session_lines), inline=False)
 
     execution_lines = ["**FULL ACCESS** · `auto_review`"]
+    if conversation.recovery_reason is not None:
+        execution_lines.append(
+            "🛡️ Safety recovery required `"
+            + _safe_plain(conversation.recovery_reason, 96)
+            + "` · run `/session new` or `/session resume`"
+        )
+    if conversation.provider_recovery_state is not None:
+        execution_lines.append("⏳ Provider Thread recovery in progress")
     if conversation.provider_barrier_kind is not None:
         execution_lines.append(
             "⚠️ Provider barrier `"

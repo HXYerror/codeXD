@@ -350,6 +350,51 @@ class RuntimeSupervisor:
             failure_code=failure_code,
         )
 
+    async def retire(
+        self,
+        project: ProjectRecord,
+        *,
+        expected_lease_id: str,
+        expected_generation: int,
+        reason: str,
+    ) -> bool:
+        """Retire exactly one loaded runtime generation without crash backoff."""
+
+        key = project.id if self._topology == "project_scoped" else "shared"
+        slot = await self._slot(key)
+        async with slot.lock:
+            runtime = slot.runtime
+            lease = slot.lease
+            if runtime is None or lease is None:
+                return False
+            if (
+                lease.id != expected_lease_id
+                or lease.generation != expected_generation
+            ):
+                return False
+            try:
+                await self._close_ready_slot(
+                    slot,
+                    deadline=time.monotonic() + _RUNTIME_CLOSE_TIMEOUT_SECONDS,
+                )
+            except BaseException:
+                await asyncio.to_thread(
+                    self._repository.record_incident,
+                    severity="error",
+                    code="runtime_retire_failed",
+                    summary="Codex runtime could not be retired for recovery",
+                    project_id=(
+                        project.id if self._topology == "project_scoped" else None
+                    ),
+                    details={
+                        "generation": expected_generation,
+                        "reason": reason,
+                    },
+                )
+                raise
+            slot.retry_at = 0
+            return True
+
     async def _report_failure_for_key(
         self,
         key: str,

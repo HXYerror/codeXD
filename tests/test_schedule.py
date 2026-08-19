@@ -14,6 +14,7 @@ from codexd.application.schedule_coordinator import (
     parse_schedule_spec,
 )
 from codexd.domain.conversations import (
+    SafetyFenceReason,
     SandboxProfile,
     ThreadConfig,
     ThreadIdentity,
@@ -1079,9 +1080,10 @@ def test_target_unavailable_materialization_blocks_atomically(
         next_due_at=60_000,
         created_by_user_id=400,
     )
-    storage_context.repository.block_conversation(
+    storage_context.repository.fence_conversation(
         storage_context.conversation.id,
-        reason="test_target_unavailable",
+        reason=SafetyFenceReason.PROVIDER_ROLLOUT_MISSING_OR_CORRUPT,
+        summary="Test target is unavailable",
     )
 
     result = repository.materialize(

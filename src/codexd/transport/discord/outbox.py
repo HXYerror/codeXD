@@ -710,8 +710,16 @@ class DiscordOutboxTransport:
             )
         )
         failure_guidance = _attachment_failure_guidance(payload.get("terminal_code"))
+        provider_guidance = _provider_failure_guidance(payload)
+        recovery_guidance = _provider_thread_recovery_guidance(
+            payload.get("terminal_code")
+        )
         if failure_guidance is not None:
             visible_text += f"\n\n{failure_guidance}"
+        if provider_guidance is not None:
+            visible_text += f"\n\n{provider_guidance}"
+        if recovery_guidance is not None:
+            visible_text += f"\n\n{recovery_guidance}"
         raw_outbound_records = await asyncio.to_thread(
             self._repository.registered_outbound_images,
             turn_id,
@@ -1820,6 +1828,63 @@ def _attachment_failure_guidance(value: object) -> str | None:
         ),
     }
     return archive_messages.get(code)
+
+
+def _provider_failure_guidance(payload: Mapping[str, object]) -> str | None:
+    code = payload.get("provider_error_code")
+    if not isinstance(code, str) or not code.startswith("provider_"):
+        return None
+    messages = {
+        "provider_stream_disconnected": "Provider stream disconnected before completion.",
+        "provider_stream_connection_failed": "Provider stream connection failed.",
+        "provider_retry_exhausted": "Codex exhausted its provider reconnect attempts.",
+        "provider_connection_failed": "Provider connection failed.",
+        "provider_overloaded": "The provider is overloaded; retry later.",
+        "provider_context_window_exceeded": (
+            "The session context limit was exceeded; run `/session compact` or `/session new`."
+        ),
+        "provider_session_budget_exceeded": "The provider session budget was exceeded.",
+        "provider_usage_limit_exceeded": "The provider usage limit was exceeded.",
+        "provider_unauthorized": "Provider authentication was rejected.",
+        "provider_bad_request": "The provider rejected this request.",
+        "provider_policy_blocked": "The provider policy blocked this request.",
+    }
+    lines = [messages.get(code, "The provider failed before completion.")]
+    retry_count = payload.get("provider_retry_count")
+    retry_limit = payload.get("provider_retry_limit")
+    if isinstance(retry_count, int) and retry_count > 0:
+        retry = f"{retry_count}/{retry_limit}" if isinstance(retry_limit, int) else str(retry_count)
+        lines.append(f"Codex reconnect attempts: `{retry}`.")
+    safe_message = payload.get("provider_safe_message")
+    if isinstance(safe_message, str) and safe_message.strip():
+        lines.append(safe_message[:300])
+    if payload.get("provider_degraded") is True:
+        lines.append(
+            "This revision has repeated the same failure. Your history is preserved; "
+            "run `/session new` instead of retrying this revision."
+        )
+    else:
+        lines.append(
+            "Your Thread history is preserved; this Turn was not replayed. "
+            "Retry once, then use `/session new` if the same failure repeats."
+        )
+    lines.append(f"Code: `{code}`")
+    return "\n".join(lines)
+
+
+def _provider_thread_recovery_guidance(value: object) -> str | None:
+    code = value if isinstance(value, str) else ""
+    if code == "provider_thread_systemError":
+        return (
+            "The provider Thread remained unhealthy after a fresh runtime resumed it. "
+            "This Turn was not sent or replayed; run `/session new`."
+        )
+    if code == "provider_thread_unknown":
+        return (
+            "Safety recovery required because the provider returned an unsupported "
+            "Thread state. Run `/session new` or inspect `/session status`."
+        )
+    return None
 
 
 def _bounded_plain_text_fallback(source: str) -> tuple[str, ...]:
