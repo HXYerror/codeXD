@@ -201,6 +201,8 @@ async def _run_daemon(config: AppConfig, bootstrap_token: str | None) -> int:
             store,
             correlation_key=projection_key,
             stream_update_ms=config.rendering.stream_update_ms,
+            progress_update_ms=config.discord.progress_update_ms,
+            task_card_update_ms=config.discord.task_card_update_ms,
         )
         from codexd.application.conversation_locks import ConversationLocks
         from codexd.application.schedule_coordinator import ScheduleCoordinator
@@ -310,6 +312,7 @@ async def _run_daemon(config: AppConfig, bootstrap_token: str | None) -> int:
                 config.retention.runtime_sqlite_size_budget_mib * 1024 * 1024
             ),
             event_metrics=turns.event_metrics,
+            discord_egress_metrics=lambda: bot.egress_metrics(),
             critical_failure=critical_failure,
         )
         retention = RetentionWorker(

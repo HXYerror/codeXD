@@ -52,6 +52,11 @@ async def test_health_reports_runtime_sqlite_capacity_and_write_latency(
             "p95_ms": 2.0,
             "max_ms": 2.0,
         },
+        discord_egress_metrics=lambda: {
+            "governor_wait_count": 3,
+            "discord_429_count": 0,
+            "route_turn_progress_edit_count": 4,
+        },
     )
 
     await reporter.write()
@@ -60,6 +65,11 @@ async def test_health_reports_runtime_sqlite_capacity_and_write_latency(
     assert payload["database"] == "degraded"
     assert payload["runtime_slots"]["capacity_limit"] == 10
     assert payload["event_pump"]["p95_ms"] == 2.0
+    assert payload["discord_egress"] == {
+        "governor_wait_count": 3,
+        "discord_429_count": 0,
+        "route_turn_progress_edit_count": 4,
+    }
     storage = payload["storage"]
     assert storage["runtime_sqlite_homes"] == 1
     assert storage["runtime_sqlite_database_bytes"] == 17

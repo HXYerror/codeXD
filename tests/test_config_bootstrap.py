@@ -86,6 +86,33 @@ def test_config_defaults_to_full_access_and_compatible_sdk(tmp_path: Path) -> No
     assert config.discord.archive_max_path_depth == 16
     assert config.discord.archive_max_path_chars == 240
     assert config.discord.archive_extract_timeout_seconds == 15
+    assert config.discord.progress_update_ms == 5000
+    assert config.discord.task_card_update_ms == 5000
+    assert config.discord.channel_write_interval_ms == 250
+    assert config.discord.global_write_interval_ms == 50
+
+
+@pytest.mark.parametrize(
+    "setting",
+    (
+        "progress_update_ms",
+        "task_card_update_ms",
+        "channel_write_interval_ms",
+        "global_write_interval_ms",
+    ),
+)
+def test_discord_egress_intervals_cannot_be_disabled(
+    tmp_path: Path,
+    setting: str,
+) -> None:
+    config_file = tmp_path / f"{setting}.toml"
+    config_file.write_text(
+        f"[discord]\n{setting} = 0\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(Exception, match="positive"):
+        load_config(config_file, environment={"HOME": str(tmp_path)})
 
 
 def test_archive_entry_limit_may_not_exceed_total_limit(tmp_path: Path) -> None:

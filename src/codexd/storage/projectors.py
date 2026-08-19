@@ -77,15 +77,19 @@ class ProjectingEventSink:
         *,
         correlation_key: bytes,
         stream_update_ms: int = 1000,
+        progress_update_ms: int = 5000,
+        task_card_update_ms: int = 5000,
         volatile_turns: VolatileTurnStore | None = None,
     ) -> None:
         if len(correlation_key) < 32:
             raise ValueError("projection correlation key must contain at least 32 bytes")
-        if stream_update_ms < 1:
-            raise ValueError("stream update interval must be positive")
+        if min(stream_update_ms, progress_update_ms, task_card_update_ms) < 1:
+            raise ValueError("projection update intervals must be positive")
         self.store = store
         self._correlation_key = correlation_key
         self._stream_update_ms = stream_update_ms
+        self._progress_update_ms = progress_update_ms
+        self._task_card_update_ms = task_card_update_ms
         self._volatile_turns = volatile_turns or VolatileTurnStore()
         self._provider_event_fingerprints: dict[str, dict[str, tuple[object, ...]]] = {}
         self._provider_event_lock = threading.Lock()
@@ -919,7 +923,7 @@ class ProjectingEventSink:
             content=content,
             now=now,
             event_sequence=sequence,
-            min_interval_ms=self._stream_update_ms,
+            min_interval_ms=self._progress_update_ms,
         )
 
     def _project_task(
@@ -1348,14 +1352,6 @@ class ProjectingEventSink:
         else:
             view_id = str(view["id"])
             revision = int(view["content_revision"]) + 1
-            connection.execute(
-                """
-                UPDATE task_card_views
-                SET content_revision = ?, component_nonce_hash = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (revision, nonce_hash, now, view_id),
-            )
         agents = [
             {
                 "label": str(agent["agent_label"]),
@@ -1373,21 +1369,60 @@ class ProjectingEventSink:
             ).fetchall()
         ]
         expanded = bool(view is not None and view["display_state"] == "expanded")
+        visible_payload: dict[str, object] = {
+            "kind": "task_card",
+            "view_id": view_id,
+            "title": task["display_title"],
+            "state": task["state"],
+            "status_summary": task["safe_status_summary"],
+            "operation": task["operation"],
+            "model": task["model"],
+            "reasoning_effort": task["reasoning_effort"],
+            "agents": agents,
+            "expanded": expanded,
+        }
+        previous_card = connection.execute(
+            """
+            SELECT operation, state, payload_json, next_attempt_at
+            FROM discord_outbox
+            WHERE coalesce_key = ? AND state <> 'superseded'
+            ORDER BY enqueue_sequence DESC
+            LIMIT 1
+            """,
+            (f"task-card:{task_id}",),
+        ).fetchone()
+        previous_ready_at: int | None = None
+        if previous_card is not None:
+            previous_payload = json.loads(str(previous_card["payload_json"]))
+            if isinstance(previous_payload, dict):
+                previous_visible = {
+                    key: previous_payload.get(key) for key in visible_payload
+                }
+                if previous_visible == visible_payload:
+                    return
+            if (
+                str(previous_card["state"]) == "pending"
+                and str(previous_card["operation"]) == "send"
+            ):
+                previous_ready_at = now
+            else:
+                previous_ready_at = int(previous_card["next_attempt_at"])
+        if view is not None:
+            revision = int(view["content_revision"]) + 1
+            connection.execute(
+                """
+                UPDATE task_card_views
+                SET content_revision = ?, component_nonce_hash = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (revision, nonce_hash, now, view_id),
+            )
         self._insert_outbox(
             connection,
             destination_key=f"thread:{scope['discord_thread_id']}",
             operation="send" if revision == 1 else "edit",
             payload={
-                "kind": "task_card",
-                "view_id": view_id,
-                "title": task["display_title"],
-                "state": task["state"],
-                "status_summary": task["safe_status_summary"],
-                "operation": task["operation"],
-                "model": task["model"],
-                "reasoning_effort": task["reasoning_effort"],
-                "agents": agents,
-                "expanded": expanded,
+                **visible_payload,
                 "revision": revision,
                 "nonce": nonce,
             },
@@ -1396,6 +1431,15 @@ class ProjectingEventSink:
             event_sequence=sequence,
             now=now,
             coalesce_key=f"task-card:{task_id}",
+            next_attempt_at=(
+                now
+                if revision == 1 or task["state"] in _TASK_TERMINAL_STATES
+                else (
+                    previous_ready_at
+                    if previous_ready_at is not None and previous_ready_at > now
+                    else now + self._task_card_update_ms
+                )
+            ),
         )
 
     def _finalize_turn(
@@ -1662,6 +1706,7 @@ class ProjectingEventSink:
         now: int,
         coalesce_key: str | None = None,
         depends_on_outbox_id: str | None = None,
+        next_attempt_at: int | None = None,
     ) -> str:
         if coalesce_key is not None:
             supersede_coalesced_outbox(
@@ -1691,7 +1736,7 @@ class ProjectingEventSink:
                 dedupe_key,
                 coalesce_key,
                 marker,
-                now,
+                next_attempt_at if next_attempt_at is not None else now,
                 now,
                 now,
             ),

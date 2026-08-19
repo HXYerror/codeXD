@@ -14,6 +14,7 @@ from codexd.storage.repository import Repository
 
 RuntimeStatus = Callable[[], Awaitable[dict[str, int | str]]]
 EventMetrics = Callable[[], dict[str, float | int]]
+DiscordEgressMetrics = Callable[[], dict[str, float | int]]
 
 
 @dataclass
@@ -30,6 +31,7 @@ class HealthReporter:
     database_size_budget_bytes: int = 512 * 1024 * 1024
     runtime_sqlite_size_budget_bytes: int = 1024 * 1024 * 1024
     event_metrics: EventMetrics | None = None
+    discord_egress_metrics: DiscordEgressMetrics | None = None
     critical_failure: Callable[[BaseException], None] | None = None
 
     def __post_init__(self) -> None:
@@ -101,6 +103,11 @@ class HealthReporter:
         storage["event_rows_per_minute"] = event_rows_per_minute
         write_latency = self.repository.store.write_latency_snapshot()
         event_metrics = self.event_metrics() if self.event_metrics is not None else {}
+        discord_egress = (
+            self.discord_egress_metrics()
+            if self.discord_egress_metrics is not None
+            else {}
+        )
         storage["write_latency"] = write_latency
         pressure_reasons: list[str] = []
         if int(storage["codexd_total_bytes"]) > self.database_size_budget_bytes:
@@ -159,6 +166,7 @@ class HealthReporter:
             },
             "unknown_provider_events": counts["unknown_provider_events"],
             "event_pump": event_metrics,
+            "discord_egress": discord_egress,
             "discord_reconnect_count": self.discord_reconnect_count,
             "inbound_reconciliation": inbound,
             "database_size_bytes": (
