@@ -646,6 +646,10 @@ async def test_registered_image_artifact_missing_keeps_distinct_failure(
     ) is not None
     assert storage_context.store.query_one(
         "SELECT 1 FROM incidents WHERE turn_id = ? AND code = ?",
+        (turn.id, "visualization_artifact_unavailable"),
+    ) is not None
+    assert storage_context.store.query_one(
+        "SELECT 1 FROM incidents WHERE turn_id = ? AND code = ?",
         (turn.id, "visualization_publish_tool_not_used"),
     ) is None
 

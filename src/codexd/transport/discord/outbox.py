@@ -782,6 +782,10 @@ class DiscordOutboxTransport:
                 "visualization_attachment_missing",
                 "A visualization had no registered Discord image",
             ),
+            "artifact_unavailable": (
+                "visualization_artifact_unavailable",
+                "A registered visualization artifact was unavailable for Discord",
+            ),
         }
         marker_incident = (
             incident_by_reason.get(marker_result.missing_reason)
