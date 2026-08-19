@@ -3279,7 +3279,9 @@ active/uninitialized/archived/needs-attention，颜色只作辅助。字段顺�
 2. `Activity`：Runtime state、非零 generation、queued/active Turn、last completed relative
    time；有 active Turn 时显示其 enqueue-time effective snapshot，若与 next-Turn settings
    不同则明确标注；
-3. `Session`：active revision short ID/name、provider version 和 resume verification；
+3. `Session`：active revision short ID/name、provider version、Provider Thread short hash、
+   resume verification，以及 active revision 持久化的 Provider Session ID；Conversation
+   owner在主动执行 status时看到完整可复制值，其他 authorized user只看到 short hash；
 4. `Execution`：固定 `FULL ACCESS / auto_review`，仅在 provider barrier 或 degraded
    resolution 存在时显示 warning。
 
@@ -3287,7 +3289,11 @@ active/uninitialized/archived/needs-attention，颜色只作辅助。字段顺�
 加载时 status 不得 cold-start app-server；显示 persisted configured value，无配置则显示
 `provider default · resolves on next Turn`。只有已加载且 ready 的 runtime 可在 bounded
 timeout 内读取 catalog；timeout/incomplete/error 均降级为安全状态文字，不能使整个
-status 失败。Embed 不显示完整 provider ID/hash、本地路径、账号或 secret，所有动态文本
+status 失败。完整 Provider Session ID 只从 active revision 的已校验持久字段读取，只在
+owner 主动执行的 ephemeral status 中披露；不得 cold-start runtime，也不得泄露到普通
+消息、progress/final/card、日志或 diagnostics。Provider Thread ID仍只显示 short hash，
+不能把 Thread ID、codexD revision ID 或 Discord thread ID标成 Session ID。异常、超长或
+含控制字符的 provider identity必须隐藏并只以 hash/length记录incident。所有动态文本
 经过 mention/Markdown suppression 和 Discord 长度限制。
 
 #### `/session new`
@@ -4646,6 +4652,7 @@ ID allowlist，不依赖昵称、显示名或 role name。
 |---|---|
 | 普通 Turn | allowed user |
 | Turn cancel/steer | allowed user，且同 Conversation |
+| session status | allowed user；仅 Conversation owner可见完整 Provider Session ID |
 | schedule create/update/pause/resume/delete/run-now | owner user，且同 Conversation |
 | project bind/unbind | owner user |
 | model/reasoning/personality/websearch change | owner user |

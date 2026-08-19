@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass, replace
@@ -33,6 +34,7 @@ from codexd.storage.repository import Repository
 
 logger = logging.getLogger(__name__)
 _STATUS_CATALOG_TIMEOUT_SECONDS = 3.0
+_PROVIDER_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 
 
 @dataclass(frozen=True)
@@ -74,6 +76,9 @@ class SessionActivityStatus:
 class SessionStatusView:
     conversation: ConversationRecord
     active_revision: ThreadRevisionRecord | None
+    provider_session_id: str | None
+    provider_session_hash: str | None
+    provider_thread_hash: str | None
     project_name: str
     behavior: SessionBehaviorStatus
     activity: SessionActivityStatus
@@ -120,16 +125,18 @@ class SessionLifecycleCoordinator:
         )
 
     async def status(self, conversation_id: str) -> SessionStatus:
-        conversation, revision = await asyncio.gather(
-            asyncio.to_thread(self._repository.get_conversation, conversation_id),
-            asyncio.to_thread(self._repository.get_active_revision, conversation_id),
+        conversation, revision = await asyncio.to_thread(
+            self._repository.conversation_with_active_revision,
+            conversation_id,
         )
         return SessionStatus(conversation, revision)
 
     async def status_view(self, conversation_id: str) -> SessionStatusView:
-        conversation, revision, project, turn_summary, active_turn = await asyncio.gather(
-            asyncio.to_thread(self._repository.get_conversation, conversation_id),
-            asyncio.to_thread(self._repository.get_active_revision, conversation_id),
+        identity, project, turn_summary, active_turn = await asyncio.gather(
+            asyncio.to_thread(
+                self._repository.conversation_with_active_revision,
+                conversation_id,
+            ),
             asyncio.to_thread(self._project_for_conversation, conversation_id),
             asyncio.to_thread(
                 self._repository.conversation_turn_summary,
@@ -140,6 +147,7 @@ class SessionLifecycleCoordinator:
                 conversation_id,
             ),
         )
+        conversation, revision = identity
         runtime_status = await self._runtimes.project_status(project.id)
         catalog: ModelCatalogSnapshot | None = None
         degraded_reason: str | None = None
@@ -187,9 +195,48 @@ class SessionLifecycleCoordinator:
             active_turn=active_turn,
             active_settings_differ=active_settings_differ,
         )
+        if revision is not None and revision.state != "active":
+            await asyncio.to_thread(
+                self._repository.record_incident,
+                severity="warning",
+                code="session_status_revision_not_active",
+                summary="Session status ignored a non-active revision pointer",
+                project_id=conversation.project_id,
+                conversation_id=conversation.id,
+                details={
+                    "revision_id": revision.id,
+                    "revision_state": revision.state,
+                },
+            )
+            revision = None
+        provider_identity, invalid_identity = _status_provider_identity(revision)
+        if invalid_identity:
+            await asyncio.to_thread(
+                self._repository.record_incident,
+                severity="warning",
+                code="session_status_provider_identity_invalid",
+                summary="A persisted provider identity was hidden from session status",
+                project_id=conversation.project_id,
+                conversation_id=conversation.id,
+                details={
+                    "revision_id": revision.id if revision is not None else None,
+                    "invalid_fields": sorted(invalid_identity),
+                    "value_hashes": {
+                        name: sha256_text(value)
+                        for name, value in sorted(invalid_identity.items())
+                    },
+                    "value_lengths": {
+                        name: len(value)
+                        for name, value in sorted(invalid_identity.items())
+                    },
+                },
+            )
         return SessionStatusView(
             conversation=conversation,
             active_revision=revision,
+            provider_session_id=provider_identity[0],
+            provider_session_hash=provider_identity[1],
+            provider_thread_hash=provider_identity[2],
             project_name=project.name,
             behavior=behavior,
             activity=activity,
@@ -1306,6 +1353,31 @@ class SessionLifecycleCoordinator:
             reason="provider_thread_identity_mismatch",
         )
         raise InvariantError("provider resumed a different thread identity")
+
+
+def _status_provider_identity(
+    revision: ThreadRevisionRecord | None,
+) -> tuple[tuple[str | None, str | None, str | None], dict[str, str]]:
+    if revision is None:
+        return (None, None, None), {}
+    invalid: dict[str, str] = {}
+    session_id = revision.provider_session_id
+    thread_id = revision.provider_thread_id
+    if _PROVIDER_ID.fullmatch(session_id) is None:
+        invalid["provider_session_id"] = session_id
+        session_id = ""
+    if _PROVIDER_ID.fullmatch(thread_id) is None:
+        invalid["provider_thread_id"] = thread_id
+        thread_id = ""
+    if invalid:
+        return (None, None, None), invalid
+    safe_session = session_id or None
+    safe_thread = thread_id or None
+    return (
+        safe_session,
+        sha256_text(safe_session)[:12] if safe_session is not None else None,
+        sha256_text(safe_thread)[:12] if safe_thread is not None else None,
+    ), invalid
 
 
 def _decode_thread_config(raw_json: str) -> ThreadConfig:

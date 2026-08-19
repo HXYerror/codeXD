@@ -2383,6 +2383,28 @@ class Repository:
         )
         return _revision(row) if row else None
 
+    def conversation_with_active_revision(
+        self,
+        conversation_id: str,
+    ) -> tuple[ConversationRecord, ThreadRevisionRecord | None]:
+        with self.store.transaction(immediate=False) as connection:
+            conversation = connection.execute(
+                "SELECT * FROM conversations WHERE id = ?",
+                (conversation_id,),
+            ).fetchone()
+            if conversation is None:
+                raise NotFoundError(f"Conversation not found: {conversation_id}")
+            revision = None
+            if conversation["active_revision_id"] is not None:
+                revision = connection.execute(
+                    """
+                    SELECT * FROM thread_revisions
+                    WHERE id = ? AND conversation_id = ?
+                    """,
+                    (conversation["active_revision_id"], conversation_id),
+                ).fetchone()
+        return _conversation(conversation), _revision(revision) if revision else None
+
     def enqueue_dynamic_tool_upgrade_notice(
         self,
         *,
