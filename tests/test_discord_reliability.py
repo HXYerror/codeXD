@@ -44,6 +44,7 @@ from codexd.storage.records import (
 from codexd.transport.discord.attachments import DiscordAttachmentIngestResult
 from codexd.transport.discord.bot import (
     CodexDBot,
+    _assert_discord_connect_contract,
     _bounded_response,
     _remove_bot_mention,
 )
@@ -83,6 +84,293 @@ def test_delivery_nonce_is_stable_and_content_has_no_hidden_marker() -> None:
         nonce=_delivery_nonce("turn-other"),
     )
     assert all(not ("\ufe00" <= character <= "\ufe0f") for character in "visible text")
+
+
+def test_discord_connection_loop_contract_preserves_resume_seam() -> None:
+    _assert_discord_connect_contract()
+
+
+@pytest.mark.asyncio
+async def test_ready_and_resumed_reset_reconnect_tiers(tmp_path: Path) -> None:
+    bot = _test_bot(tmp_path)
+    bot.repository.list_enabled_projects.return_value = ()
+    bot.session_lifecycle.restore_provider_barriers = AsyncMock()
+    bot.turns.restore = AsyncMock()
+    bot.reconnect_backoff.next_delay(error_code="offline")
+    bot.reconnect_backoff.next_delay(error_code="offline")
+
+    await bot.on_ready()
+
+    assert bot.reconnect_backoff.tier == 0
+    assert bot.reconnect_backoff.last_session_mode == "ready"
+    bot.reconnect_backoff.next_delay(error_code="offline")
+    assert bot.reconnect_backoff.tier == 1
+    await bot.on_resumed()
+    assert bot.reconnect_backoff.tier == 0
+    assert bot.reconnect_backoff.last_session_mode == "resumed"
+    assert bot.reconnect_backoff.resumed_count == 1
+
+
+@pytest.mark.asyncio
+async def test_connection_loop_preserves_resume_identity_after_fixed_wait(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot = _test_bot(tmp_path)
+    monkeypatch.setattr(
+        discord.Client,
+        "dispatch",
+        lambda _self, _event, *_args, **_kwargs: None,
+    )
+    closed = [False]
+    monkeypatch.setattr(bot, "is_closed", lambda: closed[0])
+    waits: list[float] = []
+
+    async def wait(delay: float) -> bool:
+        waits.append(delay)
+        return True
+
+    bot.reconnect_backoff.wait = wait  # type: ignore[method-assign]
+    first_websocket = SimpleNamespace(
+        sequence=88,
+        gateway="wss://resume.example",
+        session_id="session-secret",
+        poll_event=AsyncMock(side_effect=OSError(54, "connection reset")),
+    )
+    async def close_second() -> None:
+        closed[0] = True
+        raise OSError(54, "stop test")
+
+    second_websocket = SimpleNamespace(
+        sequence=88,
+        gateway="wss://resume.example",
+        session_id="session-secret",
+        poll_event=close_second,
+    )
+    websockets = iter((first_websocket, second_websocket))
+    captured: list[dict[str, object]] = []
+
+    async def from_client(_client: object, **kwargs: object) -> object:
+        captured.append(kwargs)
+        return next(websockets)
+
+    monkeypatch.setattr(
+        "codexd.transport.discord.bot.DiscordWebSocket.from_client",
+        from_client,
+    )
+
+    await bot.connect(reconnect=True)
+
+    assert waits == [1.0]
+    assert bot.reconnect_backoff.tier == 1
+    assert captured[0] == {"initial": True, "shard_id": None}
+    assert captured[1] == {
+        "initial": False,
+        "shard_id": None,
+        "sequence": 88,
+        "gateway": "wss://resume.example",
+        "resume": True,
+        "session": "session-secret",
+    }
+
+
+@pytest.mark.asyncio
+async def test_protocol_reconnect_does_not_consume_backoff_tier(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot = _test_bot(tmp_path)
+    monkeypatch.setattr(
+        discord.Client,
+        "dispatch",
+        lambda _self, _event, *_args, **_kwargs: None,
+    )
+    closed = [False]
+    monkeypatch.setattr(bot, "is_closed", lambda: closed[0])
+    first = SimpleNamespace(
+        sequence=99,
+        gateway="wss://resume.example",
+        session_id="session-secret",
+        poll_event=AsyncMock(
+            side_effect=discord.gateway.ReconnectWebSocket(None, resume=True)
+        ),
+    )
+
+    async def finish() -> None:
+        closed[0] = True
+        raise OSError(54, "stop test")
+
+    second = SimpleNamespace(
+        sequence=99,
+        gateway="wss://resume.example",
+        session_id="session-secret",
+        poll_event=finish,
+    )
+    websockets = iter((first, second))
+    captured: list[dict[str, object]] = []
+
+    async def from_client(_client: object, **kwargs: object) -> object:
+        captured.append(kwargs)
+        return next(websockets)
+
+    monkeypatch.setattr(
+        "codexd.transport.discord.bot.DiscordWebSocket.from_client",
+        from_client,
+    )
+
+    await bot.connect(reconnect=True)
+
+    assert bot.reconnect_backoff.tier == 0
+    assert captured[1]["resume"] is True
+    assert captured[1]["sequence"] == 99
+    assert captured[1]["session"] == "session-secret"
+
+
+@pytest.mark.asyncio
+async def test_protocol_invalid_session_identifies_without_consuming_tier(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot = _test_bot(tmp_path)
+    monkeypatch.setattr(
+        discord.Client,
+        "dispatch",
+        lambda _self, _event, *_args, **_kwargs: None,
+    )
+    closed = [False]
+    monkeypatch.setattr(bot, "is_closed", lambda: closed[0])
+    first = SimpleNamespace(
+        sequence=99,
+        gateway="wss://resume.example",
+        session_id="session-secret",
+        poll_event=AsyncMock(
+            side_effect=discord.gateway.ReconnectWebSocket(None, resume=False)
+        ),
+    )
+
+    async def finish() -> None:
+        closed[0] = True
+        raise OSError(54, "stop test")
+
+    second = SimpleNamespace(
+        sequence=None,
+        gateway="wss://gateway.example",
+        session_id=None,
+        poll_event=finish,
+    )
+    websockets = iter((first, second))
+    captured: list[dict[str, object]] = []
+
+    async def from_client(_client: object, **kwargs: object) -> object:
+        captured.append(kwargs)
+        return next(websockets)
+
+    monkeypatch.setattr(
+        "codexd.transport.discord.bot.DiscordWebSocket.from_client",
+        from_client,
+    )
+
+    await bot.connect(reconnect=True)
+
+    assert bot.reconnect_backoff.tier == 0
+    assert captured[1] == {"initial": True, "shard_id": None}
+
+
+@pytest.mark.asyncio
+async def test_invalid_session_close_forces_identify_after_backoff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot = _test_bot(tmp_path)
+    monkeypatch.setattr(
+        discord.Client,
+        "dispatch",
+        lambda _self, _event, *_args, **_kwargs: None,
+    )
+    closed = [False]
+    monkeypatch.setattr(bot, "is_closed", lambda: closed[0])
+    bot.reconnect_backoff.wait = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    socket = SimpleNamespace(close_code=4009)
+    first = SimpleNamespace(
+        sequence=99,
+        gateway="wss://resume.example",
+        session_id="session-secret",
+        poll_event=AsyncMock(
+            side_effect=discord.ConnectionClosed(socket, shard_id=None, code=4009)
+        ),
+    )
+
+    async def finish() -> None:
+        closed[0] = True
+        raise OSError(54, "stop test")
+
+    second = SimpleNamespace(
+        sequence=None,
+        gateway="wss://gateway.example",
+        session_id=None,
+        poll_event=finish,
+    )
+    websockets = iter((first, second))
+    captured: list[dict[str, object]] = []
+
+    async def from_client(_client: object, **kwargs: object) -> object:
+        captured.append(kwargs)
+        return next(websockets)
+
+    monkeypatch.setattr(
+        "codexd.transport.discord.bot.DiscordWebSocket.from_client",
+        from_client,
+    )
+
+    await bot.connect(reconnect=True)
+
+    assert captured[1] == {"initial": True, "shard_id": None}
+    assert bot.reconnect_backoff.tier == 1
+
+
+@pytest.mark.asyncio
+async def test_dispatch_ready_resets_before_async_callback_runs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot = _test_bot(tmp_path)
+    monkeypatch.setattr(
+        discord.Client,
+        "dispatch",
+        lambda _self, _event, *_args, **_kwargs: None,
+    )
+    bot.reconnect_backoff.next_delay(error_code="offline")
+
+    bot.dispatch("ready")
+
+    assert bot.reconnect_backoff.tier == 0
+    assert bot.reconnect_backoff.last_session_mode == "ready"
+    assert bot._gateway_ready
+
+
+@pytest.mark.asyncio
+async def test_late_disconnect_callback_cannot_undo_ready_reset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot = _test_bot(tmp_path)
+    monkeypatch.setattr(
+        discord.Client,
+        "dispatch",
+        lambda _self, _event, *_args, **_kwargs: None,
+    )
+    bot.repository.list_enabled_projects.return_value = ()
+    bot.session_lifecycle.restore_provider_barriers = AsyncMock()
+    bot.turns.restore = AsyncMock()
+    bot.dispatch("disconnect")
+    bot.dispatch("message", Mock())
+    bot.dispatch("ready")
+
+    await bot.on_disconnect()
+    await bot.on_ready()
+
+    assert bot._gateway_ready
+    assert bot.reconnect_backoff.connection_state == "ready"
 
 
 @pytest.mark.asyncio

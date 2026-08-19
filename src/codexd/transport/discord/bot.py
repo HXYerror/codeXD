@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import inspect
 import io
 import json
 import logging
 import re
 import secrets
 import time
+from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
@@ -18,6 +20,8 @@ from zoneinfo import ZoneInfo
 import aiohttp
 import discord
 from discord import app_commands
+from discord.errors import ConnectionClosed, GatewayNotFound, HTTPException
+from discord.gateway import DiscordWebSocket, ReconnectWebSocket
 
 from codexd.application.schedule_coordinator import ScheduleCoordinator
 from codexd.application.session_coordinator import SessionCoordinator
@@ -72,10 +76,15 @@ from codexd.transport.discord.presentation import (
     session_status_embed,
 )
 from codexd.transport.discord.reconciliation import DiscordInboundReconciler
+from codexd.transport.discord.reconnect import DiscordReconnectBackoff
 
 logger = logging.getLogger(__name__)
 _DISCORD_INTERACTION_ACK_DEADLINE_SECONDS = 3.0
 _MODAL_RESPONSE_NETWORK_BUDGET_SECONDS = 1.0
+_FATAL_GATEWAY_CLOSE_CODES = frozenset(
+    {4001, 4002, 4003, 4004, 4005, 4010, 4011, 4012, 4013}
+)
+_IDENTIFY_GATEWAY_CLOSE_CODES = frozenset({4007, 4009})
 
 
 @dataclass(frozen=True)
@@ -219,6 +228,11 @@ class CodexDBot(discord.Client):
         self._active_command_intents: set[str] = set()
         self._inbound_catching_up = False
         self._inbound_reconciliation_degraded = False
+        self.reconnect_backoff = DiscordReconnectBackoff()
+        self._gateway_event_epoch = 0
+        self._ready_epochs: deque[int] = deque()
+        self._resumed_epochs: deque[int] = deque()
+        self._disconnect_epochs: deque[int] = deque()
         self._inbound_reconciler = (
             DiscordInboundReconciler(
                 repository=IngressCheckpointRepository(repository.store),
@@ -236,10 +250,28 @@ class CodexDBot(discord.Client):
     def transport_initialized(self) -> bool:
         return self._outbox is not None
 
+    def dispatch(self, event: str, /, *args: Any, **kwargs: Any) -> None:
+        if event in {"ready", "resumed", "disconnect"}:
+            self._gateway_event_epoch += 1
+        event_epoch = self._gateway_event_epoch
+        if event in {"ready", "resumed"}:
+            target = self._ready_epochs if event == "ready" else self._resumed_epochs
+            target.append(event_epoch)
+            self._gateway_ready = True
+            self.reconnect_backoff.reset(event)
+        elif event == "disconnect":
+            self._disconnect_epochs.append(event_epoch)
+            self._gateway_ready = False
+            self.reconnect_backoff.connection_state = "reconnecting"
+        super().dispatch(event, *args, **kwargs)
+
     def egress_metrics(self) -> dict[str, int | float]:
         if self._transport is None:
             return {}
         return self._transport.egress_metrics()
+
+    def reconnect_status(self) -> dict[str, object]:
+        return vars(self.reconnect_backoff.snapshot())
 
     async def setup_hook(self) -> None:
         self._http_session = aiohttp.ClientSession()
@@ -289,6 +321,7 @@ class CodexDBot(discord.Client):
         await self._sync_commands_or_degrade(guild)
 
     async def close(self) -> None:
+        self.reconnect_backoff.stop()
         await self.begin_shutdown()
         self._discord_status("stopping")
         self._command_sync_stop.set()
@@ -316,6 +349,7 @@ class CodexDBot(discord.Client):
     ) -> bool:
         self._accepting_ingress = False
         self._gateway_ready = False
+        self.reconnect_backoff.stop()
         if self._inbound_reconciler is not None:
             await self._inbound_reconciler.close()
         started = time.monotonic()
@@ -350,6 +384,17 @@ class CodexDBot(discord.Client):
         return not pending
 
     async def on_ready(self) -> None:
+        dispatched = bool(self._ready_epochs)
+        event_epoch = (
+            self._ready_epochs.popleft()
+            if dispatched
+            else self._gateway_event_epoch
+        )
+        if event_epoch != self._gateway_event_epoch:
+            return
+        if not dispatched:
+            self._gateway_ready = True
+            self.reconnect_backoff.reset("ready")
         task = self._track_ingress()
         try:
             async with self._ingress_lock:
@@ -378,6 +423,18 @@ class CodexDBot(discord.Client):
             await self._process_initial_ingress_locked(message_id)
 
     async def on_resumed(self) -> None:
+        dispatched = bool(self._resumed_epochs)
+        event_epoch = (
+            self._resumed_epochs.popleft()
+            if dispatched
+            else self._gateway_event_epoch
+        )
+        if event_epoch != self._gateway_event_epoch:
+            return
+        if not dispatched:
+            self._gateway_ready = True
+            self.reconnect_backoff.reset("resumed")
+        self._update_discord_ready_status()
         task = self._track_ingress()
         try:
             if (
@@ -500,8 +557,108 @@ class CodexDBot(discord.Client):
             self._startup_recovery_task = None
 
     async def on_disconnect(self) -> None:
+        disconnect_epoch = (
+            self._disconnect_epochs.popleft()
+            if self._disconnect_epochs
+            else self._gateway_event_epoch
+        )
+        if disconnect_epoch != self._gateway_event_epoch:
+            return
         self._gateway_ready = False
-        self._discord_status("disconnected")
+        if self.reconnect_backoff.connection_state != "reconnecting":
+            self.reconnect_backoff.connection_state = "disconnected"
+        self._discord_status(self.reconnect_backoff.connection_state)
+
+    async def connect(self, *, reconnect: bool = True) -> None:
+        """discord.py connection loop with codexD-owned fixed retry policy."""
+
+        if not reconnect:
+            await super().connect(reconnect=False)
+            return
+        _assert_discord_connect_contract()
+        ws_params: dict[str, object] = {
+            "initial": True,
+            "shard_id": self.shard_id,
+        }
+        while not self.is_closed():
+            self.reconnect_backoff.mark_connecting()
+            try:
+                coro = DiscordWebSocket.from_client(self, **ws_params)  # type: ignore[arg-type]
+                self.ws = await asyncio.wait_for(coro, timeout=60.0)
+                ws_params["initial"] = False
+                while True:
+                    await self.ws.poll_event()
+            except ReconnectWebSocket as exc:
+                if not exc.resume:
+                    self.ws.sequence = None
+                    self.ws.session_id = None
+                self.dispatch("disconnect")
+                if exc.resume:
+                    ws_params.update(
+                        sequence=self.ws.sequence,
+                        gateway=self.ws.gateway,
+                        initial=False,
+                        resume=True,
+                        session=self.ws.session_id,
+                    )
+                else:
+                    ws_params = {
+                        "initial": True,
+                        "shard_id": self.shard_id,
+                    }
+                continue
+            except (
+                TimeoutError,
+                OSError,
+                HTTPException,
+                GatewayNotFound,
+                ConnectionClosed,
+                aiohttp.ClientError,
+            ) as exc:
+                if self.is_closed():
+                    return
+                force_identify = False
+                if isinstance(exc, ConnectionClosed):
+                    if exc.code == 4014:
+                        raise discord.PrivilegedIntentsRequired(exc.shard_id) from None
+                    if exc.code in _FATAL_GATEWAY_CLOSE_CODES:
+                        await self.close()
+                        raise
+                    if exc.code in _IDENTIFY_GATEWAY_CLOSE_CODES:
+                        force_identify = True
+                        ws_params = {
+                            "initial": True,
+                            "shard_id": self.shard_id,
+                        }
+                retry_after = (
+                    float(getattr(exc, "retry_after", 0.0) or 0.0)
+                    if isinstance(exc, HTTPException) and exc.status == 429
+                    else None
+                )
+                delay = self.reconnect_backoff.next_delay(
+                    error_code=_gateway_error_code(exc),
+                    retry_after=retry_after,
+                )
+                self.dispatch("disconnect")
+                self._discord_status("reconnecting")
+                logger.warning(
+                    "Discord Gateway connection failed; retrying",
+                    extra={
+                        "stable_code": "discord_gateway_reconnect_retry",
+                        "tier": self.reconnect_backoff.tier,
+                        "retry_delay_seconds": delay,
+                        "exception_type": type(exc).__name__,
+                    },
+                )
+                if not await self.reconnect_backoff.wait(delay):
+                    return
+                if not force_identify:
+                    ws_params.update(
+                        sequence=self.ws.sequence,
+                        gateway=self.ws.gateway,
+                        resume=True,
+                        session=self.ws.session_id,
+                    )
 
     async def _sync_commands_or_degrade(self, guild: discord.Object) -> None:
         try:
@@ -2290,6 +2447,13 @@ class CodexDBot(discord.Client):
             or self._inbound_reconciliation_degraded
             else "ready"
         )
+        reconnect = self.reconnect_backoff.snapshot()
+        discord_detail = discord_state
+        if reconnect.connection_state == "reconnecting":
+            discord_detail = (
+                f"reconnecting · tier {reconnect.tier}/10 · "
+                f"retry in {reconnect.selected_delay_seconds:g}s"
+            )
         service_state = (
             "stopping"
             if not self._accepting_ingress
@@ -2365,7 +2529,7 @@ class CodexDBot(discord.Client):
             "\n".join(
                 (
                     f"Service: `{service_state}`",
-                    f"Discord: `{discord_state}`",
+                    f"Discord: `{discord_detail}`",
                     f"Codex auth: `{auth}`",
                     f"Project: **{discord.utils.escape_markdown(project.name)}** · "
                     f"`{routing}` · runtime `{runtime['state']}` generation "
@@ -2556,6 +2720,7 @@ class CodexDBot(discord.Client):
             asyncio.to_thread(self.repository.store.foreign_key_check),
         )
         runtime_leases = await runtime_leases_task
+        reconnect = self.reconnect_backoff.snapshot()
         lines = [
             f"Uptime: {_duration_text(utc_now_ms() - self._started_at)}",
             "Discord: `"
@@ -2567,7 +2732,8 @@ class CodexDBot(discord.Client):
                 else "ready"
             )
             + "` · "
-            f"auth `{self._codex_auth_state}`",
+            f"auth `{self._codex_auth_state}` · reconnect tier "
+            f"{reconnect.tier}/10 · failures {reconnect.consecutive_failures}",
             f"Database: schema `{schema_version}` · integrity `{integrity}` · "
             f"foreign-key violations `{len(foreign_keys)}`",
             f"Runtime: `{runtime['topology']}` · ready {runtime['ready']}/"
@@ -4148,6 +4314,34 @@ def _usage_observation(observed: object) -> str:
 
 def _model_source(override: str | None) -> str:
     return "conversation override" if override else "provider default"
+
+
+def _assert_discord_connect_contract() -> None:
+    version = tuple(int(part) for part in discord.__version__.split(".")[:2])
+    if version < (2, 6) or version >= (3, 0):
+        raise InvariantError("unsupported discord.py connection-loop version")
+    try:
+        source = inspect.getsource(discord.Client.connect)
+    except (OSError, TypeError) as exc:
+        raise InvariantError(
+            "discord.py connection-loop source contract is unavailable"
+        ) from exc
+    required = (
+        "DiscordWebSocket.from_client",
+        "ReconnectWebSocket",
+        "sequence=self.ws.sequence",
+        "session=self.ws.session_id",
+    )
+    if not all(token in source for token in required):
+        raise InvariantError("discord.py connection-loop contract changed")
+
+
+def _gateway_error_code(exc: BaseException) -> str:
+    if isinstance(exc, HTTPException):
+        return f"discord_http_{exc.status}"
+    if isinstance(exc, ConnectionClosed):
+        return f"discord_gateway_close_{exc.code}"
+    return f"discord_{type(exc).__name__.casefold()}"
 
 
 def _effective_reasoning(
