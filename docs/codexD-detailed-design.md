@@ -1732,8 +1732,12 @@ PNG 和 delivery marker；Discord 永久拒绝图片时发送可见失败卡并�
 state。普通 `imageView` 永远只是检查事件，未调用 publish tool 时不上传。
 
 私有 `visualize…` marker 不是 provider output contract。final renderer 使用 bounded
-scanner 移除 marker；有 registered image 时由附件表达，没有时替换为可见失败提示并记录
-`visualization_attachment_missing`，绝不读取 marker 内 path、执行 HTML/JS 或发网络请求。
+scanner 移除 marker；有 registered image 时由附件表达。没有图片时按 Turn revision
+能力区分：legacy session 记录 `visualization_legacy_session` 并直接提示执行
+`/session new`；tool 已启用但未注册图片时记录
+`visualization_publish_tool_not_used`；已登记 artifact 丢失仍使用独立的
+`outbound_image_artifact_unavailable` 语义。renderer 绝不读取 marker 内 path、执行
+HTML/JS 或发网络请求。
 现有 typed `imageGeneration` 若没有显式 publish 仍维持
 `image_generation_attachment_unavailable` incident，不能误报上传成功。
 
@@ -1803,11 +1807,12 @@ Discord REST 与 SQLite 无法组成原子 transaction，所以 outbox 提供
 
 1. transaction claim outbox lease，并写 `sending`；
 2. transaction 外调用 Discord REST；
-3. message content 携带不可见的稳定 `delivery_marker`；不得向用户显示
-   `codexD:turn-...` 等内部 marker，恢复时仍兼容旧版可见 marker；
+3. 新 message 使用 delivery marker 派生的 Discord native nonce；discord.py 发送
+   `enforce_nonce=true`，正文不携带任何零宽字符或 variation selector；恢复时同时
+   兼容历史零宽 marker 与旧版可见 `codexD:turn-...` marker；
 4. REST 成功后另一个 transaction 写 `sent` 和 Discord message ID；
 5. 若在第 3、4 步之间崩溃，恢复 worker 查询 destination 最近的 bot message，
-   尝试按 marker 关联；
+   尝试按 nonce/legacy marker 关联；
 6. 无法可靠关联时允许重发，并记录 `delivery_duplicate_possible`；
 7. 已知 message ID 的 edit/delete retry 继续使用该 ID；
 8. reconciliation 可清理同 marker 的明确重复消息。
