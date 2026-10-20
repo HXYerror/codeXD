@@ -191,7 +191,8 @@ async def test_media_worker_receives_only_explicit_environment(
     child_environment = await worker._run(("environment",))
 
     assert isinstance(child_environment, dict)
-    assert child_environment == {"CODEXD_SAFE_TEST": "allowed"}
+    assert child_environment["CODEXD_SAFE_TEST"] == "allowed"
+    assert set(child_environment) <= {"CODEXD_SAFE_TEST", "SYSTEMROOT", "WINDIR"}
 
 
 def test_media_worker_uses_windows_job_object_containment(

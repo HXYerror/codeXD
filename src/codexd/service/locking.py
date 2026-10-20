@@ -25,6 +25,8 @@ class InstanceLock:
         if self._file is not None:
             return
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if self.path.is_symlink():
+            raise SecurityError("instance lock path may not be a symlink")
         flags = os.O_APPEND | os.O_CREAT | os.O_RDWR
         if hasattr(os, "O_BINARY"):
             flags |= os.O_BINARY

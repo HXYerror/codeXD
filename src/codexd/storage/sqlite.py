@@ -8,7 +8,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -250,7 +250,7 @@ class SQLiteStore:
                 checkpoint = self.checkpoint("FULL")
                 if checkpoint[0] != 0:
                     raise StorageError("database WAL checkpoint is busy")
-                with sqlite3.connect(temporary) as target:
+                with closing(sqlite3.connect(temporary)) as target:
                     target.row_factory = sqlite3.Row
                     target.execute("PRAGMA foreign_keys = ON")
                     self.connection.backup(target)

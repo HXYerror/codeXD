@@ -410,7 +410,8 @@ def _validate_zip(
                 "archive uses an unsupported compression method",
                 code="archive_unsupported",
             )
-        parts = _safe_zip_parts(info.filename, limits)
+        # ZipInfo normalizes backslashes on Windows; validate the wire name first.
+        parts = _safe_zip_parts(info.orig_filename, limits)
         mode = (info.external_attr >> 16) & 0xFFFF
         file_type = stat.S_IFMT(mode)
         if file_type not in {0, stat.S_IFREG, stat.S_IFDIR}:

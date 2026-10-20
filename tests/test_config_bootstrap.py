@@ -47,7 +47,7 @@ def test_config_defaults_to_full_access_and_compatible_sdk(tmp_path: Path) -> No
                 "owner_user_id = 456",
                 "allowed_user_ids = [456]",
                 "[security]",
-                f'allowed_roots = ["{allowed}"]',
+                f'allowed_roots = [{json.dumps(str(allowed))}]',
             )
         ),
         encoding="utf-8",
@@ -174,7 +174,7 @@ def test_runtime_accepts_an_explicit_codex_executable(tmp_path: Path) -> None:
     executable.chmod(0o700)
     config_file = tmp_path / "config.toml"
     config_file.write_text(
-        f'[runtime]\ncodex_bin = "{executable}"\n',
+        f'[runtime]\ncodex_bin = {json.dumps(str(executable))}\n',
         encoding="utf-8",
     )
 
@@ -200,13 +200,14 @@ def test_config_rejects_nonfinite_poll_and_oversized_snowflake(
         load_config(oversized, environment={"HOME": str(tmp_path)})
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX executable mode contract")
 def test_runtime_rejects_a_non_executable_codex_file(tmp_path: Path) -> None:
     executable = tmp_path / "codex"
     executable.write_text("not executable", encoding="utf-8")
     executable.chmod(0o600)
     config_file = tmp_path / "config.toml"
     config_file.write_text(
-        f'[runtime]\ncodex_bin = "{executable}"\n',
+        f'[runtime]\ncodex_bin = {json.dumps(str(executable))}\n',
         encoding="utf-8",
     )
 
@@ -877,7 +878,7 @@ def test_diff_redaction_makes_project_paths_relative_and_hides_outside_paths(
     assert str(root) not in redacted
     assert "/etc/private.conf" not in redacted
     assert r"C:\Users\alice" not in redacted
-    assert "--- src/inside.py" in redacted
+    assert f"--- {Path('src') / 'inside.py'}" in redacted
     assert "<outside-project>/private.conf" in redacted
 
 

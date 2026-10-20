@@ -4,6 +4,7 @@ import os
 import sqlite3
 import time
 import tomllib
+from contextlib import closing
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -250,7 +251,7 @@ def _backup(connection: sqlite3.Connection, source: Path, destination: Path) -> 
     if temporary.exists():
         raise StorageError(f"Codex feedback backup staging file exists: {temporary}")
     try:
-        with sqlite3.connect(temporary) as backup:
+        with closing(sqlite3.connect(temporary)) as backup:
             connection.backup(backup)
             integrity = backup.execute("PRAGMA integrity_check").fetchone()
             if integrity is None or integrity[0] != "ok":

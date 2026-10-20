@@ -620,6 +620,7 @@ def test_service_stop_accepts_platform_not_running_outcome(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(service_manager.os, "getuid", lambda: 501, raising=False)
     config = AppConfig(paths=AppPaths(tmp_path / "data", tmp_path / "logs"))
     monkeypatch.setattr(
         service_manager,
@@ -644,6 +645,7 @@ def test_macos_uninstall_removes_already_stopped_service(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(service_manager.os, "getuid", lambda: 501, raising=False)
     config = AppConfig(paths=AppPaths(tmp_path / "data", tmp_path / "logs"))
     plist = tmp_path / "com.codexd.daemon.plist"
     plist.write_text("installed")
