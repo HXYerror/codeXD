@@ -283,7 +283,7 @@ def test_dynamic_tool_capability_is_exact_version_and_product_gated(
     assert publish_supported.optional["codexd.publish_image_tool"] is True
 
     def version(_distribution: str) -> str:
-        return "0.144.5"
+        return "0.147.1"
 
     monkeypatch.setattr(codex_sdk.importlib.metadata, "version", version)
     unverified = codex_sdk.capability_manifest(schedule_tool_enabled=True)

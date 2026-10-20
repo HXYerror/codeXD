@@ -26,12 +26,8 @@ from codexd.storage.usage import (
     validate_usage_payload,
 )
 
-_TASK_TERMINAL_STATES = frozenset(
-    {"completed", "errored", "interrupted", "shutdown", "not_found"}
-)
-_AGENT_TERMINAL_STATES = frozenset(
-    {"completed", "errored", "interrupted", "shutdown", "not_found"}
-)
+_TASK_TERMINAL_STATES = frozenset({"completed", "errored", "interrupted", "shutdown", "not_found"})
+_AGENT_TERMINAL_STATES = frozenset({"completed", "errored", "interrupted", "shutdown", "not_found"})
 _DURABLE_EVENT_KINDS = frozenset(
     {
         "file_change.completed",
@@ -639,7 +635,7 @@ class ProjectingEventSink:
                 "content": (
                     "Codex reported an unsupported provider event. The Turn is still "
                     f"being observed; diagnostics code: `{code}`."
-                )
+                ),
             },
             dedupe_key=f"turn:{scope['id']}:unknown:{sequence}",
             marker=f"unknown-{sequence}",
@@ -676,6 +672,16 @@ class ProjectingEventSink:
             ),
         )
         if event.payload.get("will_retry"):
+            if event.payload.get("failure_code") != "provider_failed":
+                connection.execute(
+                    """UPDATE turns SET provider_prior_retry_typed_code = ?,
+                       provider_prior_retry_code = ? WHERE id = ?""",
+                    (
+                        event.payload.get("typed_code"),
+                        event.payload.get("failure_code"),
+                        scope["id"],
+                    ),
+                )
             suffix = (
                 f" `{retry_count}/{retry_limit}`"
                 if retry_count and isinstance(retry_limit, int)
@@ -1493,6 +1499,9 @@ class ProjectingEventSink:
             SET state = ?, terminal_code = ?, error_code = ?, ended_at = ?,
                 provider_error_code = COALESCE(?, provider_error_code),
                 provider_error_underlying_code = COALESCE(?, provider_error_underlying_code),
+                provider_terminal_typed_code = ?,
+                provider_prior_retry_typed_code = COALESCE(?, provider_prior_retry_typed_code),
+                provider_prior_retry_code = COALESCE(?, provider_prior_retry_code),
                 provider_retry_count = MAX(provider_retry_count, ?),
                 provider_retry_limit = COALESCE(?, provider_retry_limit),
                 provider_http_status = COALESCE(?, provider_http_status),
@@ -1505,8 +1514,10 @@ class ProjectingEventSink:
                 terminal_code if target is TurnState.FAILED else None,
                 now,
                 event.payload.get("failure_code"),
-                event.payload.get("underlying_typed_code")
-                or event.payload.get("typed_code"),
+                event.payload.get("underlying_typed_code") or event.payload.get("typed_code"),
+                event.payload.get("typed_code"),
+                event.payload.get("prior_retry_typed_code"),
+                event.payload.get("prior_retry_code"),
                 int(event.payload.get("retry_count") or 0),
                 event.payload.get("retry_limit"),
                 event.payload.get("http_status"),
@@ -1625,11 +1636,22 @@ class ProjectingEventSink:
                 "usage": usage,
                 "provider_error_code": event.payload.get("failure_code"),
                 "provider_error_underlying_code": (
-                    event.payload.get("underlying_typed_code")
-                    or event.payload.get("typed_code")
+                    event.payload.get("underlying_typed_code") or event.payload.get("typed_code")
                 ),
-                "provider_retry_count": int(event.payload.get("retry_count") or 0),
-                "provider_retry_limit": event.payload.get("retry_limit"),
+                "provider_retry_count": max(
+                    int(event.payload.get("retry_count") or 0), int(scope["provider_retry_count"]),
+                ),
+                "provider_terminal_typed_code": event.payload.get("typed_code"),
+                "provider_prior_retry_typed_code": (
+                    event.payload.get("prior_retry_typed_code")
+                    or scope["provider_prior_retry_typed_code"]
+                ),
+                "provider_prior_retry_code": (
+                    event.payload.get("prior_retry_code") or scope["provider_prior_retry_code"]
+                ),
+                "provider_retry_limit": (
+                    event.payload.get("retry_limit") or scope["provider_retry_limit"]
+                ),
                 "provider_http_status": event.payload.get("http_status"),
                 "provider_safe_message": event.payload.get("safe_message"),
                 "provider_degraded": self._revision_is_degraded(
@@ -1973,6 +1995,8 @@ def _durable_event_payload(event: NormalizedEvent) -> dict[str, Any]:
     if event.kind == "provider.error":
         result = {
             "will_retry": bool(payload.get("will_retry")),
+            "prior_retry_typed_code": payload.get("prior_retry_typed_code"),
+            "prior_retry_code": payload.get("prior_retry_code"),
             "failure_code": payload.get("failure_code"),
             "typed_code": payload.get("typed_code"),
             "http_status": payload.get("http_status"),
@@ -1991,6 +2015,10 @@ def _durable_event_payload(event: NormalizedEvent) -> dict[str, Any]:
     }:
         result = {
             "provider_turn_id": payload.get("provider_turn_id"),
+            "prior_retry_typed_code": payload.get("prior_retry_typed_code"),
+            "prior_retry_code": payload.get("prior_retry_code"),
+            "underlying_typed_code": payload.get("underlying_typed_code"),
+            "retry_exhausted": bool(payload.get("retry_exhausted")),
             "status": payload.get("status"),
             "failure_code": payload.get("failure_code"),
             "typed_code": payload.get("typed_code"),

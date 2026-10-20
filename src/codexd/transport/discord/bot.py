@@ -10,7 +10,7 @@ import re
 import secrets
 import time
 from collections import deque
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -81,9 +81,7 @@ from codexd.transport.discord.reconnect import DiscordReconnectBackoff
 logger = logging.getLogger(__name__)
 _DISCORD_INTERACTION_ACK_DEADLINE_SECONDS = 3.0
 _MODAL_RESPONSE_NETWORK_BUDGET_SECONDS = 1.0
-_FATAL_GATEWAY_CLOSE_CODES = frozenset(
-    {4001, 4002, 4003, 4004, 4005, 4010, 4011, 4012, 4013}
-)
+_FATAL_GATEWAY_CLOSE_CODES = frozenset({4001, 4002, 4003, 4004, 4005, 4010, 4011, 4012, 4013})
 _IDENTIFY_GATEWAY_CLOSE_CODES = frozenset({4007, 4009})
 
 
@@ -2569,25 +2567,20 @@ class CodexDBot(discord.Client):
             "**Core**",
             "  available: " + ", ".join(f"`{name}`" for name in core_available),
             *(
-                [
-                    "  unavailable: "
-                    + ", ".join(f"`{name}`" for name in core_unavailable)
-                ]
+                ["  unavailable: " + ", ".join(f"`{name}`" for name in core_unavailable)]
                 if core_unavailable
                 else []
             ),
             "**Optional**",
             *(
                 [
-                    f"  `{label}`: "
-                    + ", ".join(f"`{name}`" for name in names)
+                    f"  `{label}`: " + ", ".join(f"`{name}`" for name in names)
                     for label, names in sorted(optional_groups.items())
                 ]
                 or ["  none"]
             ),
             "**Product-gated**",
-            "  `review`, `plan_mode`, `agent_control`, `sdk_mention_input`, "
-            "`account_mutation`",
+            "  `review`, `plan_mode`, `agent_control`, `sdk_mention_input`, `account_mutation`",
             "**Discord ingress**",
             "  `bot_mention_input`: available",
             "  `conversation_thread_input`: available",
@@ -2609,7 +2602,7 @@ class CodexDBot(discord.Client):
         )
         if conversation is not None:
             catalog = await self.session_lifecycle.model_catalog(conversation.id)
-            model = _effective_model(catalog.models, conversation.model_override)
+            model = await self.session_lifecycle.model_descriptor(conversation.id, catalog)
             lines.extend(
                 (
                     "**Selected model**",
@@ -2944,7 +2937,6 @@ class CodexDBot(discord.Client):
             await interaction.response.send_modal(modal)
         finally:
             self._untrack_ingress(task)
-
     async def _steer(self, interaction: discord.Interaction[Any]) -> None:
         async def prepare() -> discord.ui.Modal:
             if not self._authorized_interaction(interaction):
@@ -3002,6 +2994,7 @@ class CodexDBot(discord.Client):
         if self.side_queries is None:
             raise ConflictError("Side Query is unavailable")
         if question is None:
+
             async def prepare() -> discord.ui.Modal:
                 if not self._authorized_interaction(interaction):
                     raise SecurityError("Side Query is not authorized")
@@ -3084,20 +3077,46 @@ class CodexDBot(discord.Client):
         await self._defer_authorized(interaction)
         conversation = await self._conversation(interaction)
         catalog = await self.session_lifecycle.model_catalog(conversation.id)
-        selected = _effective_model(catalog.models, conversation.model_override)
+        resolved = await self.session_lifecycle.effective_model(conversation.id, catalog)
+        active = await asyncio.to_thread(
+            self.repository.active_turn_for_conversation,
+            conversation.id,
+        )
+        selected = resolved.descriptor
+        identity_lines = [
+            f"Next Turn model: `{_safe_embed_text(resolved.model or 'unknown')}`",
+            f"Source: `{resolved.source}`",
+        ]
+        if active is not None:
+            # effective_model is a requested override, not a runtime observation.
+            identity_lines.append("Current Turn observed model: `not reported`")
+            identity_lines.append(
+                "Current Turn requested model: "
+                f"`{_safe_embed_text(active.effective_model or 'provider config')}`"
+            )
+        if selected is None:
+            await interaction.followup.send(
+                "\n".join(
+                    [
+                        *identity_lines,
+                        "Catalog capabilities: `unknown / not reported` "
+                        "(reasoning, image input, personality, service tiers).",
+                    ]
+                ),
+                ephemeral=True,
+            )
+            return
         tiers = ", ".join(tier.id for tier in selected.service_tiers) or "none"
         await interaction.followup.send(
             "\n".join(
                 (
-                    f"Effective model: `{selected.model}` (`{selected.id}`)",
+                    *identity_lines,
                     f"Display: **{_safe_embed_text(selected.display_name or selected.model)}**",
                     (
                         f"Description: {_safe_embed_text(selected.description)}"
                         if selected.description
                         else "Description: `not provided`"
                     ),
-                    "Source: "
-                    f"`{_model_source(conversation.model_override)}`",
                     f"Catalog: `{'complete' if catalog.complete else 'incomplete'}` · "
                     f"image input `{'image' in selected.input_modalities}`",
                     "Reasoning efforts: "
@@ -3192,31 +3211,18 @@ class CodexDBot(discord.Client):
         choices = [default, *candidates]
         return choices if len(choices) <= 25 else []
 
-    async def _model_tier_show(
-        self, interaction: discord.Interaction[Any]
-    ) -> None:
+    async def _model_tier_show(self, interaction: discord.Interaction[Any]) -> None:
         await self._defer_authorized(interaction)
         conversation = await self._conversation(interaction)
         catalog = await self.session_lifecycle.model_catalog(conversation.id)
-        selected = next(
-            (
-                model
-                for model in catalog.models
-                if (
-                    conversation.model_override in {model.id, model.model}
-                    if conversation.model_override is not None
-                    else model.is_default
-                )
-            ),
-            None,
+        selected = await self.session_lifecycle.model_descriptor(conversation.id, catalog)
+        tiers = (
+            "\n".join(
+                f"`{tier.id}` · {tier.name}{' · ' + tier.description if tier.description else ''}"
+                for tier in selected.service_tiers
+            )
+            or "This model exposes no service tiers."
         )
-        if selected is None:
-            raise InvariantError("effective model is missing from the Codex catalog")
-        tiers = "\n".join(
-            f"`{tier.id}` · {tier.name}"
-            f"{' · ' + tier.description if tier.description else ''}"
-            for tier in selected.service_tiers
-        ) or "This model exposes no service tiers."
         await interaction.followup.send(
             f"Model: `{selected.model}` · configured tier: "
             f"`{conversation.service_tier_override or 'default'}`\n{tiers}",
@@ -3253,7 +3259,7 @@ class CodexDBot(discord.Client):
         await self._defer_authorized(interaction)
         conversation = await self._conversation(interaction)
         catalog = await self.session_lifecycle.model_catalog(conversation.id)
-        selected = _effective_model(catalog.models, conversation.model_override)
+        selected = await self.session_lifecycle.model_descriptor(conversation.id, catalog)
         await interaction.followup.send(
             "\n".join(
                 (
@@ -3263,8 +3269,7 @@ class CodexDBot(discord.Client):
                     f"Model default: `{selected.default_reasoning_effort or 'provider default'}`",
                     f"Conversation override: "
                     f"`{conversation.reasoning_effort_override or 'default'}`",
-                    f"Effective: "
-                    f"`{_effective_reasoning(conversation, selected)}`",
+                    f"Effective: `{_effective_reasoning(conversation, selected)}`",
                 )
             ),
             ephemeral=True,
@@ -3312,11 +3317,20 @@ class CodexDBot(discord.Client):
             return []
         if catalog is None or not catalog.complete:
             return []
-        selected = _effective_model(catalog.models, conversation.model_override)
+        try:
+            selected = await asyncio.wait_for(
+                self.session_lifecycle.model_descriptor(
+                    conversation.id,
+                    catalog,
+                    only_if_loaded=True,
+                ),
+                timeout=0.4,
+            )
+        except (CodexDError, TimeoutError):
+            return []
         query = current.casefold().strip()
         descriptions = {
-            option.value: option.description
-            for option in selected.reasoning_effort_options
+            option.value: option.description for option in selected.reasoning_effort_options
         }
         candidates = [
             app_commands.Choice(
@@ -3328,8 +3342,7 @@ class CodexDBot(discord.Client):
                 value=effort,
             )
             for effort in selected.supported_reasoning_efforts
-            if not query
-            or query in f"{effort} {descriptions.get(effort, '')}".casefold()
+            if not query or query in f"{effort} {descriptions.get(effort, '')}".casefold()
         ]
         candidate_values = [candidate.value for candidate in candidates]
         if len(candidate_values) != len(set(candidate_values)):
@@ -3350,28 +3363,17 @@ class CodexDBot(discord.Client):
         conversation: ConversationRecord,
         kind: str,
     ) -> None:
-        catalog, generation = (
-            await self.session_lifecycle.model_catalog_with_generation(
-                conversation.id
-            )
+        catalog, generation = await self.session_lifecycle.model_catalog_with_generation(
+            conversation.id
         )
         if not catalog.complete:
-            raise InvariantError(
-                "Codex model catalog is incomplete; selection is disabled"
-            )
+            raise InvariantError("Codex model catalog is incomplete; selection is disabled")
         if kind == "model":
-            choices = [
-                (model.model, _model_choice_label(model))
-                for model in catalog.models
-            ]
+            choices = [(model.model, _model_choice_label(model)) for model in catalog.models]
         else:
-            selected = _effective_model(
-                catalog.models,
-                conversation.model_override,
-            )
+            selected = await self.session_lifecycle.model_descriptor(conversation.id, catalog)
             descriptions = {
-                option.value: option.description
-                for option in selected.reasoning_effort_options
+                option.value: option.description for option in selected.reasoning_effort_options
             }
             choices = [
                 (
@@ -3430,8 +3432,7 @@ class CodexDBot(discord.Client):
             min_values=1,
             max_values=1,
             options=[
-                discord.SelectOption(label=label[:100], value=value)
-                for value, label in choices
+                discord.SelectOption(label=label[:100], value=value) for value, label in choices
             ],
         )
         view = discord.ui.View(timeout=600)
@@ -3489,13 +3490,11 @@ class CodexDBot(discord.Client):
         )
         await interaction.followup.send("Reasoning summary: `default`.", ephemeral=True)
 
-    async def _personality_show(
-        self, interaction: discord.Interaction[Any]
-    ) -> None:
+    async def _personality_show(self, interaction: discord.Interaction[Any]) -> None:
         await self._defer_authorized(interaction)
         conversation = await self._conversation(interaction)
         catalog = await self.session_lifecycle.model_catalog(conversation.id)
-        selected = _effective_model(catalog.models, conversation.model_override)
+        selected = await self.session_lifecycle.model_descriptor(conversation.id, catalog)
         await interaction.followup.send(
             f"Model `{selected.model}` personality support: "
             f"`{'available' if selected.supports_personality else 'unavailable'}` · "
@@ -4312,10 +4311,6 @@ def _usage_observation(observed: object) -> str:
     return "observed" if observed is True else "not reported"
 
 
-def _model_source(override: str | None) -> str:
-    return "conversation override" if override else "provider default"
-
-
 def _assert_discord_connect_contract() -> None:
     version = tuple(int(part) for part in discord.__version__.split(".")[:2])
     if version < (2, 6) or version >= (3, 0):
@@ -4370,22 +4365,6 @@ def _reasoning_choice_label(
     detail = description.strip()
     suffix = " · model default" if is_default else ""
     return f"{effort}{suffix}{' · ' + detail if detail else ''}"[:100]
-
-
-def _effective_model(
-    models: Sequence[ModelDescriptor],
-    override: str | None,
-) -> ModelDescriptor:
-    if override is not None:
-        selected = next(
-            (model for model in models if override in {model.id, model.model}),
-            None,
-        )
-    else:
-        selected = next((model for model in models if model.is_default), None)
-    if selected is None:
-        raise InvariantError("effective model is missing from the Codex catalog")
-    return selected
 
 
 def _remove_bot_mention(message: discord.Message, user_id: int) -> str:

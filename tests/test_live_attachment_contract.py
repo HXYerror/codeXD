@@ -23,7 +23,7 @@ from codexd.security import private_files
 
 
 @pytest.mark.asyncio
-async def test_live_0144_4_app_server_reads_materialized_zip_marker(
+async def test_live_0147_0_app_server_reads_materialized_zip_marker(
     storage_context: StorageContext,
 ) -> None:
     """Opt-in semantic contract; this starts one real, potentially billed Turn."""
@@ -34,8 +34,8 @@ async def test_live_0144_4_app_server_reads_materialized_zip_marker(
         name: importlib.metadata.version(name)
         for name in ("openai-codex", "openai-codex-cli-bin")
     }
-    if set(versions.values()) != {"0.144.4"}:
-        pytest.skip(f"the semantic regression fixture is pinned to 0.144.4: {versions}")
+    if set(versions.values()) != {"0.147.0"}:
+        pytest.fail(f"the semantic regression fixture requires 0.147.0: {versions}")
 
     marker = "CODEXD_ATTACHMENT_" + secrets.token_hex(16)
     archive_stream = io.BytesIO()

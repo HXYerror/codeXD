@@ -21,7 +21,12 @@ from codexd.domain.conversations import (
     WebSearchMode,
 )
 from codexd.domain.ids import canonical_json, sha256_text
-from codexd.domain.models import ModelCatalogSnapshot, ModelDescriptor
+from codexd.domain.models import (
+    EffectiveModel,
+    ModelCatalogSnapshot,
+    ModelDescriptor,
+    resolve_model,
+)
 from codexd.errors import InvariantError, NotFoundError
 from codexd.runtime.errors import AdapterError, ProviderOutcomeUnknown
 from codexd.runtime.port import CodexRuntime
@@ -188,7 +193,16 @@ class SessionLifecycleCoordinator:
                 f"matching failures ({revision.degraded_failure_code}); run /session new"
             )
 
-        behavior = _session_behavior(conversation, project, catalog)
+        configured = EffectiveModel(None, "unknown (runtime not loaded)")
+        if runtime_status["state"] == "ready":
+            try:
+                configured = await asyncio.wait_for(
+                    self._runtimes.configured_model_if_loaded(project),
+                    timeout=_STATUS_CATALOG_TIMEOUT_SECONDS,
+                )
+            except (AdapterError, TimeoutError):
+                configured = EffectiveModel(None, "unknown (effective config unavailable)")
+        behavior = _session_behavior(conversation, project, catalog, configured)
         if degraded_reason is None and behavior.resolution in {
             "catalog incomplete",
             "configured model unavailable",
@@ -234,12 +248,10 @@ class SessionLifecycleCoordinator:
                     "revision_id": revision.id if revision is not None else None,
                     "invalid_fields": sorted(invalid_identity),
                     "value_hashes": {
-                        name: sha256_text(value)
-                        for name, value in sorted(invalid_identity.items())
+                        name: sha256_text(value) for name, value in sorted(invalid_identity.items())
                     },
                     "value_lengths": {
-                        name: len(value)
-                        for name, value in sorted(invalid_identity.items())
+                        name: len(value) for name, value in sorted(invalid_identity.items())
                     },
                 },
             )
@@ -940,6 +952,40 @@ class SessionLifecycleCoordinator:
         catalog, _generation = await self._runtimes.refresh_model_catalog(project)
         return catalog
 
+    async def effective_model(
+        self,
+        conversation_id: str,
+        catalog: ModelCatalogSnapshot | None = None,
+        *,
+        only_if_loaded: bool = False,
+    ) -> EffectiveModel:
+        conversation = await asyncio.to_thread(self._repository.get_conversation, conversation_id)
+        project = await asyncio.to_thread(self._repository.get_project, conversation.project_id)
+        configured = EffectiveModel(None, "unknown (effective config unavailable)")
+        if conversation.model_override is None and project.default_model is None:
+            if only_if_loaded:
+                configured = await self._runtimes.configured_model_if_loaded(project)
+            else:
+                runtime, _lease = await self._runtimes.ensure(project)
+                configured = await runtime.configured_model(project.root_path)
+        return resolve_model(
+            catalog, conversation.model_override, project.default_model, configured
+        )
+
+    async def model_descriptor(
+        self,
+        conversation_id: str,
+        catalog: ModelCatalogSnapshot,
+        *,
+        only_if_loaded: bool = False,
+    ) -> ModelDescriptor:
+        resolved = await self.effective_model(
+            conversation_id,
+            catalog,
+            only_if_loaded=only_if_loaded,
+        )
+        return resolved.require_descriptor()
+
     async def model_catalog_with_generation(
         self,
         conversation_id: str,
@@ -974,39 +1020,27 @@ class SessionLifecycleCoordinator:
         expected_hash: str,
     ) -> None:
         await self.assert_runtime_generation(conversation_id, generation)
-        catalog, observed_generation = await self.model_catalog_with_generation(
-            conversation_id
-        )
+        catalog, observed_generation = await self.model_catalog_with_generation(conversation_id)
         if observed_generation != generation:
-            raise InvariantError(
-                "Codex runtime changed; reopen the model or reasoning selector"
-            )
-        conversation = await asyncio.to_thread(
-            self._repository.get_conversation,
-            conversation_id,
-        )
+            raise InvariantError("Codex runtime changed; reopen the model or reasoning selector")
         if not catalog.complete:
             raise InvariantError("Codex model catalog became incomplete")
+        descriptor = (
+            await self.model_descriptor(conversation_id, catalog) if kind != "model" else None
+        )
         values = (
             ["default", *(model.model for model in catalog.models)]
             if kind == "model"
             else [
                 "default",
-                *_effective_model(
-                    catalog,
-                    conversation.model_override,
-                ).supported_reasoning_efforts,
+                *(descriptor.supported_reasoning_efforts if descriptor else ()),
             ]
         )
         observed_hash = sha256_text(
-            canonical_json(
-                {"kind": kind, "generation": generation, "values": values}
-            )
+            canonical_json({"kind": kind, "generation": generation, "values": values})
         )
         if not hmac.compare_digest(observed_hash, expected_hash):
-            raise InvariantError(
-                "Codex catalog changed; reopen the model or reasoning selector"
-            )
+            raise InvariantError("Codex catalog changed; reopen the model or reasoning selector")
 
     async def model_catalog_if_loaded(
         self,
@@ -1081,15 +1115,10 @@ class SessionLifecycleCoordinator:
         interaction_id: str | None = None,
     ) -> ConversationRecord:
         async with self._locks.hold(conversation_id):
-            await asyncio.to_thread(
-                self._repository.assert_conversation_mutable, conversation_id
-            )
+            await asyncio.to_thread(self._repository.assert_conversation_mutable, conversation_id)
             if effort is not None:
-                conversation = await asyncio.to_thread(
-                    self._repository.get_conversation, conversation_id
-                )
                 catalog = await self.model_catalog(conversation_id)
-                descriptor = _effective_model(catalog, conversation.model_override)
+                descriptor = await self.model_descriptor(conversation_id, catalog)
                 if effort not in descriptor.supported_reasoning_efforts:
                     supported = ", ".join(descriptor.supported_reasoning_efforts)
                     raise InvariantError(
@@ -1139,21 +1168,18 @@ class SessionLifecycleCoordinator:
             "friendly",
             "pragmatic",
         }:
-            raise InvariantError(
-                "personality must be none, friendly, pragmatic, or default"
-            )
+            raise InvariantError("personality must be none, friendly, pragmatic, or default")
         async with self._locks.hold(conversation_id):
-            conversation, project, _config = await self._context(
+            _conversation, project, _config = await self._context(
                 conversation_id, reject_active_schedules=False
             )
             runtime, _lease = await self._runtimes.ensure(project)
             await _require_capabilities(runtime, "turn.personality")
-            catalog = await runtime.list_models()
-            descriptor = _effective_model(catalog, conversation.model_override)
-            if personality is not None and not descriptor.supports_personality:
-                raise InvariantError(
-                    f"model {descriptor.model} does not support personality"
-                )
+            if personality is not None:
+                catalog = await runtime.list_models()
+                descriptor = await self.model_descriptor(conversation_id, catalog)
+                if not descriptor.supports_personality:
+                    raise InvariantError(f"model {descriptor.model} does not support personality")
             return await asyncio.to_thread(
                 self._repository.update_conversation_preferences,
                 conversation_id,
@@ -1169,7 +1195,7 @@ class SessionLifecycleCoordinator:
         interaction_id: str | None = None,
     ) -> ConversationRecord:
         async with self._locks.hold(conversation_id):
-            conversation, project, _config = await self._context(
+            _conversation, project, _config = await self._context(
                 conversation_id, reject_active_schedules=False
             )
             runtime, _lease = await self._runtimes.ensure(project)
@@ -1180,7 +1206,7 @@ class SessionLifecycleCoordinator:
                     raise InvariantError(
                         "Codex model catalog is incomplete; service-tier changes are disabled"
                     )
-                descriptor = _effective_model(catalog, conversation.model_override)
+                descriptor = await self.model_descriptor(conversation_id, catalog)
                 tiers = {tier.id for tier in descriptor.service_tiers}
                 if service_tier not in tiers:
                     supported = ", ".join(sorted(tiers)) or "none"
@@ -1552,12 +1578,16 @@ def _session_behavior(
     conversation: ConversationRecord,
     project: ProjectRecord,
     catalog: ModelCatalogSnapshot | None,
+    configured: EffectiveModel | None = None,
 ) -> SessionBehaviorStatus:
-    requested_model, model_source = _configured_value(
+    effective = resolve_model(
+        catalog,
         conversation.model_override,
         project.default_model,
+        configured or EffectiveModel(None, "unknown"),
     )
-    descriptor: ModelDescriptor | None = None
+    requested_model, model_source = effective.model, effective.source
+    descriptor = effective.descriptor
     resolution = "resolved"
     if catalog is None:
         resolution = "resolves on next Turn"
@@ -1566,26 +1596,14 @@ def _session_behavior(
             descriptor = _find_model(catalog, requested_model)
         except InvariantError:
             resolution = (
-                "configured model unavailable"
-                if catalog.complete
-                else "catalog incomplete"
+                "configured model unavailable" if catalog.complete else "catalog incomplete"
             )
     else:
-        descriptor = next((model for model in catalog.models if model.is_default), None)
-        if descriptor is None:
-            resolution = (
-                "configured model unavailable"
-                if catalog.complete
-                else "catalog incomplete"
-            )
+        resolution = "effective model unknown"
 
     model = SessionStatusValue(
-        value=(
-            descriptor.model
-            if descriptor is not None
-            else requested_model or "provider default"
-        ),
-        source=(model_source if requested_model is not None else "provider default"),
+        value=(descriptor.model if descriptor is not None else requested_model or "unknown"),
+        source=model_source,
     )
     reasoning_effort = _resolved_value(
         conversation.reasoning_effort_override,
@@ -1618,9 +1636,7 @@ def _session_behavior(
         personality=personality,
         service_tier=service_tier,
         web_search_mode=conversation.web_search_mode,
-        input_modalities=(
-            descriptor.input_modalities if descriptor is not None else ()
-        ),
+        input_modalities=(descriptor.input_modalities if descriptor is not None else ()),
         resolution=resolution,
     )
 
@@ -1690,17 +1706,6 @@ def _find_model(
     if len(matches) > 1 and len({model.model for model in matches}) > 1:
         raise InvariantError(f"model identifier is ambiguous: {requested}")
     return matches[0]
-
-
-def _effective_model(
-    catalog: ModelCatalogSnapshot, override: str | None
-) -> ModelDescriptor:
-    if override is not None:
-        return _find_model(catalog, override)
-    for model in catalog.models:
-        if model.is_default:
-            return model
-    raise InvariantError("Codex model catalog does not identify a default model")
 
 
 async def _require_capabilities(runtime: CodexRuntime, *names: str) -> None:

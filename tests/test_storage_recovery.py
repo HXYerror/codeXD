@@ -233,6 +233,81 @@ def test_outbox_dedupe_rejects_divergent_operation(
         )
 
 
+@pytest.mark.parametrize("terminal", ["other", "unauthorized"])
+def test_provider_retry_context_is_durable_and_final_is_unique(
+    storage_context: StorageContext,
+    terminal: str,
+) -> None:
+    from codexd.transport.discord.outbox import _provider_failure_guidance
+
+    turn, lease = _running_turn(storage_context, "retry-context")
+    sink = ProjectingEventSink(storage_context.store, correlation_key=b"e" * 32)
+    for i in range(1, 6):
+        sink.record(
+            turn_id=turn.id,
+            runtime_generation=lease.generation,
+            event=NormalizedEvent(
+                "provider.error",
+                {
+                    "will_retry": True,
+                    "typed_code": "responseStreamDisconnected",
+                    "failure_code": "provider_stream_disconnected",
+                    "retry_count": i,
+                    "retry_limit": 5,
+                    "message": "private prompt",
+                },
+            ),
+        )
+    # A fresh sink must recover the previous typed context from durable state.
+    sink = ProjectingEventSink(storage_context.store, correlation_key=b"e" * 32)
+    code = "provider_failed" if terminal == "other" else "provider_unauthorized"
+    event = NormalizedEvent(
+        "turn.failed",
+        {
+            "typed_code": terminal,
+            "failure_code": code,
+            "retry_count": 5,
+            "retry_limit": 5,
+        },
+    )
+    for _ in range(2):
+        sink.record(
+            turn_id=turn.id,
+            runtime_generation=lease.generation,
+            event=event,
+            terminal_state=TurnState.FAILED,
+            terminal_code=code,
+        )
+    with SQLiteStore(storage_context.store.path) as reopened:
+        recorded = Repository(reopened).get_turn(turn.id)
+        assert recorded.provider_terminal_typed_code == terminal
+        assert recorded.provider_prior_retry_typed_code == "responseStreamDisconnected"
+        assert recorded.provider_error_code == code
+        finals = reopened.connection.execute(
+            "SELECT payload_json FROM discord_outbox WHERE dedupe_key = ?",
+            (f"turn:{turn.id}:final",),
+        ).fetchall()
+        assert len(finals) == 1
+        payload = json.loads(finals[0]["payload_json"])
+        rendered = _provider_failure_guidance(payload)
+        assert rendered is not None and "5/5" in rendered
+        if terminal == "other":
+            assert "unspecified" in rendered and "stream disconnected" in rendered
+        else:
+            assert "authentication was rejected" in rendered
+        assert "private prompt" not in finals[0]["payload_json"]
+    conversation = storage_context.repository.get_conversation(storage_context.conversation.id)
+    assert conversation.recovery_reason is None
+    next_turn = storage_context.repository.enqueue_turn(
+        conversation_id=conversation.id,
+        source=TurnSource.DISCORD,
+        turn_input=TurnInput(text="next"),
+        input_message_id="next-no-retries",
+    )
+    assert next_turn.provider_prior_retry_typed_code is None
+    assert next_turn.provider_retry_count == 0
+
+
 def test_provider_event_id_rejects_divergent_content(
     storage_context: StorageContext,
 ) -> None:
@@ -1564,14 +1639,12 @@ def test_channel_binding_migration_preserves_legacy_conversation_identity(
             )
 
         monkeypatch.setattr(sqlite_module, "_load_migrations", lambda: migrations)
-        assert store.migrate() == 25
+        assert store.migrate() == 26
         assert store.foreign_key_check() == ()
         repository = Repository(store)
         project = repository.get_project("legacy-project")
         conversation = repository.get_conversation("legacy-conversation")
-        columns = {
-            str(row["name"]) for row in store.query_all("PRAGMA table_info(projects)")
-        }
+        columns = {str(row["name"]) for row in store.query_all("PRAGMA table_info(projects)")}
 
         assert "enabled" not in columns
         assert "discord_channel_id" not in columns
@@ -1602,9 +1675,7 @@ def test_terminal_progress_cleanup_migration_preserves_rollout_boundary(
         monkeypatch.setattr(
             sqlite_module,
             "_load_migrations",
-            lambda: tuple(
-                migration for migration in migrations if migration.version < 16
-            ),
+            lambda: tuple(migration for migration in migrations if migration.version < 16),
         )
         assert store.migrate() == 15
         repository = Repository(store)
@@ -1695,7 +1766,7 @@ def test_terminal_progress_cleanup_migration_preserves_rollout_boundary(
         )
 
         monkeypatch.setattr(sqlite_module, "_load_migrations", lambda: migrations)
-        assert store.migrate() == 25
+        assert store.migrate() == 26
         active_row = store.query_one(
             """
             SELECT discord_message_id, cleanup_state, deleted_at
@@ -1744,9 +1815,7 @@ def test_terminal_progress_cleanup_migration_preserves_rollout_boundary(
             (terminal_turn.id,),
         )
         assert delivered_terminal_row is not None
-        assert delivered_terminal_row["discord_message_id"] == (
-            "terminal-legacy-remote-progress"
-        )
+        assert delivered_terminal_row["discord_message_id"] == ("terminal-legacy-remote-progress")
         assert delivered_terminal_row["cleanup_state"] == "legacy_ineligible"
 
         legacy_final = repository.claim_outbox(worker_id="legacy-final-worker")
@@ -1757,17 +1826,23 @@ def test_terminal_progress_cleanup_migration_preserves_rollout_boundary(
             lease_owner=legacy_final.lease_owner,
             lease_attempt=legacy_final.attempts,
         )
-        assert store.query_one(
-            "SELECT 1 FROM discord_outbox WHERE dedupe_key = ?",
-            (f"turn:{terminal_turn.id}:progress:delete",),
-        ) is None
-        assert store.query_one(
-            """
+        assert (
+            store.query_one(
+                "SELECT 1 FROM discord_outbox WHERE dedupe_key = ?",
+                (f"turn:{terminal_turn.id}:progress:delete",),
+            )
+            is None
+        )
+        assert (
+            store.query_one(
+                """
             SELECT 1 FROM discord_outbox
             WHERE state IN ('pending', 'retry', 'reconciling', 'sending')
             LIMIT 1
             """
-        ) is None
+            )
+            is None
+        )
 
         repository.request_cancel(active_turn.id, origin=InterruptOrigin.USER)
         while True:
@@ -1784,9 +1859,7 @@ def test_terminal_progress_cleanup_migration_preserves_rollout_boundary(
                     else None
                 ),
                 turn_progress_id=(
-                    active_turn.id
-                    if payload.get("kind") == "turn_progress"
-                    else None
+                    active_turn.id if payload.get("kind") == "turn_progress" else None
                 ),
             )
             if payload.get("kind") == "turn_final":
@@ -1869,7 +1942,7 @@ def test_component_scope_migrations_expire_and_guard_legacy_pending_drafts(
             )
 
         monkeypatch.setattr(sqlite_module, "_load_migrations", lambda: migrations)
-        assert store.migrate() == 25
+        assert store.migrate() == 26
         row = store.query_one(
             """
             SELECT state, discord_guild_id, discord_channel_id
@@ -1993,7 +2066,7 @@ def test_turn_enqueue_sequence_migration_backfills_existing_turns(
                 )
 
         monkeypatch.setattr(sqlite_module, "_load_migrations", lambda: migrations)
-        assert store.migrate() == 25
+        assert store.migrate() == 26
         repository = Repository(store)
         third = repository.enqueue_turn(
             conversation_id="upgrade-conversation",
@@ -2095,18 +2168,15 @@ def test_schedule_fire_turn_fk_upgrade_preserves_pairs(
                 """
             )
             connection.execute(
-                "UPDATE schedule_fires SET turn_id = 'schedule-turn' "
-                "WHERE id = 'schedule-fire'"
+                "UPDATE schedule_fires SET turn_id = 'schedule-turn' WHERE id = 'schedule-fire'"
             )
 
         monkeypatch.setattr(sqlite_module, "_load_migrations", lambda: migrations)
-        assert store.migrate() == 25
+        assert store.migrate() == 26
         assert store.foreign_key_check() == ()
         fire_fks = store.query_all("PRAGMA foreign_key_list(schedule_fires)")
         assert any(
-            row["from"] == "turn_id"
-            and row["table"] == "turns"
-            and row["on_delete"] == "CASCADE"
+            row["from"] == "turn_id" and row["table"] == "turns" and row["on_delete"] == "CASCADE"
             for row in fire_fks
         )
         fire = store.query_one(

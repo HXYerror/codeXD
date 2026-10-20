@@ -126,6 +126,9 @@ class TurnRecord:
     error_message_redacted: str | None
     provider_error_code: str | None
     provider_error_underlying_code: str | None
+    provider_terminal_typed_code: str | None
+    provider_prior_retry_typed_code: str | None
+    provider_prior_retry_code: str | None
     provider_retry_count: int
     provider_retry_limit: int | None
     provider_http_status: int | None

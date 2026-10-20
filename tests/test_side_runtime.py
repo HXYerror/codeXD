@@ -98,9 +98,11 @@ def test_side_query_detects_nested_mcp_configuration(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("correlated", [False, True])
 async def test_runtime_side_query_is_ephemeral_read_only_and_unsubscribed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    correlated: bool,
 ) -> None:
     codex_home = tmp_path / "codex-home"
     codex_home.mkdir()
@@ -114,6 +116,13 @@ async def test_runtime_side_query_is_ephemeral_read_only_and_unsubscribed(
         topology_contract="project_scoped",
     )
     client = _SideClient()
+    if correlated:
+        from unittest.mock import AsyncMock
+        snapshot = await client.thread.read()
+        snapshot.thread.forked_from_id = None
+        snapshot.thread.session_id = "ephemeral-session"
+        client.thread.read = AsyncMock(return_value=snapshot)
+        client.thread.fork_request_source = "main-provider-thread"
     monkeypatch.setattr(codex_sdk, "DynamicAsyncCodex", _SideClient)
     runtime = CodexSDKRuntime(
         client=cast(Any, client),

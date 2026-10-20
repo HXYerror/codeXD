@@ -25,6 +25,7 @@ from openai_codex.generated.v2_all import (
     ApprovalsReviewer,
     AskForApproval,
     AskForApprovalValue,
+    ConfigReadResponse,
     DangerFullAccessSandboxPolicy,
     DynamicToolSpec,
     GetAccountParams,
@@ -47,7 +48,7 @@ from openai_codex.generated.v2_all import (
     TurnSteerResponse,
     WorkspaceWriteSandboxPolicy,
 )
-from openai_codex.models import InitializeResponse, JsonObject, JsonValue, Notification
+from openai_codex.models import InitializeResponse, JsonObject, JsonValue, Notification, ServerInfo
 from openai_codex.types import Personality, ReasoningEffort, ReasoningSummary
 
 from codexd.domain.ids import canonical_json
@@ -70,7 +71,7 @@ _APPROVAL_METHODS = frozenset(
 class DynamicAsyncCodex:
     """Version-gated async facade over the public low-level SDK client.
 
-    The high-level SDK does not expose server-request handlers in 0.144.4.
+    The high-level SDK does not expose server-request handlers in 0.147.0.
     This compatibility facade injects the handler through ``CodexClient``'s
     public constructor and otherwise calls only public typed client methods.
     """
@@ -105,6 +106,10 @@ class DynamicAsyncCodex:
         await asyncio.to_thread(self._sync_client.start)
         try:
             self._metadata = await asyncio.to_thread(self._sync_client.initialize)
+            if self._metadata.serverInfo is None and self._metadata.userAgent:
+                name, separator, version = self._metadata.userAgent.partition("/")
+                if separator and name and version:
+                    self._metadata.serverInfo = ServerInfo(name=name, version=version)
         except BaseException:
             await asyncio.to_thread(self._sync_client.close)
             self._loop = None
@@ -134,6 +139,15 @@ class DynamicAsyncCodex:
             self._observed_image_paths.clear()
         self._metadata = None
         self._loop = None
+
+    async def read_config(self, cwd: str) -> ConfigReadResponse:
+        params: JsonObject = {"cwd": cwd, "includeLayers": False}
+        return await asyncio.to_thread(
+            self._sync_client.request,
+            "config/read",
+            params,
+            response_model=ConfigReadResponse,
+        )
 
     async def models(self, *, include_hidden: bool = False) -> ModelListResponse:
         return await asyncio.to_thread(
@@ -238,7 +252,9 @@ class DynamicAsyncCodex:
             thread_id,
             params,
         )
-        return DynamicAsyncThread(self, response.thread.id)
+        if response.thread.id == thread_id:
+            raise ValueError("fork response reused its source thread")
+        return DynamicAsyncThread(self, response.thread.id, fork_request_source=thread_id)
 
     async def thread_unsubscribe(self, thread_id: str) -> str:
         params = ThreadUnsubscribeParams(thread_id=thread_id)
@@ -438,6 +454,8 @@ class DynamicAsyncCodex:
 class DynamicAsyncThread:
     codex: DynamicAsyncCodex
     id: str
+    # Request/response correlation, not fabricated persisted Thread metadata.
+    fork_request_source: str | None = None
 
     async def read(self, *, include_turns: bool = False) -> ThreadReadResponse:
         return await asyncio.to_thread(

@@ -1120,19 +1120,19 @@ SDK public type 虽名为 `RunInput`，它只是
 
 ### 7.4 SDK 与 CLI 版本兼容
 
-codexD 的发布依赖声明使用受测试的兼容范围，而不是固定单一版本：
+当前发布为 #41 锁定已认证的 SDK/runtime 配对；adapter 仍保留 minor 兼容范围：
 
 ```text
-openai-codex >= MIN_SUPPORTED, < NEXT_BREAKING
+release: openai-codex==0.147.0 -> openai-codex-cli-bin==0.147.0
+adapter: openai-codex>=0.147.0,<0.148
 ```
 
-`MIN_SUPPORTED` 和 `NEXT_BREAKING` 由 compatibility matrix 决定。若 SDK
-仍采用快速演进的预发布版本号，可以收窄到相邻 minor 范围，但不能把产品
-设计成只能安装一个 patch 版本。
+范围内其他 patch 只开放公开基础合同，附件、dynamic tools、Side Query
+在精确配对重新认证前保持关闭。版本验证禁止把 prerelease 截断成稳定版。
 
 SDK 对其配套 `openai-codex-cli-bin` 的依赖关系由官方 SDK 包管理：
 
-- codexD 不单独要求 SDK version 与 runtime version 字符串相等；
+- codexD 要求 SDK 与实际 initialized runtime 使用相同稳定版本；
 - 包管理器安装 SDK 声明的兼容 runtime；
 - codexD 通过 SDK handshake、required API 和 capability manifest 判断是否
   可用；
@@ -1140,25 +1140,26 @@ SDK 对其配套 `openai-codex-cli-bin` 的依赖关系由官方 SDK 包管理�
 - 使用 PATH 中任意 `codex` 覆盖 SDK runtime 默认不支持；
 - SDK 与 runtime 不能绕过官方依赖关系各自手工升级；
 - 运行时发现不兼容后不能静默降级到 `codex exec`；
-- 不依赖 SDK 私有模块路径。
+- 配置读取封装在版本门控 adapter：高层 SDK 无 facade 时，使用其现有
+  low-level client 的 typed `config/read`；不读取或持久化完整配置。
 
 分发策略：
 
 | 场景 | 策略 |
 |---|---|
-| PyPI/安装包依赖 | 声明兼容范围 |
-| CI | 测试 minimum、recommended、latest-supported 三个组合 |
+| PyPI/安装包依赖 | 精确配对 0.147.0 |
+| CI | macOS arm64、Linux x86_64/arm64、Windows amd64 的 0.147.0 配对 |
 | 独立应用产物 | 记录构建时解析版本，但不把该版本变成全局产品要求 |
 | 用户已有较新 SDK | 在受支持范围内先做 compatibility/capability check |
 | 超出声明范围 | 拒绝启动并给出升级 codexD 或调整 SDK 的明确提示 |
 
 补丁版本在声明范围内默认可安装；若启动检查发现 required capability 缺失，
 仍然 fail closed。Optional capability 按实际 manifest 注册，不按版本号猜测。
-`mention.input` 固定报告 false：0.144.4 的 `MentionInput.path` 是 app/plugin/skill
+`mention.input` 固定报告 false：0.147.0 的 `MentionInput.path` 是 app/plugin/skill
 结构化 target，不会把任意 filesystem path暴露给模型。ordinary file 能力由
 `codexd.attachment_materialization` 表示，并要求平台 owner-only/no-reparse lease、
 materialized snapshot、bounded host context 和真实 app-server marker-read contract。
-当前只对已实测的 SDK/runtime `0.144.4` 配对报告 true；范围内其他 patch 或 runtime
+当前只对已实测的 SDK/runtime `0.147.0` 配对报告 true；范围内其他 patch 或 runtime
 override 保持 false，直到独立 marker-read contract 通过。
 
 启动时记录：
@@ -1260,7 +1261,7 @@ capability 分开表示。
 SDK/runtime pair 的 public `CodexClient` handler、experimental opt-in、request
 routing 和 response schema 通过 contract；后者还要求 actor persistence、owner
 gate、Schedule draft/outbox transaction 与 Discord card contract 全部接线完成。
-当前只对 SDK/runtime `0.144.4/0.144.4` 报告为 true，范围内未验证 patch 保持
+当前只对 SDK/runtime `0.147.0/0.147.0` 报告为 true，范围内未验证 patch 保持
 false。自定义 handler 对 command/file approval 继续返回既有 `auto_review`
 decision；未知 server request 返回空结果，绝不按 Schedule 调用处理。
 
@@ -5570,7 +5571,7 @@ Golden fixtures：
   不启动 provider Turn，错误、日志和 diagnostics 不暴露路径、URL 或内容；
 - `codexd.attachment_materialization` 缺失时 file Turn 以 `file_input_unsupported` fail closed，文字/图片
   Turn 与既有 image modality gate 不受影响；
-- 显式 opt-in 的真实 `0.144.4` app-server contract 从安全 ZIP 中读取随机唯一 marker，
+- 显式 opt-in 的真实 `0.147.0` app-server contract 从安全 ZIP 中读取随机唯一 marker，
   最终回答必须返回 marker 且事件中必须出现 command execution；mock/wire serialization
   不能替代该验证，也不把计费 Turn 作为 daemon 启动探针；
 - normalized commit 后原始 EXIF/GPS quarantine 被删除；

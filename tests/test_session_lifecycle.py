@@ -21,7 +21,7 @@ from codexd.domain.conversations import (
     ThreadSnapshot,
 )
 from codexd.domain.ids import sha256_text
-from codexd.domain.models import ModelCatalogSnapshot, ModelDescriptor
+from codexd.domain.models import EffectiveModel, ModelCatalogSnapshot, ModelDescriptor
 from codexd.domain.turns import InterruptOrigin, TurnInput, TurnSource, TurnState
 from codexd.errors import ConflictError, InvariantError
 from codexd.runtime.errors import AdapterFailure, ProviderOutcomeUnknown
@@ -159,8 +159,8 @@ async def test_session_status_does_not_cold_start_runtime(
         assert view.provider_session_id is None
         assert view.provider_session_hash is None
         assert view.provider_thread_hash is None
-        assert view.behavior.model.value == "provider default"
-        assert view.behavior.model.source == "provider default"
+        assert view.behavior.model.value == "unknown"
+        assert view.behavior.model.source == "unknown (runtime not loaded)"
         assert view.behavior.resolution == "resolves on next Turn"
         assert view.degraded_reason is None
         session_field = next(
@@ -441,6 +441,7 @@ async def test_session_status_catalog_failure_degrades_without_failing(
     runtimes.model_catalog_if_loaded = AsyncMock(
         side_effect=RuntimeError("private path must not escape")
     )
+    runtimes.configured_model_if_loaded = AsyncMock(return_value=EffectiveModel(None, "unknown"))
     lifecycle = SessionLifecycleCoordinator(
         repository=storage_context.repository,
         runtimes=runtimes,
