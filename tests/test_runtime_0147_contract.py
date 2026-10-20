@@ -147,12 +147,23 @@ async def test_real_0147_dynamic_tools_and_thread_lifecycle(
                         if os.name == "nt"
                         else f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
                     )
+                    available = {
+                        tool.get("name") for tool in request.get("tools", [])
+                        if tool.get("type") == "function"
+                    }
+                    command_tool = (
+                        "exec_command" if "exec_command" in available else "shell_command"
+                    )
+                    arguments = (
+                        {"cmd": command} if command_tool == "exec_command"
+                        else {"command": command}
+                    )
                     item = {
                         "type": "function_call",
                         "id": "read-file",
                         "call_id": "read-file",
-                        "name": "exec_command",
-                        "arguments": json.dumps({"cmd": command}),
+                        "name": command_tool,
+                        "arguments": json.dumps(arguments),
                         "status": "completed",
                     }
                 else:
