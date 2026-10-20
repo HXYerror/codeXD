@@ -2174,6 +2174,10 @@ def _provider_failure_guidance(payload: Mapping[str, object]) -> str | None:
         "provider_policy_blocked": "The provider policy blocked this request.",
     }
     lines = [messages.get(code, "The provider failed before completion.")]
+    prior_code = payload.get("provider_prior_retry_code")
+    if code == "provider_failed" and isinstance(prior_code, str) and prior_code in messages:
+        lines = ["This Turn failed; the final error type is unspecified."]
+        lines.append(f"Earlier retry context: {messages[prior_code]}")
     retry_count = payload.get("provider_retry_count")
     retry_limit = payload.get("provider_retry_limit")
     if isinstance(retry_count, int) and retry_count > 0:

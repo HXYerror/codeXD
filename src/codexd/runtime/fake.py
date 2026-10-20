@@ -22,6 +22,7 @@ from codexd.domain.events import NormalizedEvent
 from codexd.domain.ids import utc_now_ms
 from codexd.domain.models import (
     AccountStatus,
+    EffectiveModel,
     ModelCatalogSnapshot,
     ModelDescriptor,
     ServiceTierDescriptor,
@@ -98,6 +99,9 @@ class FakeCodexRuntime:
                 "collab.item": EventCapability.SUPPORTED_NOT_OBSERVED,
             },
         )
+
+    async def configured_model(self, cwd: Path) -> EffectiveModel:
+        return EffectiveModel("fake-model", "provider default")
 
     async def list_models(self) -> ModelCatalogSnapshot:
         return ModelCatalogSnapshot(

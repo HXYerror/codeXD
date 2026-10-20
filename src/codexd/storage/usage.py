@@ -35,6 +35,13 @@ def validate_usage_payload(payload: Mapping[str, object]) -> dict[str, object]:
                     f"usage.updated {name}.{field} must be a non-negative integer"
                 )
             breakdown[field] = token_count
+        # 0.147 adds cache-write usage. Optional for older events; never reject
+        # an otherwise valid snapshot simply because the field is absent/null.
+        cache_write = value.get("cache_write_input_tokens")
+        if cache_write is not None:
+            if isinstance(cache_write, bool) or not isinstance(cache_write, int) or cache_write < 0:
+                raise InvariantError("cache_write_input_tokens must be a non-negative integer")
+            breakdown["cache_write_input_tokens"] = cache_write
         normalized[name] = breakdown
     context_window = payload.get("model_context_window")
     if context_window is not None:

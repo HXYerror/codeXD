@@ -13,7 +13,7 @@ from codexd.domain.conversations import (
     TurnConfig,
 )
 from codexd.domain.events import NormalizedEvent
-from codexd.domain.models import AccountStatus, ModelCatalogSnapshot
+from codexd.domain.models import AccountStatus, EffectiveModel, ModelCatalogSnapshot
 from codexd.domain.turns import TurnIdentity, TurnInput
 from codexd.errors import InvariantError
 
@@ -94,6 +94,8 @@ class CodexRuntime(Protocol):
     async def capabilities(self) -> CapabilityManifest: ...
 
     async def list_models(self) -> ModelCatalogSnapshot: ...
+
+    async def configured_model(self, cwd: Path) -> EffectiveModel: ...
 
     async def account_status(self) -> AccountStatus: ...
 

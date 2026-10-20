@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
@@ -185,7 +186,7 @@ def test_codex_feedback_path_honors_sqlite_home(tmp_path: Path) -> None:
     codex_home.mkdir()
     configured = tmp_path / "configured-state"
     (codex_home / "config.toml").write_text(
-        f'sqlite_home = "{configured}"\n',
+        f'sqlite_home = {json.dumps(str(configured))}\n',
         encoding="utf-8",
     )
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -63,7 +64,7 @@ def classify_provider_failure(
     raw_message = str(getattr(error, "message", "") or "")
     safe_message = (
         redacted_summary(
-            raw_message,
+            _display_message(raw_message),
             project_root=project_root,
             max_chars=300,
         )
@@ -91,6 +92,26 @@ def classify_provider_failure(
         fingerprint=sha256_text(canonical_json(fingerprint_payload)),
         unknown_typed=unknown_typed,
     )
+
+
+def _display_message(message: str) -> str:
+    """Unwrap bounded provider error envelopes for display, never classification."""
+    current = message
+    for _ in range(3):
+        if len(current) > 16 * 1024:
+            break
+        try:
+            value = json.loads(current)
+        except (ValueError, RecursionError):
+            break
+        if isinstance(value, dict):
+            value = value.get("error", value)
+            if isinstance(value, dict):
+                value = value.get("message")
+        if not isinstance(value, str) or not value.strip() or value == current:
+            break
+        current = value
+    return current
 
 
 def _typed_error(error: object | None) -> tuple[str | None, int | None, bool]:

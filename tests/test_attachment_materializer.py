@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import os
 import stat
 import struct
@@ -42,7 +43,7 @@ def test_plain_file_materialization_uses_opaque_snapshot_context(
     materialized = result.files[0]
     assert materialized.canonical_path != source.canonical_path
     assert materialized.canonical_path.read_bytes() == source.canonical_path.read_bytes()
-    assert str(materialized.canonical_path.parent) in result.context
+    assert json.dumps(str(materialized.canonical_path.parent))[1:-1] in result.context
     assert str(source.canonical_path) not in result.context
     assert "plain-materialized-marker" not in result.context
     assert "untrusted user data" in result.context
@@ -635,7 +636,10 @@ def _zip_bytes(
     compression = zipfile.ZIP_STORED if stored else zipfile.ZIP_DEFLATED
     with zipfile.ZipFile(stream, "w", compression=compression) as archive:
         for name, content in entries.items():
-            archive.writestr(name, content)
+            info = zipfile.ZipInfo("placeholder")
+            info.filename = name
+            info.compress_type = compression
+            archive.writestr(info, content)
     return stream.getvalue()
 
 

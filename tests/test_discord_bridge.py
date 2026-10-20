@@ -194,6 +194,7 @@ async def test_live_catalog_autocomplete_uses_sdk_snapshot_and_fails_closed(
     )
     catalog = ModelCatalogSnapshot((model,), complete=True, next_cursor=None)
     bot.session_lifecycle.model_catalog_if_loaded = AsyncMock(return_value=catalog)
+    bot.session_lifecycle.model_descriptor = AsyncMock(return_value=model)
     thread = Mock(spec=discord.Thread)
     thread.id = 300
     thread.parent_id = 200
@@ -585,6 +586,11 @@ async def test_every_registered_discord_command_executes_through_bridge(
     catalog = ModelCatalogSnapshot((model,), complete=True, next_cursor=None)
     lifecycle = Mock()
     lifecycle.model_catalog = AsyncMock(return_value=catalog)
+    from codexd.domain.models import EffectiveModel
+    lifecycle.model_descriptor = AsyncMock(return_value=model)
+    lifecycle.effective_model = AsyncMock(
+        return_value=EffectiveModel(model.model, "provider default", model)
+    )
     lifecycle.model_catalog_if_loaded = AsyncMock(return_value=catalog)
     lifecycle.list_revisions = AsyncMock(return_value=(revision,))
     lifecycle.status = AsyncMock(

@@ -3635,6 +3635,7 @@ class Repository:
                         },
                         now=now,
                     )
+
     def provider_barrier_conversation_ids(self) -> tuple[str, ...]:
         return tuple(
             str(row["id"])
@@ -7093,19 +7094,30 @@ def _turn(row: sqlite3.Row) -> TurnRecord:
         error_code=row["error_code"],
         error_message_redacted=row["error_message_redacted"],
         provider_error_code=(
-            row["provider_error_code"]
-            if "provider_error_code" in tuple(row.keys())
-            else None
+            row["provider_error_code"] if "provider_error_code" in tuple(row.keys()) else None
         ),
         provider_error_underlying_code=(
             row["provider_error_underlying_code"]
             if "provider_error_underlying_code" in tuple(row.keys())
             else None
         ),
+        provider_terminal_typed_code=(
+            row["provider_terminal_typed_code"]
+            if "provider_terminal_typed_code" in tuple(row.keys())
+            else None
+        ),
+        provider_prior_retry_typed_code=(
+            row["provider_prior_retry_typed_code"]
+            if "provider_prior_retry_typed_code" in tuple(row.keys())
+            else None
+        ),
+        provider_prior_retry_code=(
+            row["provider_prior_retry_code"]
+            if "provider_prior_retry_code" in tuple(row.keys())
+            else None
+        ),
         provider_retry_count=(
-            int(row["provider_retry_count"])
-            if "provider_retry_count" in tuple(row.keys())
-            else 0
+            int(row["provider_retry_count"]) if "provider_retry_count" in tuple(row.keys()) else 0
         ),
         provider_retry_limit=(
             int(row["provider_retry_limit"])

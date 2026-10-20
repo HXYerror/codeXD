@@ -42,6 +42,7 @@ from openai_codex import (
 from openai_codex.api import AsyncThread, AsyncTurnHandle
 from openai_codex.client import CodexClient
 from openai_codex.generated.v2_all import (
+    ConfigReadResponse,
     DynamicToolSpec,
     ReasoningSummaryPartAddedNotification,
     TurnCompletedNotification,
@@ -53,6 +54,7 @@ from openai_codex.models import (
     UnknownNotification,
 )
 from openai_codex.types import Personality, ReasoningEffort, ReasoningSummary, TurnStatus
+from pydantic import ValidationError
 
 from codexd.domain.capabilities import (
     CapabilityManifest,
@@ -73,6 +75,7 @@ from codexd.domain.events import NormalizedEvent
 from codexd.domain.ids import canonical_json, sha256_text, utc_now_ms
 from codexd.domain.models import (
     AccountStatus,
+    EffectiveModel,
     ModelCatalogSnapshot,
     ModelDescriptor,
     ReasoningEffortDescriptor,
@@ -111,7 +114,7 @@ from codexd.security import private_files
 from codexd.security.redaction import redact_diff, redact_text, redact_value
 from codexd.storage.codex_feedback import install_codex_feedback_guard
 
-SDK_DECLARED_RANGE = ">=0.144.4,<0.145"
+SDK_DECLARED_RANGE = ">=0.147.0,<0.148"
 _MAX_DELTA = 16 * 1024
 _THREAD_COMPACT_START_TIMEOUT_SECONDS = 30.0
 _SUBAGENT_DETAIL_TIMEOUT_SECONDS = 2.0
@@ -126,12 +129,10 @@ _SIDE_QUERY_DEVELOPER_INSTRUCTIONS = (
     "paths, hidden reasoning, provider IDs, or secrets."
 )
 _ARCHIVE_DIRECT_HANDLE_CONTRACT_VERIFIED = False
-_MIN_SDK_VERSION = (0, 144, 4)
-_MAX_SDK_VERSION = (0, 145, 0)
-_ATTACHMENT_MATERIALIZATION_VERIFIED_VERSION_PAIRS = frozenset(
-    {("0.144.4", "0.144.4")}
-)
-_DYNAMIC_TOOL_VERIFIED_VERSION_PAIRS = frozenset({("0.144.4", "0.144.4")})
+_MIN_SDK_VERSION = (0, 147, 0)
+_MAX_SDK_VERSION = (0, 148, 0)
+_ATTACHMENT_MATERIALIZATION_VERIFIED_VERSION_PAIRS = frozenset({("0.147.0", "0.147.0")})
+_DYNAMIC_TOOL_VERIFIED_VERSION_PAIRS = frozenset({("0.147.0", "0.147.0")})
 try:
     _FCNTL: Any | None = importlib.import_module("fcntl")
 except ImportError:
@@ -446,6 +447,24 @@ class CodexSDKRuntime:
     async def capabilities(self) -> CapabilityManifest:
         return self._manifest
 
+    async def configured_model(self, cwd: Path) -> EffectiveModel:
+        self._ensure_open()
+        try:
+            async with asyncio.timeout(3):
+                if isinstance(self._client, DynamicAsyncCodex):
+                    response = await self._client.read_config(str(cwd))
+                else:
+                    # Exact-version adapter: high-level AsyncCodex has no config facade.
+                    response = await self._client._client.request(
+                        "config/read",
+                        {"cwd": str(cwd), "includeLayers": False},
+                        response_model=ConfigReadResponse,
+                    )
+            model = response.config.model
+            return EffectiveModel(model, "Codex effective config" if model else "unknown")
+        except (CodexError, TimeoutError, ValidationError):
+            return EffectiveModel(None, "unknown (effective config unavailable)")
+
     async def list_models(self) -> ModelCatalogSnapshot:
         self._ensure_open()
         try:
@@ -720,10 +739,8 @@ class CodexSDKRuntime:
         config: TurnConfig,
     ) -> StartedTurn:
         if input.files and (
-            self._manifest.optional.get("codexd.attachment_materialization")
-            is not True
-            or
-            input.attachment_context is None
+            self._manifest.optional.get("codexd.attachment_materialization") is not True
+            or input.attachment_context is None
             or not input.materialized_files
             or not _file_input_leasing_supported()
         ):
@@ -739,12 +756,10 @@ class CodexSDKRuntime:
         if input.attachment_context:
             wire_input.append(TextInput(input.attachment_context))
         wire_input.extend(
-            SkillInput(skill.name, str(skill.canonical_path))
-            for skill in input.skill_inputs
+            SkillInput(skill.name, str(skill.canonical_path)) for skill in input.skill_inputs
         )
         attachment_input: list[tuple[int, InputItem]] = [
-            (image.ordinal, LocalImageInput(str(image.canonical_path)))
-            for image in input.images
+            (image.ordinal, LocalImageInput(str(image.canonical_path))) for image in input.images
         ]
         leases = _acquire_materialized_file_leases(input.materialized_files)
         provider_start_attempted = False
@@ -769,11 +784,7 @@ class CodexSDKRuntime:
                     cwd=str(config.cwd),
                     effort=_effort(config.reasoning_effort),
                     model=config.model,
-                    output_schema=(
-                        dict(config.output_schema)
-                        if config.output_schema
-                        else None
-                    ),
+                    output_schema=(dict(config.output_schema) if config.output_schema else None),
                     personality=_personality(config.personality),
                     sandbox=_sandbox(config.sandbox),
                     service_tier=config.service_tier,
@@ -786,11 +797,7 @@ class CodexSDKRuntime:
                     cwd=str(config.cwd),
                     effort=_effort(config.reasoning_effort),
                     model=config.model,
-                    output_schema=(
-                        dict(config.output_schema)
-                        if config.output_schema
-                        else None
-                    ),
+                    output_schema=(dict(config.output_schema) if config.output_schema else None),
                     personality=_personality(config.personality),
                     sandbox=_sandbox(config.sandbox),
                     service_tier=config.service_tier,
@@ -826,9 +833,7 @@ class CodexSDKRuntime:
         if input.files and self._closed:
             self._pending_file_input_leases.discard(leases)
             leases.close()
-            closed_error = RuntimeError(
-                "Codex runtime closed while starting a file Turn"
-            )
+            closed_error = RuntimeError("Codex runtime closed while starting a file Turn")
             raise _uncertain_file_turn_start(
                 closed_error,
                 generation=self.generation,
@@ -873,17 +878,15 @@ class CodexSDKRuntime:
                         generation=self.generation,
                     )
                     observed_image_path = _provider_image_path(notification)
-                    if (
-                        observed_image_path is not None
-                        and isinstance(self._client, DynamicAsyncCodex)
+                    if observed_image_path is not None and isinstance(
+                        self._client, DynamicAsyncCodex
                     ):
                         self._client.observe_image_path(
                             handle.id,
                             observed_image_path,
                         )
-                    unknown_terminal = (
-                        notification.method == "turn/completed"
-                        and isinstance(notification.payload, UnknownNotification)
+                    unknown_terminal = notification.method == "turn/completed" and isinstance(
+                        notification.payload, UnknownNotification
                     )
                     agent_thread_id = _subagent_thread_id(notification)
                     event = _normalize_notification(
@@ -900,9 +903,29 @@ class CodexSDKRuntime:
                         raw_limit = event.payload.get("retry_limit")
                         if isinstance(raw_limit, int):
                             retry_limit = max(retry_limit or 0, raw_limit)
-                        if event.payload.get("will_retry"):
+                        if (
+                            event.payload.get("will_retry")
+                            and event.payload.get("failure_code") != "provider_failed"
+                        ):
                             last_retry_failure = dict(event.payload)
+                        elif not event.payload.get("will_retry") and last_retry_failure:
+                            event = replace(
+                                event,
+                                payload={
+                                    **event.payload,
+                                    "prior_retry_typed_code": last_retry_failure.get("typed_code"),
+                                    "prior_retry_code": last_retry_failure.get("failure_code"),
+                                },
+                            )
                     elif event.kind == "turn.failed" and last_retry_failure is not None:
+                        event = replace(
+                            event,
+                            payload={
+                                **event.payload,
+                                "prior_retry_typed_code": last_retry_failure.get("typed_code"),
+                                "prior_retry_code": last_retry_failure.get("failure_code"),
+                            },
+                        )
                         terminal_typed = event.payload.get("typed_code")
                         if terminal_typed == "responseTooManyFailedAttempts":
                             event = replace(
@@ -913,9 +936,7 @@ class CodexSDKRuntime:
                                         "failure_code",
                                         event.payload.get("failure_code"),
                                     ),
-                                    "underlying_typed_code": last_retry_failure.get(
-                                        "typed_code"
-                                    ),
+                                    "underlying_typed_code": last_retry_failure.get("typed_code"),
                                     "retry_exhausted": True,
                                 },
                             )
@@ -1028,10 +1049,22 @@ class CodexSDKRuntime:
                 requested_thread_id=None,
                 sdk_version=self._manifest.sdk_version,
             )
+            correlated_ephemeral_fork = (
+                self._manifest.sdk_version == "0.147.0"
+                and self._manifest.runtime_version == "0.147.0"
+                and getattr(side_thread, "fork_request_source", None) == source_thread.thread_id
+                and identity.thread_id == side_thread.id
+                and identity.forked_from_thread_id is None
+            )
             if (
                 identity.thread_id == source_thread.thread_id
-                or identity.forked_from_thread_id != source_thread.thread_id
-                or identity.provider_session_id != source_thread.provider_session_id
+                or (
+                    not correlated_ephemeral_fork
+                    and (
+                        identity.forked_from_thread_id != source_thread.thread_id
+                        or identity.provider_session_id != source_thread.provider_session_id
+                    )
+                )
             ):
                 raise InvariantError("Side Query fork identity does not match its source")
             handle = await side_thread.turn(
@@ -1052,10 +1085,7 @@ class CodexSDKRuntime:
                 try:
                     await self._client.thread_unsubscribe(side_thread.id)
                 except BaseException as cleanup_error:
-                    exc.add_note(
-                        "Side Query fork cleanup failed: "
-                        f"{type(cleanup_error).__name__}"
-                    )
+                    exc.add_note(f"Side Query fork cleanup failed: {type(cleanup_error).__name__}")
             if isinstance(exc, CodexError):
                 raise _adapter_error(
                     exc,
@@ -2020,12 +2050,16 @@ def capability_manifest(
             runtime_generation=0,
         )
         raise AdapterInvariantError(failure)
-    if sdk_version == "0.144.4" and effective_runtime_version == "0.144.4":
+    if sdk_version == "0.147.0" and effective_runtime_version == "0.147.0":
         matrix_tier = "recommended"
     elif sdk_version == effective_runtime_version:
         matrix_tier = "compatible_patch"
     else:
-        matrix_tier = "runtime_override"
+        raise AdapterInvariantError(AdapterFailure(
+            code="runtime_version_mismatch", provider_exception="VersionMismatch",
+            message="Codex SDK and runtime must use the same stable version",
+            retryable=False, runtime_generation=0,
+        ))
     dynamic_tool_call = _dynamic_tool_contract_supported(
         sdk_version,
         effective_runtime_version,
@@ -2104,12 +2138,8 @@ def capability_manifest(
             "mcp.item": EventCapability.SUPPORTED_NOT_OBSERVED,
             "dynamic_tool.item": EventCapability.SUPPORTED_NOT_OBSERVED,
             "dynamic_tool.call": dynamic_tool_call,
-            "codexd.schedule_create_tool": (
-                dynamic_tool_call and schedule_tool_enabled
-            ),
-            "codexd.publish_image_tool": (
-                dynamic_tool_call and publish_image_enabled
-            ),
+            "codexd.schedule_create_tool": (dynamic_tool_call and schedule_tool_enabled),
+            "codexd.publish_image_tool": (dynamic_tool_call and publish_image_enabled),
             "collab.item": EventCapability.SUPPORTED_NOT_OBSERVED,
             "image_generation.item": EventCapability.SUPPORTED_NOT_OBSERVED,
             "account.read": True,
@@ -2130,8 +2160,12 @@ def _initialized_runtime_version(
 ) -> str:
     server_info = client.metadata.serverInfo
     if server_info is None or server_info.version is None or not server_info.version.strip():
-        return importlib.metadata.version("openai-codex-cli-bin")
-    match = re.search(r"(?<!\d)(\d+\.\d+\.\d+)(?!\d)", server_info.version)
+        raise AdapterInvariantError(AdapterFailure(
+            code="runtime_version_missing", provider_exception="VersionMismatch",
+            message="Initialized Codex runtime did not report its version",
+            retryable=False, runtime_generation=0,
+        ))
+    match = re.match(r"^(\d+\.\d+\.\d+)(?=$|[ (])", server_info.version)
     return match.group(1) if match is not None else server_info.version.strip()
 
 
@@ -2449,6 +2483,13 @@ def _normalize_notification_unredacted(
     # The SDK models method/payload correlation at runtime, but its type is an
     # unnarrowed union. The method dispatch below is the adapter's discriminator.
     payload: Any = notification.payload
+    if method in {"thread/environment/connected", "thread/environment/disconnected"}:
+        # Connection metadata is not Turn lifecycle or user content. Keep only
+        # a hash/size; the route guard still checks its typed thread identity.
+        raw = payload.params if isinstance(payload, UnknownNotification) else payload.model_dump(
+            mode="json", by_alias=True, exclude_none=True,
+        )
+        return NormalizedEvent.unknown(method=method, raw_payload=raw)
     routed = _normalize_routed_notification(method, payload, cwd=cwd)
     if routed is not None:
         return routed
@@ -2506,11 +2547,7 @@ def _normalize_notification_unredacted(
             {
                 "provider_turn_id": payload.turn.id,
                 "status": status,
-                "error": (
-                    _bounded(redact_text(error.message))
-                    if error
-                    else None
-                ),
+                "error": (_bounded(redact_text(error.message)) if error else None),
                 **(failure.payload() if error is not None else {}),
             },
             provider_event_id=f"turn:{payload.turn.id}:completed",
@@ -2572,9 +2609,7 @@ def _normalize_notification_unredacted(
             raw_type=method,
         )
     if method == "turn/diff/updated":
-        return NormalizedEvent(
-            "diff.updated", {"diff": payload.diff}, raw_type=method
-        )
+        return NormalizedEvent("diff.updated", {"diff": payload.diff}, raw_type=method)
     if method == "turn/plan/updated":
         return NormalizedEvent(
             "plan.updated",

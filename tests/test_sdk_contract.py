@@ -111,8 +111,7 @@ def test_official_sdk_public_contract_and_required_manifest() -> None:
     assert manifest.optional["mention.input"] is False
     assert manifest.optional["codexd.attachment_materialization"] is (
         codex_sdk._file_input_leasing_supported()
-        and (manifest.sdk_version, manifest.runtime_version)
-        == ("0.144.4", "0.144.4")
+        and (manifest.sdk_version, manifest.runtime_version) == ("0.147.0", "0.147.0")
     )
 
 
@@ -360,7 +359,9 @@ async def test_abnormal_stream_retains_file_lease_until_confirmed_runtime_close(
         Any,
         SimpleNamespace(
             close=close,
-            _client=SimpleNamespace(_sync=SimpleNamespace(_proc=process)),
+            _client=SimpleNamespace(
+                _sync=SimpleNamespace(_proc=process)
+            ),
         ),
     )
 
@@ -696,9 +697,7 @@ async def test_runtime_force_wait_failure_retains_file_leases(
         Any,
         SimpleNamespace(
             close=close,
-            _client=SimpleNamespace(
-                _sync=SimpleNamespace(_proc=process)
-            ),
+            _client=SimpleNamespace(_sync=SimpleNamespace(_proc=process)),
         ),
     )
 
@@ -877,10 +876,8 @@ def test_runtime_version_comes_from_initialized_server_metadata() -> None:
     )
 
     assert _initialized_runtime_version(cast(Any, client)) == "0.146.0"
-    assert (
-        codex_sdk.capability_manifest(runtime_version="0.146.0").runtime_version
-        == "0.146.0"
-    )
+    with pytest.raises(AdapterInvariantError, match="same stable version"):
+        codex_sdk.capability_manifest(runtime_version="0.146.0")
 
 
 def test_runtime_version_must_be_stable_semantic() -> None:
@@ -888,6 +885,22 @@ def test_runtime_version_must_be_stable_semantic() -> None:
         codex_sdk.capability_manifest(runtime_version="codex-dev")
 
     assert error.value.failure.code == "runtime_version_invalid"
+
+
+def test_missing_initialized_version_cannot_be_replaced_by_installed_package() -> None:
+    client = SimpleNamespace(metadata=SimpleNamespace(serverInfo=None))
+    with pytest.raises(AdapterInvariantError) as error:
+        _initialized_runtime_version(cast(Any, client))
+    assert error.value.failure.code == "runtime_version_missing"
+
+
+@pytest.mark.parametrize("version", ["0.147.0-alpha.1", "0.147.0+custom"])
+def test_initialized_prerelease_or_custom_build_is_not_coerced_to_stable(version: str) -> None:
+    client = SimpleNamespace(metadata=SimpleNamespace(serverInfo=SimpleNamespace(version=version)))
+    observed = _initialized_runtime_version(cast(Any, client))
+    assert observed == version
+    with pytest.raises(AdapterInvariantError):
+        codex_sdk.capability_manifest(runtime_version=observed)
 
 
 def test_runtime_slot_can_select_an_explicit_codex_binary(tmp_path: Path) -> None:
@@ -1124,6 +1137,125 @@ def test_retry_exhausted_variant_is_stable() -> None:
     assert event.payload["failure_code"] == "provider_retry_exhausted"
     assert event.payload["http_status"] == 503
     assert (event.payload["retry_count"], event.payload["retry_limit"]) == (5, 5)
+
+
+def test_nested_error_display_does_not_reclassify_or_persist_secrets() -> None:
+    from codexd.domain.provider_failures import classify_provider_failure
+    error = TurnError(message=json.dumps({"error": {"message": json.dumps({"error": {
+        "message": ("Encrypted function output could not be decoded. "
+                    "Authorization: Bearer secret-value"),
+        "code": "invalid_request_body", "private_payload": "DO_NOT_DISPLAY",
+    }})}}), codexErrorInfo=CodexErrorInfo(root=CodexErrorInfoValue.other))
+    failure = classify_provider_failure(error)
+    assert failure.code == "provider_failed"
+    assert failure.typed_code == "other"
+    assert failure.retry_count == 0
+    assert failure.safe_message and "Encrypted function output" in failure.safe_message
+    assert "secret-value" not in failure.safe_message
+    assert "DO_NOT_DISPLAY" not in failure.safe_message
+    assert "\\\"" not in failure.safe_message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "terminal", ["other", "unauthorized", "contextWindowExceeded", "responseTooManyFailedAttempts"]
+)
+async def test_retry_context_survives_terminal_and_is_turn_scoped(
+    tmp_path: Path,
+    terminal: str,
+) -> None:
+    runtime = CodexSDKRuntime(
+        client=cast(Any, object()),
+        slot=_runtime_slot(tmp_path),
+        generation=7,
+        manifest=_capability_manifest(),
+    )
+    retry_error = TurnError.model_validate(
+        {
+            "message": "Reconnecting... 5/5",
+            "codexErrorInfo": {"responseStreamDisconnected": {"httpStatusCode": 502}},
+        }
+    )
+    terminal_error = TurnError.model_validate(
+        {
+            "message": "terminal",
+            "codexErrorInfo": (
+                {terminal: {"httpStatusCode": 503}}
+                if terminal == "responseTooManyFailedAttempts"
+                else terminal
+            ),
+        }
+    )
+    for with_retries in (True, False):
+        errors = (
+            [
+                Notification(
+                    "error",
+                    ErrorNotification(
+                        error=retry_error.model_copy(update={"message": f"Reconnecting... {i}/5"}),
+                        threadId="thread",
+                        turnId="turn",
+                        willRetry=True,
+                    ),
+                )
+                for i in range(1, 6)
+            ]
+            if with_retries
+            else []
+        )
+        errors.append(
+            Notification(
+                "error",
+                ErrorNotification(
+                    error=terminal_error,
+                    threadId="thread",
+                    turnId="turn",
+                    willRetry=False,
+                ),
+            )
+        )
+        errors.append(
+            Notification(
+                "turn/completed",
+                TurnCompletedNotification(
+                    threadId="thread",
+                    turn=Turn(
+                        id="turn",
+                        items=[],
+                        status=TurnStatus.failed,
+                        error=terminal_error,
+                    ),
+                ),
+            )
+        )
+        runtime._threads["thread"] = cast(
+            Any,
+            _NotificationThread(
+                _NotificationHandle(tuple(errors)),
+            ),
+        )
+        started = await runtime.start_turn(
+            local_turn_id=f"local-{with_retries}",
+            thread=ThreadIdentity("thread", None, "session", None, None, "test"),
+            input=TurnInput(text="test"),
+            config=_turn_config(tmp_path),
+        )
+        events = [event async for event in started.stream]
+        final = [event for event in events if event.kind == "turn.failed"]
+        assert len(final) == 1
+        payload = final[0].payload
+        assert payload["typed_code"] == terminal
+        assert payload["retry_count"] == (5 if with_retries else 0)
+        assert payload.get("prior_retry_typed_code") == (
+            "responseStreamDisconnected" if with_retries else None
+        )
+        if terminal == "other":
+            assert payload["failure_code"] == "provider_failed"
+        if terminal == "unauthorized":
+            assert payload["failure_code"] == "provider_unauthorized"
+        if terminal == "responseTooManyFailedAttempts" and with_retries:
+            assert payload["retry_exhausted"] is True
+            assert payload["failure_code"] == "provider_stream_disconnected"
 
 
 def test_unknown_notification_is_hashed_not_persisted_raw() -> None:
@@ -1885,7 +2017,7 @@ def test_in_range_patch_uses_verified_public_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def version(_distribution: str) -> str:
-        return "0.144.5"
+        return "0.147.1"
 
     monkeypatch.setattr(importlib.metadata, "version", version)
     manifest = codex_sdk.capability_manifest()
@@ -1899,15 +2031,15 @@ def test_in_range_patch_uses_verified_public_contract(
     assert manifest.optional["codexd.attachment_materialization"] is False
 
 
-def test_runtime_override_disables_unverified_materialization_pair(
+@pytest.mark.parametrize("runtime_version", ["0.147.1", "0.149.0", "0.153.4"])
+def test_runtime_override_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
+    runtime_version: str,
 ) -> None:
-    monkeypatch.setattr(importlib.metadata, "version", lambda _name: "0.144.4")
-
-    manifest = codex_sdk.capability_manifest(runtime_version="0.144.5")
-
-    assert manifest.compatibility.matrix_tier == "runtime_override"
-    assert manifest.optional["codexd.attachment_materialization"] is False
+    monkeypatch.setattr(importlib.metadata, "version", lambda _name: "0.147.0")
+    with pytest.raises(AdapterInvariantError) as error:
+        codex_sdk.capability_manifest(runtime_version=runtime_version)
+    assert error.value.failure.code == "runtime_version_mismatch"
 
 
 def test_incompatible_mention_constructor_does_not_affect_file_materialization(

@@ -89,10 +89,6 @@ async def test_fake_runtime_turn_is_durable_end_to_end(
         terminal = await _wait_for_terminal(storage_context, turn.id)
 
         assert terminal.state is TurnState.COMPLETED
-        events = storage_context.store.query_all(
-            "SELECT kind FROM events WHERE turn_id = ? ORDER BY local_event_index",
-            (turn.id,),
-        )
         lifecycle = None
         for _ in range(100):
             lifecycle = storage_context.store.query_one(
@@ -106,6 +102,10 @@ async def test_fake_runtime_turn_is_durable_end_to_end(
                 break
             await asyncio.sleep(0.01)
         assert lifecycle is not None
+        events = storage_context.store.query_all(
+            "SELECT kind FROM events WHERE turn_id = ? ORDER BY local_event_index",
+            (turn.id,),
+        )
         payload = json.loads(str(lifecycle["payload_json"]))
         assert payload["stream_created"] is True
         assert payload["stream_claimed"] is True
@@ -621,14 +621,18 @@ async def test_queued_followup_does_not_close_active_provider_stream(
 
         assert first_terminal.state is TurnState.COMPLETED
         assert storage_context.repository.get_turn(followup.id).state is TurnState.QUEUED
-        lifecycle = storage_context.store.query_all(
-            """
-            SELECT payload_json FROM events
-            WHERE turn_id = ? AND kind = 'runtime.stream_lifecycle'
-            ORDER BY sequence
-            """,
-            (first.id,),
-        )
+        for _ in range(100):
+            lifecycle = storage_context.store.query_all(
+                """
+                SELECT payload_json FROM events
+                WHERE turn_id = ? AND kind = 'runtime.stream_lifecycle'
+                ORDER BY sequence
+                """,
+                (first.id,),
+            )
+            if lifecycle:
+                break
+            await asyncio.sleep(0.01)
         assert len(lifecycle) == 1
         assert all(
             json.loads(str(row["payload_json"]))["terminal_notification"] is True

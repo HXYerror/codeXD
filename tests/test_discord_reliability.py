@@ -2710,7 +2710,7 @@ def test_discord_command_schema_exposes_codex_native_controls(
                 "owner_user_id = 400",
                 "allowed_user_ids = [400]",
                 "[security]",
-                f'allowed_roots = ["{tmp_path}"]',
+                f'allowed_roots = [{json.dumps(str(tmp_path))}]',
             )
         )
     )
@@ -3685,7 +3685,7 @@ async def test_recovered_initial_ingress_never_replays_old_prompt(
                 "owner_user_id = 400",
                 "allowed_user_ids = [400]",
                 "[security]",
-                f'allowed_roots = ["{storage_context.root}"]',
+                f'allowed_roots = [{json.dumps(str(storage_context.root))}]',
             )
         )
     )

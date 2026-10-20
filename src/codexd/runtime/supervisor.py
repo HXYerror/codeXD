@@ -10,7 +10,7 @@ from pathlib import Path
 from codexd.config import resolve_project_path
 from codexd.domain.capabilities import CapabilityManifest
 from codexd.domain.ids import utc_now_ms
-from codexd.domain.models import AccountStatus, ModelCatalogSnapshot
+from codexd.domain.models import AccountStatus, EffectiveModel, ModelCatalogSnapshot
 from codexd.errors import InvariantError, SecurityError
 from codexd.runtime.errors import (
     AdapterError,
@@ -663,6 +663,20 @@ class RuntimeSupervisor:
             if slot.runtime is None:
                 return None
             return await slot.runtime.account_status()
+
+    async def configured_model_if_loaded(self, project: ProjectRecord) -> EffectiveModel:
+        key = project.id if self._topology == "project_scoped" else "shared"
+        async with self._slots_lock:
+            slot = self._slots.get(key)
+        if slot is not None:
+            async with slot.lock:
+                if (
+                    slot.runtime is not None
+                    and slot.lease is not None
+                    and slot.lease.state == "ready"
+                ):
+                    return await slot.runtime.configured_model(project.root_path)
+        return EffectiveModel(None, "unknown (runtime not loaded)")
 
     async def model_catalog_if_loaded(
         self,

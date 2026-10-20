@@ -20,7 +20,11 @@ from codexd.domain.conversations import (
     WebSearchMode,
 )
 from codexd.domain.ids import sha256_text
-from codexd.domain.models import ModelCatalogSnapshot, ModelDescriptor
+from codexd.domain.models import (
+    EffectiveModel,
+    ModelDescriptor,
+    resolve_model,
+)
 from codexd.domain.turns import InterruptOrigin, TurnIdentity, TurnInput, TurnSource, TurnState
 from codexd.errors import (
     CodexDError,
@@ -180,31 +184,23 @@ class TurnCoordinator:
         return self._event_pump.metrics()
 
     async def _assert_image_model(self, conversation_id: str) -> None:
-        conversation = await asyncio.to_thread(
-            self._repository.get_conversation, conversation_id
-        )
-        project = await asyncio.to_thread(
-            self._repository.get_project, conversation.project_id
-        )
-        config = await asyncio.to_thread(
-            self._repository.effective_thread_config, conversation_id
-        )
+        conversation = await asyncio.to_thread(self._repository.get_conversation, conversation_id)
+        project = await asyncio.to_thread(self._repository.get_project, conversation.project_id)
+        config = await asyncio.to_thread(self._repository.effective_thread_config, conversation_id)
         runtime, _lease = await self._runtime_supervisor.ensure(project)
         catalog = await runtime.list_models()
-        candidates = tuple(
-            model
-            for model in catalog.models
-            if (
-                config.model in {model.id, model.model}
-                if config.model is not None
-                else model.is_default
-            )
+        if not catalog.complete or not catalog.models:
+            raise InvariantError("Codex model catalog is incomplete or empty")
+        resolved = resolve_model(
+            catalog, config.model, None,
+            await runtime.configured_model(project.root_path),
         )
-        if len(candidates) != 1:
+        descriptor = resolved.descriptor
+        if descriptor is None:
             raise ConflictError("effective image model is missing or ambiguous")
-        if "image" not in candidates[0].input_modalities:
+        if "image" not in descriptor.input_modalities:
             raise ConflictError(
-                f"effective model {candidates[0].model} does not support image input"
+                f"effective model {descriptor.model} does not support image input"
             )
 
     async def cancel(
@@ -1187,36 +1183,51 @@ class TurnCoordinator:
         *,
         turn: TurnRecord,
         turn_input: TurnInput,
-    ) -> ModelDescriptor:
+    ) -> ModelDescriptor | None:
         catalog = await runtime.list_models()
-        descriptor = _effective_model(catalog, turn.effective_model)
+        if not catalog.complete or not catalog.models:
+            raise InvariantError("Codex model catalog is incomplete or empty")
+        conversation = await asyncio.to_thread(
+            self._repository.get_conversation,
+            turn.conversation_id,
+        )
+        project = await asyncio.to_thread(self._repository.get_project, conversation.project_id)
+        configured = (
+            await runtime.configured_model(project.root_path)
+            if turn.effective_model is None
+            else EffectiveModel(None, "unknown")
+        )
+        resolved = resolve_model(catalog, turn.effective_model, None, configured)
+        descriptor = resolved.descriptor
+        if descriptor is None:
+            if sum(
+                resolved.model in {item.id, item.model} for item in catalog.models
+            ) > 1:
+                raise InvariantError("effective model is ambiguous in the Codex catalog")
+            if (
+                turn_input.images
+                or turn.effective_reasoning_effort is not None
+                or turn.effective_personality is not None
+                or turn.effective_service_tier is not None
+            ):
+                resolved.require_descriptor()
+            # A plain text request can use provider configuration outside the catalog.
+            return None
         if turn_input.images and "image" not in descriptor.input_modalities:
-            raise InvariantError(
-                f"effective model {descriptor.model} does not support image input"
-            )
+            raise InvariantError(f"effective model {descriptor.model} does not support image input")
         if (
             turn.effective_reasoning_effort is not None
-            and turn.effective_reasoning_effort
-            not in descriptor.supported_reasoning_efforts
+            and turn.effective_reasoning_effort not in descriptor.supported_reasoning_efforts
         ):
             raise InvariantError(
                 f"effective reasoning effort is unavailable for {descriptor.model}"
             )
-        if (
-            turn.effective_personality is not None
-            and not descriptor.supports_personality
-        ):
-            raise InvariantError(
-                f"effective personality is unavailable for {descriptor.model}"
-            )
-        if (
-            turn.effective_service_tier is not None
-            and turn.effective_service_tier
-            not in {tier.id for tier in descriptor.service_tiers}
-        ):
-            raise InvariantError(
-                f"effective service tier is unavailable for {descriptor.model}"
-            )
+        if turn.effective_personality is not None and not descriptor.supports_personality:
+            raise InvariantError(f"effective personality is unavailable for {descriptor.model}")
+        if turn.effective_service_tier is not None and turn.effective_service_tier not in {
+            tier.id for tier in descriptor.service_tiers
+        }:
+            raise InvariantError(f"effective service tier is unavailable for {descriptor.model}")
         return descriptor
 
     async def _terminal_claimed_for_shutdown(self, turn_id: str) -> None:
@@ -1289,25 +1300,3 @@ def _turn_config(turn: TurnRecord, project: ProjectRecord) -> TurnConfig:
         personality=turn.effective_personality,
         service_tier=turn.effective_service_tier,
     )
-
-
-def _effective_model(
-    catalog: ModelCatalogSnapshot,
-    requested: str | None,
-) -> ModelDescriptor:
-    candidates = tuple(
-        model
-        for model in catalog.models
-        if (
-            requested in {model.id, model.model}
-            if requested is not None
-            else model.is_default
-        )
-    )
-    if len(candidates) == 1:
-        return candidates[0]
-    if not candidates and not catalog.complete:
-        raise InvariantError("Codex model catalog is incomplete")
-    if not candidates:
-        raise InvariantError("effective model is not present in the Codex catalog")
-    raise InvariantError("effective model is ambiguous in the Codex catalog")
