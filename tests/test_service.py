@@ -515,6 +515,8 @@ def test_macos_uninstall_stops_before_removing_definition(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    monkeypatch.setattr(service_manager.sys, "platform", "darwin")
+    monkeypatch.setattr(service_manager.os, "getuid", lambda: 501, raising=False)
     config = AppConfig(paths=AppPaths(tmp_path / "data", tmp_path / "logs"))
     plist = tmp_path / "com.codexd.daemon.plist"
     plist.write_text("installed")
@@ -542,6 +544,8 @@ def test_macos_uninstall_preserves_definition_on_bootout_failure(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    monkeypatch.setattr(service_manager.sys, "platform", "darwin")
+    monkeypatch.setattr(service_manager.os, "getuid", lambda: 501, raising=False)
     config = AppConfig(paths=AppPaths(tmp_path / "data", tmp_path / "logs"))
     plist = tmp_path / "com.codexd.daemon.plist"
     plist.write_text("installed")

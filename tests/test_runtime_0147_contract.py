@@ -239,7 +239,7 @@ async def test_real_0147_dynamic_tools_and_thread_lifecycle(
                 ephemeral=False,
                 model=None,
                 personality=None,
-                sandbox=Sandbox.read_only,
+                sandbox=Sandbox.full_access,
                 service_tier=None,
             )
             handle = await thread.turn(
@@ -255,7 +255,7 @@ async def test_real_0147_dynamic_tools_and_thread_lifecycle(
                 model=None,
                 output_schema=None,
                 personality=None,
-                sandbox=Sandbox.read_only,
+                sandbox=Sandbox.full_access,
                 service_tier=None,
                 summary=None,
             )
@@ -273,9 +273,10 @@ async def test_real_0147_dynamic_tools_and_thread_lifecycle(
             assert not errors
             assert len({call.provider_call_id for call in calls}) == 2
             assert marker not in json.dumps(requests[0])
-            assert marker in json.dumps(requests[-1]), (
-                "runtime did not read the materialized marker"
-            )
+            assert marker in json.dumps(requests[-1]), [
+                item for item in requests[-1].get("input", [])
+                if item.get("type") == "function_call_output"
+            ]
             assert "input_image" in json.dumps(requests[0])
             resumed = await client.thread_resume(
                 thread.id,
