@@ -621,14 +621,18 @@ async def test_queued_followup_does_not_close_active_provider_stream(
 
         assert first_terminal.state is TurnState.COMPLETED
         assert storage_context.repository.get_turn(followup.id).state is TurnState.QUEUED
-        lifecycle = storage_context.store.query_all(
-            """
-            SELECT payload_json FROM events
-            WHERE turn_id = ? AND kind = 'runtime.stream_lifecycle'
-            ORDER BY sequence
-            """,
-            (first.id,),
-        )
+        for _ in range(100):
+            lifecycle = storage_context.store.query_all(
+                """
+                SELECT payload_json FROM events
+                WHERE turn_id = ? AND kind = 'runtime.stream_lifecycle'
+                ORDER BY sequence
+                """,
+                (first.id,),
+            )
+            if lifecycle:
+                break
+            await asyncio.sleep(0.01)
         assert len(lifecycle) == 1
         assert all(
             json.loads(str(row["payload_json"]))["terminal_notification"] is True
