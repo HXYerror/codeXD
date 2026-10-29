@@ -253,6 +253,8 @@ async def test_real_0147_dynamic_tools_and_thread_lifecycle(
                 sandbox=Sandbox.full_access,
                 service_tier=None,
             )
+            assert client.settings[thread.id].values["model"] == "contract-model"
+            assert client.settings[thread.id].source in {"thread/start", "thread/settings/updated"}
             handle = await thread.turn(
                 [
                     TextInput("Run the two contract tools and read the attachment."),
@@ -272,6 +274,10 @@ async def test_real_0147_dynamic_tools_and_thread_lifecycle(
             )
             events = [event async for event in handle.stream()]
             assert events[-1].payload.turn.status.value == "completed"
+            assert client.settings[thread.id].source in {"thread/start", "thread/settings/updated"}
+            if client.settings[thread.id].source == "thread/start":
+                assert client.settings[thread.id].turn_id is None
+                assert client.settings[thread.id].values["reasoning_summary"] is None
             assert [call.tool for call in calls] == ["schedule_create", "publish_image"], requests[
                 0
             ].get("tools")
@@ -300,6 +306,12 @@ async def test_real_0147_dynamic_tools_and_thread_lifecycle(
                 service_tier=None,
             )
             assert resumed.id == thread.id
+            for _ in range(100):
+                if client.settings[thread.id].source == "thread/settings/updated":
+                    break
+                await asyncio.sleep(0.01)
+            assert client.settings[thread.id].values["model"] == "contract-model"
+            assert client._settings_task is not None and not client._settings_task.done()
             side = await client.thread_fork(
                 thread.id,
                 approval_mode=ApprovalMode.deny_all,
@@ -371,6 +383,25 @@ async def test_real_0147_dynamic_tools_and_thread_lifecycle(
             await asyncio.to_thread(client._sync_client.thread_archive, thread.id)
             restored = await asyncio.to_thread(client._sync_client.thread_unarchive, thread.id)
             assert restored.thread.id == thread.id
+        from codexd.runtime.observing_client import ObservingAsyncCodex
+
+        async with ObservingAsyncCodex(config) as public:
+            observed_runtime = CodexSDKRuntime(
+                client=public,
+                generation=8,
+                slot=RuntimeSlotConfig(
+                    "project", "fixture", tmp_path, home, {}, "fixture", "project_scoped"
+                ),
+                manifest=capability_manifest(),
+            )
+            public_thread = await public.thread_start(
+                model=None,
+                cwd=str(tmp_path),
+                ephemeral=True,
+                sandbox=Sandbox.read_only,
+            )
+            assert observed_runtime._settings[public_thread.id].values["model"] == "contract-model"
+            assert observed_runtime._settings[public_thread.id].source == "thread/start"
     finally:
         release_response.set()
         server.shutdown()

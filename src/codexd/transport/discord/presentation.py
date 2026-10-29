@@ -97,7 +97,7 @@ def session_status_embed(
     if behavior.resolution != "resolved":
         model_lines.append(f"Resolution: {_safe_plain(behavior.resolution, 128)}")
     embed.add_field(
-        name="Model & behavior · next Turn",
+        name="Provider settings · last observed",
         value="\n".join(model_lines)[:1024],
         inline=False,
     )
@@ -114,7 +114,7 @@ def session_status_embed(
     if activity.active_turn is not None:
         turn = activity.active_turn
         current = (
-            f"Current Turn `{_safe_plain(turn.effective_model or 'provider default', 96)}`"
+            f"Current Turn requested `{_safe_plain(turn.effective_model or 'no override', 96)}`"
             " · reasoning `"
             + _safe_plain(
                 turn.effective_reasoning_effort or "provider default",

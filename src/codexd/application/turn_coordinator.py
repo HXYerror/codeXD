@@ -191,10 +191,15 @@ class TurnCoordinator:
         catalog = await runtime.list_models()
         if not catalog.complete or not catalog.models:
             raise InvariantError("Codex model catalog is incomplete or empty")
-        resolved = resolve_model(
-            catalog, config.model, None,
-            await runtime.configured_model(project.root_path),
-        )
+        revision = await asyncio.to_thread(self._repository.get_active_revision, conversation_id)
+        configured = await runtime.configured_model(project.root_path)
+        if revision is not None and config.model is None:
+            observed = await runtime.observed_settings(revision.provider_thread_id)
+            configured = EffectiveModel(
+                observed.values.get("model") if observed and observed.fresh else None,
+                "provider observed" if observed and observed.fresh else "unknown",
+            )
+        resolved = resolve_model(catalog, config.model, None, configured)
         descriptor = resolved.descriptor
         if descriptor is None:
             raise ConflictError("effective image model is missing or ambiguous")
@@ -1197,6 +1202,15 @@ class TurnCoordinator:
             if turn.effective_model is None
             else EffectiveModel(None, "unknown")
         )
+        revision = await asyncio.to_thread(
+            self._repository.get_active_revision, turn.conversation_id,
+        )
+        if turn.effective_model is None and revision is not None:
+            observed = await runtime.observed_settings(revision.provider_thread_id)
+            configured = EffectiveModel(
+                observed.values.get("model") if observed and observed.fresh else None,
+                "provider observed" if observed and observed.fresh else "unknown",
+            )
         resolved = resolve_model(catalog, turn.effective_model, None, configured)
         descriptor = resolved.descriptor
         if descriptor is None:

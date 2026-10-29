@@ -27,6 +27,7 @@ from codexd.domain.models import (
     ModelDescriptor,
     ServiceTierDescriptor,
 )
+from codexd.domain.observations import ProviderSettings
 from codexd.domain.turns import TurnIdentity, TurnInput
 from codexd.errors import NotFoundError
 from codexd.runtime.errors import file_input_unsupported
@@ -102,6 +103,12 @@ class FakeCodexRuntime:
 
     async def configured_model(self, cwd: Path) -> EffectiveModel:
         return EffectiveModel("fake-model", "provider default")
+
+    async def observed_settings(self, thread_id: str) -> ProviderSettings | None:
+        if thread_id not in self._threads:
+            return None
+        return ProviderSettings(thread_id, self.generation, {"model": "fake-model"},
+                                "thread/start", utc_now_ms(), 1, state="idle")
 
     async def list_models(self) -> ModelCatalogSnapshot:
         return ModelCatalogSnapshot(

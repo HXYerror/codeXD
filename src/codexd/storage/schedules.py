@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import re
 import sqlite3
 from collections.abc import Mapping
 from pathlib import Path
@@ -1113,6 +1114,10 @@ class ScheduleRepository:
 
     def resolve(self, conversation_id: str, schedule_ref: str) -> ScheduleRecord:
         reference = schedule_ref.strip().lower()
+        if not re.fullmatch(r"[0-9a-f-]{4,36}", reference):
+            raise ConflictError(
+                "Use a schedule UUID or unique prefix (4+ characters), not a Thread ID"
+            )
         if len(reference) < 4:
             raise ConflictError("schedule ID prefix must contain at least 4 characters")
         rows = self.store.query_all(
@@ -1125,7 +1130,9 @@ class ScheduleRepository:
             (conversation_id, f"{reference}%"),
         )
         if not rows:
-            raise NotFoundError(f"schedule not found: {schedule_ref}")
+            raise NotFoundError(
+                "Schedule missing or deleted in this Conversation; use its original thread"
+            )
         if len(rows) > 1:
             raise ConflictError(f"schedule prefix is ambiguous: {schedule_ref}")
         return _schedule(rows[0])

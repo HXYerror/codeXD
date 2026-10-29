@@ -27,10 +27,12 @@ from codexd.domain.models import (
     ModelDescriptor,
     resolve_model,
 )
+from codexd.domain.observations import ProviderSettings, unknown_settings
 from codexd.errors import InvariantError, NotFoundError
 from codexd.runtime.errors import AdapterError, ProviderOutcomeUnknown
 from codexd.runtime.port import CodexRuntime
 from codexd.runtime.supervisor import RuntimeSupervisor
+from codexd.storage import provider_settings
 from codexd.storage.records import (
     ConversationRecord,
     ProjectRecord,
@@ -193,25 +195,30 @@ class SessionLifecycleCoordinator:
                 f"matching failures ({revision.degraded_failure_code}); run /session new"
             )
 
-        configured = EffectiveModel(None, "unknown (runtime not loaded)")
-        if runtime_status["state"] == "ready":
-            try:
-                configured = await asyncio.wait_for(
-                    self._runtimes.configured_model_if_loaded(project),
-                    timeout=_STATUS_CATALOG_TIMEOUT_SECONDS,
-                )
-            except (AdapterError, TimeoutError):
-                configured = EffectiveModel(None, "unknown (effective config unavailable)")
-        behavior = _session_behavior(conversation, project, catalog, configured)
+        observed = await self.provider_settings(conversation_id)
+        source = f"{observed.source}; {'last observed' if observed.fresh else 'stale'}"
+        def observed_value(name: str) -> SessionStatusValue:
+            return SessionStatusValue(observed.values.get(name) or "unknown", source)
+        behavior = SessionBehaviorStatus(
+            model=observed_value("model"),
+            reasoning_effort=observed_value("reasoning_effort"),
+            reasoning_summary=observed_value("reasoning_summary"),
+            personality=observed_value("personality"),
+            service_tier=observed_value("service_tier"),
+            web_search_mode="unknown (requested separately)",
+            input_modalities=(),
+            resolution=(
+                f"{source}; "
+                f"observed_at={observed.observed_at if observed.sequence else 'unknown'}; "
+                f"provider state={observed.state}"
+            ),
+        )
         if degraded_reason is None and behavior.resolution in {
             "catalog incomplete",
             "configured model unavailable",
         }:
             degraded_reason = behavior.resolution
-        active_settings_differ = bool(
-            active_turn is not None
-            and _turn_behavior_tuple(active_turn) != _behavior_tuple(behavior)
-        )
+        active_settings_differ = False  # Requests are not observations; do not infer drift.
         activity = SessionActivityStatus(
             runtime_state=str(runtime_status["state"]),
             runtime_generation=int(runtime_status["generation"]),
@@ -961,16 +968,67 @@ class SessionLifecycleCoordinator:
     ) -> EffectiveModel:
         conversation = await asyncio.to_thread(self._repository.get_conversation, conversation_id)
         project = await asyncio.to_thread(self._repository.get_project, conversation.project_id)
-        configured = EffectiveModel(None, "unknown (effective config unavailable)")
+        revision = await asyncio.to_thread(self._repository.get_active_revision, conversation_id)
+        configured = EffectiveModel(None, "unknown (provider settings not observed)")
         if conversation.model_override is None and project.default_model is None:
-            if only_if_loaded:
-                configured = await self._runtimes.configured_model_if_loaded(project)
+            if revision is not None:
+                observed = await self.provider_settings(conversation_id)
+                configured = EffectiveModel(
+                    observed.values.get("model") if observed.fresh else None,
+                    "provider observed" if observed.fresh else "unknown (last observation stale)",
+                )
             else:
-                runtime, _lease = await self._runtimes.ensure(project)
-                configured = await runtime.configured_model(project.root_path)
+                # Only a new thread may use disk defaults as a candidate, never actual state.
+                configured = await self._runtimes.configured_model_if_loaded(project)
         return resolve_model(
             catalog, conversation.model_override, project.default_model, configured
         )
+
+    async def provider_settings(self, conversation_id: str) -> ProviderSettings:
+        conversation, revision = await asyncio.to_thread(
+            self._repository.conversation_with_active_revision, conversation_id,
+        )
+        if revision is None or revision.state != "active":
+            return unknown_settings()
+        if not _PROVIDER_ID.fullmatch(revision.provider_thread_id):
+            return unknown_settings()
+        runtime_status = await self._runtimes.project_status(conversation.project_id)
+        if runtime_status["state"] != "ready":
+            previous = await asyncio.to_thread(
+                provider_settings.load, self._repository, revision.id,
+            )
+            return previous or unknown_settings(revision.provider_thread_id)
+        try:
+            async with asyncio.timeout(3):
+                observed = await self._runtimes.observed_settings_if_loaded(
+                    conversation.project_id, revision.provider_thread_id,
+                )
+            if observed is not None:
+                current = await asyncio.to_thread(
+                    self._repository.get_active_revision, conversation_id,
+                )
+                if current is not None and current.id == revision.id:
+                    return observed
+                return unknown_settings()
+        except (AdapterError, TimeoutError, InvariantError):
+            pass
+        previous = await asyncio.to_thread(provider_settings.load, self._repository, revision.id)
+        return previous or unknown_settings(revision.provider_thread_id)
+
+    async def requested_settings(self, conversation_id: str) -> dict[str, str | None]:
+        conversation = await asyncio.to_thread(self._repository.get_conversation, conversation_id)
+        project = await asyncio.to_thread(self._repository.get_project, conversation.project_id)
+        return {
+            field: getattr(conversation, f"{field}_override")
+            or getattr(project, f"default_{field}")
+            for field in (
+                "model",
+                "reasoning_effort",
+                "reasoning_summary",
+                "personality",
+                "service_tier",
+            )
+        } | {"web_search": conversation.web_search_mode}
 
     async def model_descriptor(
         self,

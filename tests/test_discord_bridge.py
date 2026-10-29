@@ -394,6 +394,7 @@ async def test_session_status_discloses_full_provider_session_only_to_owner(
         user_id=401,
     )
 
+    bot.session_lifecycle.requested_settings = AsyncMock(return_value={})
     await bot._session_status(owner)
     await bot._session_status(authorized_non_owner)
 
@@ -585,6 +586,11 @@ async def test_every_registered_discord_command_executes_through_bridge(
     )
     catalog = ModelCatalogSnapshot((model,), complete=True, next_cursor=None)
     lifecycle = Mock()
+    from codexd.domain.observations import ProviderSettings
+    lifecycle.provider_settings = AsyncMock(return_value=ProviderSettings(
+        "thread", 1, {"model": "gpt-test"}, "thread/resume", 1000, 1,
+    ))
+    lifecycle.requested_settings = AsyncMock(return_value={"model": None})
     lifecycle.model_catalog = AsyncMock(return_value=catalog)
     from codexd.domain.models import EffectiveModel
     lifecycle.model_descriptor = AsyncMock(return_value=model)
@@ -777,9 +783,9 @@ async def test_every_registered_discord_command_executes_through_bridge(
         "/session/clear": {"confirm": True},
         "/schedule/show": {"schedule_id": schedule.id[:8]},
         "/schedule/update": {"schedule_id": schedule.id[:8]},
-        "/schedule/pause": {"schedule_id": schedule.id[:8], "version": 1},
-        "/schedule/resume": {"schedule_id": schedule.id[:8], "version": 1},
-        "/schedule/delete": {"schedule_id": schedule.id[:8], "version": 1},
+        "/schedule/pause": {"schedule_id": schedule.id[:8]},
+        "/schedule/resume": {"schedule_id": schedule.id[:8]},
+        "/schedule/delete": {"schedule_id": schedule.id[:8]},
         "/schedule/run-now": {"schedule_id": schedule.id[:8]},
         "/diff": {"turn": turn.id[:8]},
     }
@@ -848,7 +854,7 @@ async def test_every_registered_discord_command_executes_through_bridge(
     assert session_status_call.kwargs["ephemeral"] is True
     assert session_embed.title == "🟢 Session active"
     assert [field.name for field in session_embed.fields] == [
-        "Model & behavior · next Turn",
+        "Provider settings · last observed",
         "Activity",
         "Session",
         "Execution",
@@ -866,7 +872,7 @@ async def test_every_registered_discord_command_executes_through_bridge(
     assert "`bot_mention_input`" in capabilities
     assert "`sdk_mention_input`" in capabilities
     assert "`ordinary_file_materialization`" in capabilities
-    assert "`gpt-test` · personality `supported`" in capabilities
+    assert "`gpt-test`" in capabilities and "last observed" in capabilities
     diagnostics = interactions["/diagnostics"].followup.send.await_args.args[0]
     assert "Attachments retained:" in diagnostics
     assert "Runtime lease:" in diagnostics
@@ -903,9 +909,11 @@ async def test_every_registered_discord_command_executes_through_bridge(
     ):
         assert getattr(lifecycle, name).await_args.kwargs["interaction_id"]
     lifecycle.archive.assert_not_awaited()
-    schedules.pause.assert_awaited_once()
-    schedules.resume.assert_awaited_once()
-    schedules.delete.assert_awaited_once()
+    assert schedule_repository.get(schedule.id).state.value == "active"
+    assert storage_context.store.query_one(
+        "SELECT id FROM schedule_delete_confirmations WHERE schedule_id=?", (schedule.id,),
+    ) is not None
+    schedules.delete.assert_not_awaited()  # Requires a separate owner confirmation.
     schedules.run_now.assert_awaited_once()
 
 

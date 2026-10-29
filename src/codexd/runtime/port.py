@@ -14,6 +14,7 @@ from codexd.domain.conversations import (
 )
 from codexd.domain.events import NormalizedEvent
 from codexd.domain.models import AccountStatus, EffectiveModel, ModelCatalogSnapshot
+from codexd.domain.observations import ProviderSettings
 from codexd.domain.turns import TurnIdentity, TurnInput
 from codexd.errors import InvariantError
 
@@ -96,6 +97,8 @@ class CodexRuntime(Protocol):
     async def list_models(self) -> ModelCatalogSnapshot: ...
 
     async def configured_model(self, cwd: Path) -> EffectiveModel: ...
+
+    async def observed_settings(self, thread_id: str) -> ProviderSettings | None: ...
 
     async def account_status(self) -> AccountStatus: ...
 

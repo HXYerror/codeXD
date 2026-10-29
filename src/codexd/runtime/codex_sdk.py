@@ -12,7 +12,7 @@ import os
 import re
 import stat
 import tomllib
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
@@ -20,7 +20,6 @@ from typing import Any, cast
 
 from openai_codex import (
     ApprovalMode,
-    AsyncCodex,
     CodexConfig,
     CodexError,
     InputItem,
@@ -81,6 +80,7 @@ from codexd.domain.models import (
     ReasoningEffortDescriptor,
     ServiceTierDescriptor,
 )
+from codexd.domain.observations import ProviderSettings
 from codexd.domain.provider_failures import classify_provider_failure
 from codexd.domain.turns import MaterializedTurnFile, TurnIdentity, TurnInput
 from codexd.errors import AttachmentIntegrityError, InvariantError, NotFoundError
@@ -101,6 +101,8 @@ from codexd.runtime.errors import (
     UnsupportedCapability,
     file_input_unsupported,
 )
+from codexd.runtime.observing_client import ObservingAsyncCodex as AsyncCodex
+from codexd.runtime.observing_client import ObservingClient
 from codexd.runtime.port import (
     CompactStartResult,
     DynamicToolHandler,
@@ -342,6 +344,14 @@ class CodexSDKRuntime:
         self._subagent_details: dict[str, dict[str, str]] = {}
         self._closed = False
         self._close_lock = asyncio.Lock()
+        self._settings: dict[str, ProviderSettings] = {}
+        self._settings_task: asyncio.Task[None] | None = None
+        self._settings_sink: Callable[[ProviderSettings], None] | None = None
+        self._settings_sequence = 0
+        self._settings_turns: dict[str, str] = {}
+        if isinstance(client, AsyncCodex) and isinstance(client._client, ObservingClient):
+            client._client.response_sink = self._record_response_settings
+            client._client.sequence = lambda: self._settings_sequence
 
     @classmethod
     async def create(
@@ -442,7 +452,10 @@ class CodexSDKRuntime:
                         runtime_generation=generation,
                     )
                 ) from exc
-        return cls(client=client, slot=slot, generation=generation, manifest=manifest)
+        runtime = cls(client=client, slot=slot, generation=generation, manifest=manifest)
+        if isinstance(client, AsyncCodex) and hasattr(client, "_client"):
+            runtime._settings_task = asyncio.create_task(runtime._observe_public_settings())
+        return runtime
 
     async def capabilities(self) -> CapabilityManifest:
         return self._manifest
@@ -464,6 +477,87 @@ class CodexSDKRuntime:
             return EffectiveModel(model, "Codex effective config" if model else "unknown")
         except (CodexError, TimeoutError, ValidationError):
             return EffectiveModel(None, "unknown (effective config unavailable)")
+
+    async def observed_settings(self, thread_id: str) -> ProviderSettings | None:
+        self._ensure_open()
+        if not isinstance(self._client, DynamicAsyncCodex):
+            observed = self._settings.get(thread_id)
+            if observed is None:
+                return None
+            try:
+                async with asyncio.timeout(3):
+                    response = await self._client._client.thread_read(thread_id, False)
+                observed = self._settings.get(thread_id, observed)
+                state = str(response.thread.status.root.type)
+                return replace(observed, state=state,
+                               fresh=observed.fresh and response.thread.id == thread_id
+                               and state not in {"notLoaded", "systemError"})
+            except (CodexError, TimeoutError, ValidationError):
+                return replace(observed, fresh=False, state="unavailable")
+        observed = self._client.settings.get(thread_id)
+        if observed is None:
+            return None
+        try:
+            async with asyncio.timeout(3):
+                response = await asyncio.to_thread(
+                    self._client._sync_client.thread_read, thread_id, False
+                )
+            if response.thread.id != thread_id:
+                return replace(observed, fresh=False, state="identity mismatch")
+            observed = self._client.settings.get(thread_id, observed)
+            state = str(response.thread.status.root.type)
+            return replace(observed, state=state,
+                           fresh=observed.fresh and state not in {"notLoaded", "systemError"})
+        except (CodexError, TimeoutError, ValidationError):
+            return replace(observed, fresh=False, state="unavailable")
+
+    def set_settings_sink(self, sink: Callable[[ProviderSettings], None]) -> None:
+        self._settings_sink = sink
+        if isinstance(self._client, DynamicAsyncCodex):
+            self._client.settings_sink = sink
+
+    async def _observe_public_settings(self) -> None:
+        from codexd.domain.observations import settings_values
+        assert isinstance(self._client, AsyncCodex)
+        try:
+            while not self._closed:
+                event = await self._client._client.next_notification()
+                settings = getattr(event.payload, "thread_settings", None)
+                thread_id = getattr(event.payload, "thread_id", None)
+                if (event.method != "thread/settings/updated" or settings is None
+                        or not isinstance(thread_id, str)):
+                    continue
+                self._settings_sequence += 1
+                observed = ProviderSettings(thread_id, self.generation,
+                    settings_values(settings, notification=True), event.method,
+                    utc_now_ms(), self._settings_sequence, self._settings_turns.get(thread_id))
+                if len(self._settings) >= 256 and thread_id not in self._settings:
+                    self._settings.pop(next(iter(self._settings)))
+                self._settings[thread_id] = observed
+                if self._settings_sink:
+                    self._settings_sink(observed)
+        except Exception:
+            self._settings = {
+                key: replace(value, fresh=False) for key, value in self._settings.items()
+            }
+
+    def _record_response_settings(self, response: Any, source: str, before: int) -> None:
+        from codexd.domain.observations import settings_values
+        existing = self._settings.get(response.thread.id)
+        if existing and existing.sequence > before:
+            return
+        self._settings_sequence += 1
+        observed = ProviderSettings(
+            response.thread.id,
+            self.generation,
+            settings_values(response, notification=False),
+            source,
+            utc_now_ms(),
+            self._settings_sequence,
+        )
+        self._settings[response.thread.id] = observed
+        if self._settings_sink:
+            self._settings_sink(observed)
 
     async def list_models(self) -> ModelCatalogSnapshot:
         self._ensure_open()
@@ -750,6 +844,10 @@ class CodexSDKRuntime:
                 turn_id=local_turn_id,
             )
         handle_thread = self._thread(thread.thread_id)
+        self._settings_turns[thread.thread_id] = local_turn_id
+        previous_settings = self._settings.get(thread.thread_id)
+        if previous_settings is not None:
+            self._settings[thread.thread_id] = replace(previous_settings, fresh=False)
         wire_input: list[InputItem] = []
         if input.text:
             wire_input.append(TextInput(input.text))
@@ -895,6 +993,21 @@ class CodexSDKRuntime:
                         retry_count=retry_count,
                         retry_limit=retry_limit,
                     )
+                    if event.kind in {
+                        "turn.started",
+                        "turn.completed",
+                        "turn.failed",
+                        "turn.interrupted",
+                    }:
+                        settings = (self._client.settings.get(thread.thread_id)
+                                    if isinstance(self._client, DynamicAsyncCodex)
+                                    else self._settings.get(thread.thread_id))
+                        if settings is not None and settings.turn_id == local_turn_id:
+                            yield NormalizedEvent("provider.settings", {
+                                "thread_id": settings.thread_id, "values": settings.values,
+                                "source": settings.source, "observed_at": settings.observed_at,
+                                "sequence": settings.sequence,
+                            })
                     if event.kind == "provider.error":
                         retry_count = max(
                             retry_count,
@@ -959,6 +1072,7 @@ class CodexSDKRuntime:
                         or terminal_event
                     )
                     if provider_terminal:
+                        self._settings_turns.pop(thread.thread_id, None)
                         terminal_seen = True
                         self._turn_handles.pop(handle.id, None)
                         self._release_file_input_lease(handle.id)
@@ -1375,6 +1489,9 @@ class CodexSDKRuntime:
         self._file_lease_process = None
         self._closed = True
         self._turn_handles.clear()
+        if self._settings_task is not None:
+            self._settings_task.cancel()
+            self._settings_task = None
         self._threads.clear()
         self._side_turn_handles.clear()
         self._side_threads.clear()
