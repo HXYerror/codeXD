@@ -2617,7 +2617,9 @@ class Repository:
                                 "This Codex session predates the latest codexD tools. "
                                 "Run `/session new` once to enable Schedule creation "
                                 "and generated-image delivery from natural-language "
-                                "requests."
+                                "requests. To stop future triggers, use `/schedule list` "
+                                "then `/schedule pause` in this thread (select a task; "
+                                "no version required). A text promise is not a pause."
                             ),
                         }
                     ),

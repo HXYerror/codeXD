@@ -46,6 +46,9 @@ async def test_effective_identity_never_uses_catalog_default(
     )
     runtimes = Mock()
     runtimes.ensure = AsyncMock(return_value=(runtime, None))
+    async def configured_if_loaded(project):
+        return await runtime.configured_model(project.root_path)
+    runtimes.configured_model_if_loaded = AsyncMock(side_effect=configured_if_loaded)
     lifecycle = SessionLifecycleCoordinator(
         repository=storage_context.repository,
         runtimes=runtimes,
@@ -119,6 +122,12 @@ async def test_model_show_missing_catalog_model_preserves_identity_and_active_bo
     bot.session_lifecycle.effective_model = AsyncMock(
         return_value=EffectiveModel("outside-catalog", "Codex effective config"),
     )
+    from codexd.domain.observations import ProviderSettings
+    bot.session_lifecycle.provider_settings = AsyncMock(return_value=ProviderSettings(
+        "thread", 1, {"model": "outside-catalog"}, "thread/resume", 1000, 1,
+    ))
+    bot.session_lifecycle.requested_settings = AsyncMock(return_value={"model": "next-model"})
+    bot.session_lifecycle.model_catalog_if_loaded = AsyncMock(return_value=catalog)
     # An active Turn's requested model must not be labeled as an observation.
     from codexd.domain.turns import TurnInput, TurnSource
 
@@ -137,8 +146,8 @@ async def test_model_show_missing_catalog_model_preserves_identity_and_active_bo
     await bot._model_show(interaction)
     content = interaction.followup.send.await_args.args[0]
     assert "outside-catalog" in content and "unknown / not reported" in content
-    assert "Current Turn observed model: `not reported`" in content
-    assert "Current Turn requested model: `old`" in content
+    assert "next-model" in content and "not provider confirmation" in content
+    assert "last observed" in content
     assert "fake-model" not in content
 
 

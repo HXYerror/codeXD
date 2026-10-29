@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import secrets
+import sqlite3
 from collections.abc import Mapping
 from typing import Any, cast
 
@@ -18,8 +19,9 @@ from codexd.application.schedule_coordinator import (
     prepare_schedule_create_draft,
 )
 from codexd.domain.ids import canonical_json, sha256_text, utc_now_ms
-from codexd.errors import ConfigurationError, ConflictError, SecurityError
+from codexd.errors import ConfigurationError, ConflictError, NotFoundError, SecurityError
 from codexd.runtime.port import DynamicToolCall
+from codexd.storage import schedule_management
 from codexd.storage.records import DynamicToolInvocationRecord
 from codexd.storage.schedules import ScheduleRepository
 
@@ -53,9 +55,7 @@ CODEXD_DYNAMIC_TOOLS: tuple[JsonObject, ...] = (
     {
         "type": "namespace",
         "name": "codexd",
-        "description": (
-            "Actions provided by codexD for the current Discord Conversation."
-        ),
+        "description": ("Actions provided by codexD for the current Discord Conversation."),
         "tools": [
             {
                 "type": "function",
@@ -82,6 +82,43 @@ CODEXD_DYNAMIC_TOOLS: tuple[JsonObject, ...] = (
                 ),
                 "inputSchema": PUBLISH_IMAGE_INPUT_SCHEMA,
             },
+            *[
+                cast(JsonObject, {
+                    "type": "function",
+                    "name": name,
+                    "description": description,
+                    "inputSchema": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {}
+                        if name == "schedule_list"
+                        else {
+                            "schedule_id": {"type": "string", "minLength": 4, "maxLength": 36},
+                        },
+                        "required": [] if name == "schedule_list" else ["schedule_id"],
+                    },
+                })
+                for name, description in (
+                    (
+                        "schedule_list",
+                        "List schedules in the owner's current Conversation. "
+                        "No cross-thread access. "
+                        "If tools are unavailable, use /schedule list in the original thread.",
+                    ),
+                    (
+                        "schedule_show",
+                        "Read one current-Conversation schedule by ID or unique prefix. "
+                        "Clarify ambiguous targets; never guess or use a Discord Thread ID.",
+                    ),
+                    (
+                        "schedule_pause",
+                        "Pause future triggers only when the owner explicitly requests it. "
+                        "List/clarify first if the target is ambiguous. Report persisted state, "
+                        "not a promise. Queued/running work is not cancelled. No background "
+                        "self-pause or delete; use /schedule delete for owner confirmation.",
+                    ),
+                )
+            ],
         ],
     },
 )
@@ -125,6 +162,31 @@ class DynamicToolDispatcher:
                     },
                 )
             return await self._images.handle(call)
+        if call.tool in {"schedule_list", "schedule_show", "schedule_pause"}:
+            arguments_hash, error = _arguments_hash(call.arguments)
+            args = call.arguments
+            expected = set() if call.tool == "schedule_list" else {"schedule_id"}
+            if (
+                error
+                or not isinstance(args, dict)
+                or set(args) != expected
+                or (expected and not isinstance(args.get("schedule_id"), str))
+            ):
+                return _tool_response(False, {"status": "error", "code": "invalid_arguments"})
+            try:
+                result = await asyncio.to_thread(
+                    schedule_management.tool_call,
+                    self._schedules,
+                    call,
+                    arguments_hash,
+                    self._owner_user_id,
+                    self._guild_id,
+                )
+            except (ConflictError, SecurityError, NotFoundError) as exc:
+                return _tool_response(
+                    False, {"status": "error", "code": exc.code, "message": str(exc)}
+                )
+            return _tool_response(result["status"] == "ok", result)
         if call.tool != "schedule_create":
             return _tool_response(
                 False,
@@ -174,13 +236,11 @@ class DynamicToolDispatcher:
                 occurrences=(prepared.occurrences if prepared is not None else ()),
                 component_nonce=secrets.token_urlsafe(9),
                 expires_at=(
-                    prepared.expires_at
-                    if prepared is not None
-                    else utc_now_ms() + 10 * 60 * 1000
+                    prepared.expires_at if prepared is not None else utc_now_ms() + 10 * 60 * 1000
                 ),
                 validation_error=validation_error,
             )
-        except ConflictError:
+        except (ConflictError, sqlite3.IntegrityError):
             return _tool_response(
                 False,
                 {

@@ -12,6 +12,7 @@ from typing import Any, cast
 from codexd.application.volatile_turns import VolatileTurnStore
 from codexd.domain.events import NormalizedEvent
 from codexd.domain.ids import canonical_json, new_id, sha256_text, utc_now_ms
+from codexd.domain.observations import FIELDS, scalar
 from codexd.domain.turns import InterruptOrigin, TurnState, assert_turn_transition
 from codexd.errors import InvariantError, NotFoundError, SecurityError, StorageError
 from codexd.storage.progress import (
@@ -32,6 +33,7 @@ _DURABLE_EVENT_KINDS = frozenset(
     {
         "file_change.completed",
         "provider.error",
+        "provider.settings",
         "provider.unknown",
         "provider.item",
         "model.rerouted",
@@ -466,6 +468,42 @@ class ProjectingEventSink:
         event: NormalizedEvent,
         now: int,
     ) -> None:
+        if event.kind == "provider.settings":
+            revision = connection.execute(
+                "SELECT provider_thread_id FROM thread_revisions WHERE id=?",
+                (scope["thread_revision_id"],),
+            ).fetchone()
+            if revision is None or revision["provider_thread_id"] != event.payload.get("thread_id"):
+                return
+            raw = event.payload.get("values")
+            values = (
+                {key: scalar(value) for key, value in raw.items() if key in FIELDS}
+                if isinstance(raw, dict)
+                else {}
+            )
+            for turn_id in ("", str(scope["id"])):
+                connection.execute(
+                    "INSERT INTO provider_settings_observations VALUES (?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(revision_id,turn_id) DO UPDATE SET "
+                    "values_json=excluded.values_json, "
+                    "runtime_generation=excluded.runtime_generation, "
+                    "observed_at=excluded.observed_at, "
+                    "sequence=excluded.sequence,source=excluded.source "
+                    "WHERE excluded.runtime_generation>runtime_generation OR "
+                    "(excluded.runtime_generation=runtime_generation "
+                    "AND excluded.sequence>=sequence)",
+                    (
+                        scope["thread_revision_id"],
+                        turn_id,
+                        scope["runtime_generation"],
+                        event.payload["thread_id"],
+                        event.payload["observed_at"],
+                        event.payload["sequence"],
+                        event.payload["source"],
+                        canonical_json(values),
+                    ),
+                )
+            return
         if event.kind == "turn.started":
             self._project_progress(
                 connection,
@@ -1982,6 +2020,15 @@ class ProjectingEventSink:
 
 def _durable_event_payload(event: NormalizedEvent) -> dict[str, Any]:
     payload = event.payload
+    if event.kind == "provider.settings":
+        raw = payload.get("values")
+        return {
+            key: payload.get(key) for key in ("thread_id", "source", "observed_at", "sequence")
+        } | {
+            "values": {key: scalar(value) for key, value in raw.items() if key in FIELDS}
+            if isinstance(raw, dict)
+            else {},
+        }
     if event.kind == "file_change.completed":
         raw_changes = payload.get("changes")
         changes = raw_changes if isinstance(raw_changes, list) else []

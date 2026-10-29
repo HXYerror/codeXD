@@ -44,6 +44,7 @@ from codexd.rendering.media_worker import MediaWorker
 from codexd.runtime.supervisor import RuntimeSupervisor
 from codexd.security.redaction import redact_diff
 from codexd.security.signing import ComponentSigner
+from codexd.storage import provider_settings, schedule_management
 from codexd.storage.ingress_reconciliation import IngressCheckpointRepository
 from codexd.storage.records import (
     CommandIntentRecord,
@@ -1688,6 +1689,20 @@ class CodexDBot(discord.Client):
             return
         data = cast(Mapping[str, object], interaction.data or {})
         custom_id = str(data.get("custom_id", ""))
+        if custom_id.startswith("schedule-delete:"):
+            try:
+                await self._run_intent_action(
+                    interaction, command_name="schedule delete confirm",
+                    request={"confirmation": custom_id},
+                    action=lambda staged: self._confirm_schedule_delete(
+                        staged, custom_id.removeprefix("schedule-delete:"),
+                    ),
+                )
+            except (CodexDError, ValueError) as exc:
+                await self._send_component_error(
+                    interaction, message=str(exc), title="Schedule deletion rejected",
+                )
+            return
         if custom_id.startswith("cc:v1:"):
             await self._handle_catalog_choice_component(interaction, custom_id)
             return
@@ -1846,7 +1861,7 @@ class CodexDBot(discord.Client):
                 interaction_id=str(interaction.id),
             )
         await interaction.followup.send(
-            f"{kind.title()} override: `{selected or 'default'}`.",
+            f"{kind.title()} request saved: `{selected or 'no override'}`; pending confirmation.",
             ephemeral=True,
         )
 
@@ -2262,6 +2277,14 @@ class CodexDBot(discord.Client):
         schedule.command(name="run-now", description="Run a schedule now")(
             intent("schedule run-now", self._schedule_run_now)
         )
+        for command in schedule.commands:
+            if isinstance(command, app_commands.Command) and any(
+                parameter.name == "schedule_id" for parameter in command.parameters
+            ):
+                app_commands.describe(
+                    schedule_id="Select a task in this thread, or enter its UUID / unique prefix",
+                )(command)
+                command.autocomplete("schedule_id")(self._schedule_autocomplete)
         self.tree.add_command(schedule, guild=guild)
 
         self.tree.add_command(
@@ -2601,13 +2624,14 @@ class CodexDBot(discord.Client):
             else None
         )
         if conversation is not None:
-            catalog = await self.session_lifecycle.model_catalog(conversation.id)
-            model = await self.session_lifecycle.model_descriptor(conversation.id, catalog)
+            observed = await self.session_lifecycle.provider_settings(conversation.id)
             lines.extend(
                 (
-                    "**Selected model**",
-                    f"  `{model.model}` · personality "
-                    f"`{'supported' if model.supports_personality else 'unsupported'}`",
+                    "**Provider last observed model**",
+                    f"  `{observed.values.get('model') or 'unknown'}` · "
+                    f"{'last observed' if observed.fresh else 'stale / unconfirmed'} · "
+                    f"{_discord_time(observed.observed_at if observed.sequence else None)}",
+                    "Manifest above: daemon startup capabilities, not live model settings.",
                     "  execution: `full_access` / `auto_review` (fixed)",
                 )
             )
@@ -2622,9 +2646,21 @@ class CodexDBot(discord.Client):
         payload = await asyncio.to_thread(
             self.repository.latest_event_payload, conversation.id, "usage.updated"
         )
+        usage_event = await asyncio.to_thread(
+            self.repository.store.query_one,
+            "SELECT occurred_at,turn_id FROM events WHERE conversation_id=? "
+            "AND kind='usage.updated' ORDER BY sequence DESC LIMIT 1", (conversation.id,),
+        )
         await interaction.followup.send(
             (
-                format_usage(payload)
+                "Latest reported usage for this Conversation (historical, not live):\n"
+                + (
+                    f"Observed {_discord_time(usage_event['occurred_at'])}; "
+                    f"Turn `{usage_event['turn_id'][:8]}`\n"
+                    if usage_event
+                    else "Time: not reported\n"
+                )
+                + format_usage(payload)
                 if payload is not None
                 else "Provider token usage has not been reported for this Conversation."
             ),
@@ -2846,13 +2882,13 @@ class CodexDBot(discord.Client):
             f"Input summary: `{_inline_code(record.input_summary)}`",
             f"Runtime: generation `{record.runtime_generation or 'n/a'}` · "
             f"lease `{(record.runtime_lease_id or 'n/a')[:12]}`",
-            f"Model: `{record.effective_model or 'default'}` · reasoning: "
+            f"Requested model: `{record.effective_model or 'no override'}` · reasoning: "
             f"`{record.effective_reasoning_effort or 'default'}`",
-            f"Reasoning summary: "
+            f"Requested reasoning summary: "
             f"`{record.effective_reasoning_summary or 'default'}` · personality "
             f"`{record.effective_personality or 'default'}` · tier "
             f"`{record.effective_service_tier or 'default'}`",
-            f"Sandbox: **{record.effective_sandbox.value.upper()}** · "
+            f"Requested sandbox: **{record.effective_sandbox.value.upper()}** · "
             f"approval: `auto_review` · web search: "
             f"`{record.effective_web_search_mode}`",
             f"Terminal: `{record.terminal_code or record.error_code or 'n/a'}` · "
@@ -2863,6 +2899,13 @@ class CodexDBot(discord.Client):
             f"{events['file_events']} · usage "
             f"`{record.usage_scope or _usage_observation(events['usage_observed'])}`",
         ]
+        historical = await asyncio.to_thread(
+            provider_settings.load, self.repository, record.thread_revision_id or "", record.id,
+        )
+        lines.append("Provider settings at this Turn: " + (
+            f"{historical.values} · {historical.source} · {_discord_time(historical.observed_at)}"
+            if historical else "unknown / not observed"
+        ))
         if record.input_message_id is not None:
             input_channel_id = (
                 conversation.discord_parent_channel_id
@@ -3074,72 +3117,75 @@ class CodexDBot(discord.Client):
         )
 
     async def _model_show(self, interaction: discord.Interaction[Any]) -> None:
+        await self._provider_settings_show(interaction)
+
+    async def _provider_settings_show(self, interaction: discord.Interaction[Any]) -> None:
         await self._defer_authorized(interaction)
         conversation = await self._conversation(interaction)
-        catalog = await self.session_lifecycle.model_catalog(conversation.id)
-        resolved = await self.session_lifecycle.effective_model(conversation.id, catalog)
-        active = await asyncio.to_thread(
-            self.repository.active_turn_for_conversation,
-            conversation.id,
+        observed = await self.session_lifecycle.provider_settings(conversation.id)
+        requested = await self.session_lifecycle.requested_settings(conversation.id)
+        label = (
+            "Provider last observed settings"
+            if observed.fresh
+            else "Provider settings unknown/stale"
         )
-        selected = resolved.descriptor
-        identity_lines = [
-            f"Next Turn model: `{_safe_embed_text(resolved.model or 'unknown')}`",
-            f"Source: `{resolved.source}`",
+        lines = [
+            label,
+            f"State: `{observed.state}` · source `{observed.source}` · "
+            f"last observed {_discord_time(observed.observed_at if observed.sequence else None)}",
         ]
-        if active is not None:
-            # effective_model is a requested override, not a runtime observation.
-            identity_lines.append("Current Turn observed model: `not reported`")
-            identity_lines.append(
-                "Current Turn requested model: "
-                f"`{_safe_embed_text(active.effective_model or 'provider config')}`"
+        for field in (
+            "model",
+            "model_provider",
+            "reasoning_effort",
+            "reasoning_summary",
+            "personality",
+            "service_tier",
+        ):
+            lines.append(
+                f"{field}: "
+                f"`{_safe_embed_text(observed.values.get(field) or 'unknown / not reported')}`"
             )
-        if selected is None:
-            await interaction.followup.send(
-                "\n".join(
-                    [
-                        *identity_lines,
-                        "Catalog capabilities: `unknown / not reported` "
-                        "(reasoning, image input, personality, service tiers).",
-                    ]
-                ),
-                ephemeral=True,
-            )
-            return
-        tiers = ", ".join(tier.id for tier in selected.service_tiers) or "none"
-        await interaction.followup.send(
-            "\n".join(
-                (
-                    *identity_lines,
-                    f"Display: **{_safe_embed_text(selected.display_name or selected.model)}**",
-                    (
-                        f"Description: {_safe_embed_text(selected.description)}"
-                        if selected.description
-                        else "Description: `not provided`"
-                    ),
-                    f"Catalog: `{'complete' if catalog.complete else 'incomplete'}` · "
-                    f"image input `{'image' in selected.input_modalities}`",
-                    "Reasoning efforts: "
-                    f"`{', '.join(selected.supported_reasoning_efforts) or 'provider default'}` "
-                    "· "
-                    f"default `{selected.default_reasoning_effort or 'provider default'}`",
-                    f"Personality: "
-                    f"`{'supported' if selected.supports_personality else 'unsupported'}`",
-                    f"Service tiers: `{tiers}` · default "
-                    f"`{selected.default_service_tier or 'provider default'}`",
-                    f"Upgrade suggestion: `{'available' if selected.upgrade else 'none'}`",
-                )
-            ),
-            ephemeral=True,
+        lines.append("Requested for next use (not provider confirmation):")
+        lines.extend(
+            f"{key}: "
+            f"`{_safe_embed_text(value or 'no override; existing thread may retain settings')}`"
+            for key, value in requested.items()
         )
+        lines.append("Web search execution: `not observed`; requested policy is not confirmation.")
+        catalog = await self.session_lifecycle.model_catalog_if_loaded(conversation.id)
+        selected = (
+            next(
+                (item for item in catalog.models if item.model == observed.values.get("model")),
+                None,
+            )
+            if catalog
+            else None
+        )
+        if selected is None:
+            lines.append("Catalog capabilities: unknown / not reported for this observed model.")
+        else:
+            lines.append(
+                f"Catalog capabilities only: image `{'image' in selected.input_modalities}`; "
+                f"reasoning `{', '.join(selected.supported_reasoning_efforts)}`; "
+                f"personality `{selected.supports_personality}`."
+            )
+        await interaction.followup.send("\n".join(lines), ephemeral=True,
+                                         allowed_mentions=discord.AllowedMentions.none())
 
     async def _model_list(self, interaction: discord.Interaction[Any]) -> None:
         await self._defer_authorized(interaction)
         conversation = await self._conversation(interaction)
-        catalog = await self.session_lifecycle.model_catalog(conversation.id)
+        catalog = await self.session_lifecycle.model_catalog_if_loaded(conversation.id)
+        if catalog is None:
+            await interaction.followup.send(
+                "Model catalog unavailable: runtime is not loaded; this query does not start it.",
+                ephemeral=True,
+            )
+            return
         text = "\n".join(
             f"**{_safe_embed_text(model.display_name or model.model)}** · "
-            f"`{model.model}`{' **default**' if model.is_default else ''} · "
+            f"`{model.model}`{' **catalog default**' if model.is_default else ''} · "
             f"input {', '.join(model.input_modalities)} · "
             f"reasoning {', '.join(model.supported_reasoning_efforts) or 'provider default'}"
             f"{' · ' + _safe_embed_text(model.description) if model.description else ''}"
@@ -3166,7 +3212,10 @@ class CodexDBot(discord.Client):
             value,
             interaction_id=str(interaction.id),
         )
-        await interaction.followup.send(f"Model override: `{value or 'default'}`", ephemeral=True)
+        await interaction.followup.send(
+            f"Model request saved: `{value or 'no override'}`; pending confirmation. "
+            "Clearing an override does not reset an existing thread.", ephemeral=True,
+        )
 
     async def _model_autocomplete(
         self,
@@ -3212,22 +3261,7 @@ class CodexDBot(discord.Client):
         return choices if len(choices) <= 25 else []
 
     async def _model_tier_show(self, interaction: discord.Interaction[Any]) -> None:
-        await self._defer_authorized(interaction)
-        conversation = await self._conversation(interaction)
-        catalog = await self.session_lifecycle.model_catalog(conversation.id)
-        selected = await self.session_lifecycle.model_descriptor(conversation.id, catalog)
-        tiers = (
-            "\n".join(
-                f"`{tier.id}` · {tier.name}{' · ' + tier.description if tier.description else ''}"
-                for tier in selected.service_tiers
-            )
-            or "This model exposes no service tiers."
-        )
-        await interaction.followup.send(
-            f"Model: `{selected.model}` · configured tier: "
-            f"`{conversation.service_tier_override or 'default'}`\n{tiers}",
-            ephemeral=True,
-        )
+        await self._provider_settings_show(interaction)
 
     async def _model_tier_set(
         self, interaction: discord.Interaction[Any], tier: str
@@ -3240,7 +3274,8 @@ class CodexDBot(discord.Client):
             interaction_id=str(interaction.id),
         )
         await interaction.followup.send(
-            f"Service tier: `{updated.service_tier_override}`.", ephemeral=True
+            f"Service tier requested: `{updated.service_tier_override}`; pending confirmation.",
+            ephemeral=True
         )
 
     async def _model_tier_default(
@@ -3253,27 +3288,13 @@ class CodexDBot(discord.Client):
             None,
             interaction_id=str(interaction.id),
         )
-        await interaction.followup.send("Service tier: `default`.", ephemeral=True)
-
-    async def _reasoning_show(self, interaction: discord.Interaction[Any]) -> None:
-        await self._defer_authorized(interaction)
-        conversation = await self._conversation(interaction)
-        catalog = await self.session_lifecycle.model_catalog(conversation.id)
-        selected = await self.session_lifecycle.model_descriptor(conversation.id, catalog)
         await interaction.followup.send(
-            "\n".join(
-                (
-                    f"Model: `{selected.model}`",
-                    "Supported efforts: "
-                    f"`{', '.join(selected.supported_reasoning_efforts) or 'provider default'}`",
-                    f"Model default: `{selected.default_reasoning_effort or 'provider default'}`",
-                    f"Conversation override: "
-                    f"`{conversation.reasoning_effort_override or 'default'}`",
-                    f"Effective: `{_effective_reasoning(conversation, selected)}`",
-                )
-            ),
+            "Tier override cleared; existing thread may retain settings (not confirmed).",
             ephemeral=True,
         )
+
+    async def _reasoning_show(self, interaction: discord.Interaction[Any]) -> None:
+        await self._provider_settings_show(interaction)
 
     async def _reasoning_set(
         self, interaction: discord.Interaction[Any], effort: str | None = None
@@ -3294,7 +3315,8 @@ class CodexDBot(discord.Client):
             interaction_id=str(interaction.id),
         )
         await interaction.followup.send(
-            f"Reasoning effort: `{value or 'default'}`", ephemeral=True
+            f"Reasoning request saved: `{value or 'no override'}`; pending confirmation. "
+            "Clearing an override does not reset an existing thread.", ephemeral=True
         )
 
     async def _reasoning_autocomplete(
@@ -3452,16 +3474,8 @@ class CodexDBot(discord.Client):
             ephemeral=True,
         )
 
-    async def _reasoning_summary_show(
-        self, interaction: discord.Interaction[Any]
-    ) -> None:
-        await self._defer_authorized(interaction)
-        conversation = await self._conversation(interaction)
-        await interaction.followup.send(
-            "Reasoning summary: "
-            f"`{conversation.reasoning_summary_override or 'default'}`",
-            ephemeral=True,
-        )
+    async def _reasoning_summary_show(self, interaction: discord.Interaction[Any]) -> None:
+        await self._provider_settings_show(interaction)
 
     async def _reasoning_summary_set(
         self, interaction: discord.Interaction[Any], summary: str
@@ -3474,7 +3488,7 @@ class CodexDBot(discord.Client):
             interaction_id=str(interaction.id),
         )
         await interaction.followup.send(
-            f"Reasoning summary: `{updated.reasoning_summary_override}`.",
+            f"Summary request saved: `{updated.reasoning_summary_override}`; pending confirmation.",
             ephemeral=True,
         )
 
@@ -3488,19 +3502,13 @@ class CodexDBot(discord.Client):
             None,
             interaction_id=str(interaction.id),
         )
-        await interaction.followup.send("Reasoning summary: `default`.", ephemeral=True)
-
-    async def _personality_show(self, interaction: discord.Interaction[Any]) -> None:
-        await self._defer_authorized(interaction)
-        conversation = await self._conversation(interaction)
-        catalog = await self.session_lifecycle.model_catalog(conversation.id)
-        selected = await self.session_lifecycle.model_descriptor(conversation.id, catalog)
         await interaction.followup.send(
-            f"Model `{selected.model}` personality support: "
-            f"`{'available' if selected.supports_personality else 'unavailable'}` · "
-            f"override `{conversation.personality_override or 'default'}`.",
+            "Summary override cleared; existing thread may retain settings (not confirmed).",
             ephemeral=True,
         )
+
+    async def _personality_show(self, interaction: discord.Interaction[Any]) -> None:
+        await self._provider_settings_show(interaction)
 
     async def _personality_set(
         self, interaction: discord.Interaction[Any], personality: str
@@ -3514,18 +3522,13 @@ class CodexDBot(discord.Client):
             interaction_id=str(interaction.id),
         )
         await interaction.followup.send(
-            f"Personality: `{updated.personality_override or 'default'}`.",
+            f"Personality requested: `{updated.personality_override or 'no override'}`; "
+            "pending confirmation. Existing thread may retain settings.",
             ephemeral=True,
         )
 
-    async def _websearch_show(
-        self, interaction: discord.Interaction[Any]
-    ) -> None:
-        await self._defer_authorized(interaction)
-        conversation = await self._conversation(interaction)
-        await interaction.followup.send(
-            f"Web search mode: `{conversation.web_search_mode}`", ephemeral=True
-        )
+    async def _websearch_show(self, interaction: discord.Interaction[Any]) -> None:
+        await self._provider_settings_show(interaction)
 
     async def _websearch_set(
         self,
@@ -3543,7 +3546,8 @@ class CodexDBot(discord.Client):
             interaction_id=str(interaction.id),
         )
         await interaction.followup.send(
-            f"Web search mode: `{updated.web_search_mode}`.", ephemeral=True
+            f"Requested web search policy: `{updated.web_search_mode}`; "
+            "execution is not independently observed.", ephemeral=True
         )
 
     async def _session_list(self, interaction: discord.Interaction[Any]) -> None:
@@ -3556,7 +3560,7 @@ class CodexDBot(discord.Client):
             f"provider hash `{sha256_text(revision.provider_thread_id)[:12]}` · "
             f"created {_discord_time(revision.created_at)} · "
             f"last active {_discord_time(revision.activated_at)} · "
-            f"v{revision.provider_version}"
+            f"creation runtime v{revision.provider_version} (historical)"
             for revision in revisions
         ) or "No Thread revisions."
         await interaction.followup.send(text, ephemeral=True)
@@ -3565,7 +3569,10 @@ class CodexDBot(discord.Client):
         await self._defer_authorized(interaction)
         conversation = await self._conversation(interaction)
         view = await self.session_lifecycle.status_view(conversation.id)
+        requested = await self.session_lifecycle.requested_settings(conversation.id)
         await interaction.followup.send(
+            "Requested for next use (not provider confirmation): "
+            + "; ".join(f"{key}={value or 'no override'}" for key, value in requested.items()),
             embed=session_status_embed(
                 view,
                 disclose_provider_session_id=(
@@ -3709,6 +3716,8 @@ class CodexDBot(discord.Client):
             f"last {_discord_time(schedule.last_due_at)}"
             for schedule in schedules
         ) or "No schedules."
+        text += "\nManage in this thread: /schedule show, /schedule pause, "
+        text += "/schedule resume, /schedule delete — select a task; no version required."
         await interaction.followup.send(text, ephemeral=True)
 
     async def _schedule_show(
@@ -3745,6 +3754,8 @@ class CodexDBot(discord.Client):
                     "Execution: **FULL ACCESS** / auto_review (fixed)",
                     f"Prompt: {discord.utils.escape_markdown(schedule.prompt_text or '[deleted]')}",
                     f"Recent fires:\n{fire_lines}",
+                    "Manage here: /schedule pause · /schedule resume · /schedule delete "
+                    "(owner confirmation; queued/running Turns are not cancelled).",
                 )
             ),
             ephemeral=True,
@@ -3752,20 +3763,17 @@ class CodexDBot(discord.Client):
         )
 
     async def _schedule_pause(
-        self, interaction: discord.Interaction[Any], schedule_id: str, version: int
+        self, interaction: discord.Interaction[Any], schedule_id: str
     ) -> None:
         await self._defer_owner(interaction)
         conversation = await self._conversation(interaction)
-        target = await asyncio.to_thread(
-            self.schedule_repository.resolve, conversation.id, schedule_id
-        )
-        schedule = await self.schedules.pause(
-            target.id,
-            expected_version=version,
-            audit=_schedule_audit_context(interaction),
+        schedule = await asyncio.to_thread(
+            schedule_management.control, self.schedule_repository, conversation.id,
+            schedule_id, "pause", _schedule_audit_context(interaction),
         )
         await interaction.followup.send(
-            f"Schedule `{schedule.id[:8]}` paused (v{schedule.version}).", ephemeral=True
+            f"Schedule `{schedule['id'][:8]}` is paused; future triggers stopped. "
+            f"Queued/running Turns unchanged: {schedule['pending_turns']}.", ephemeral=True
         )
 
     async def _schedule_update(
@@ -3832,36 +3840,74 @@ class CodexDBot(discord.Client):
         )
 
     async def _schedule_resume(
-        self, interaction: discord.Interaction[Any], schedule_id: str, version: int
+        self, interaction: discord.Interaction[Any], schedule_id: str
     ) -> None:
         await self._defer_owner(interaction)
         conversation = await self._conversation(interaction)
-        target = await asyncio.to_thread(
-            self.schedule_repository.resolve, conversation.id, schedule_id
-        )
-        schedule = await self.schedules.resume(
-            target.id,
-            expected_version=version,
-            audit=_schedule_audit_context(interaction),
+        schedule = await asyncio.to_thread(
+            schedule_management.control, self.schedule_repository, conversation.id,
+            schedule_id, "resume", _schedule_audit_context(interaction),
         )
         await interaction.followup.send(
-            f"Schedule `{schedule.id[:8]}` resumed (v{schedule.version}).", ephemeral=True
+            f"Schedule `{schedule['id'][:8]}` resumed.", ephemeral=True
         )
 
     async def _schedule_delete(
-        self, interaction: discord.Interaction[Any], schedule_id: str, version: int
+        self, interaction: discord.Interaction[Any], schedule_id: str
     ) -> None:
         await self._defer_owner(interaction)
         conversation = await self._conversation(interaction)
-        target = await asyncio.to_thread(
-            self.schedule_repository.resolve, conversation.id, schedule_id
+        confirmation, target = await asyncio.to_thread(
+            schedule_management.prepare_delete, self.schedule_repository,
+            conversation.id, schedule_id, interaction.user.id,
         )
-        await self.schedules.delete(
-            target.id,
-            expected_version=version,
-            audit=_schedule_audit_context(interaction),
+        view = discord.ui.View(timeout=None)
+        view.add_item(discord.ui.Button(
+            label="Confirm deletion", style=discord.ButtonStyle.danger,
+            custom_id=f"schedule-delete:{confirmation}",
+        ))
+        await interaction.followup.send(
+            f"Delete **{_safe_embed_text(target['name'])}** (`{target['id']}`) in this thread?\n"
+            "Stops future triggers and clears its prompt/skill inputs. Audit/fire history remains; "
+            "queued/running Turns are not cancelled. Confirmation expires in 10 minutes.",
+            view=view, ephemeral=True, allowed_mentions=discord.AllowedMentions.none(),
         )
-        await interaction.followup.send("Schedule deleted.", ephemeral=True)
+
+    async def _confirm_schedule_delete(
+        self, interaction: discord.Interaction[Any], confirmation: str,
+    ) -> None:
+        await self._defer_owner(interaction)
+        conversation = await self._conversation(interaction)
+        await asyncio.to_thread(
+            schedule_management.confirm_delete,
+            self.schedule_repository,
+            conversation.id,
+            confirmation,
+            interaction.user.id,
+            _schedule_audit_context(interaction),
+        )
+        await interaction.followup.send(
+            "Schedule deleted; queued/running Turns unchanged.", ephemeral=True
+        )
+
+    async def _schedule_autocomplete(
+        self, interaction: discord.Interaction[Any], current: str,
+    ) -> list[app_commands.Choice[str]]:
+        if (
+            not self._authorized_interaction(interaction)
+            or interaction.user.id != self.config.discord.owner_user_id
+        ):
+            return []
+        try:
+            conversation = await self._conversation(interaction)
+            schedules = await asyncio.to_thread(
+                self.schedule_repository.list_for_conversation, conversation.id,
+            )
+        except CodexDError:
+            return []
+        return [app_commands.Choice(
+            name=f"{item.name} · {item.state.value} · {item.id[:8]}"[:100], value=item.id,
+        ) for item in schedules if current.casefold() in f"{item.name} {item.id}".casefold()][:25]
 
     async def _schedule_run_now(
         self, interaction: discord.Interaction[Any], schedule_id: str

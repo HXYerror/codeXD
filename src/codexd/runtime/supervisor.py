@@ -11,6 +11,7 @@ from codexd.config import resolve_project_path
 from codexd.domain.capabilities import CapabilityManifest
 from codexd.domain.ids import utc_now_ms
 from codexd.domain.models import AccountStatus, EffectiveModel, ModelCatalogSnapshot
+from codexd.domain.observations import ProviderSettings
 from codexd.errors import InvariantError, SecurityError
 from codexd.runtime.errors import (
     AdapterError,
@@ -20,6 +21,7 @@ from codexd.runtime.errors import (
 )
 from codexd.runtime.port import CodexRuntime, RuntimeSlotConfig
 from codexd.security import private_files
+from codexd.storage import provider_settings
 from codexd.storage.records import ProjectRecord, RuntimeLeaseRecord
 from codexd.storage.repository import Repository
 
@@ -329,6 +331,9 @@ class RuntimeSupervisor:
             slot.last_watchdog_at = slot.ready_since
             slot.last_used_at = slot.ready_since
             slot.model_catalog = catalog
+            binder = getattr(runtime, "set_settings_sink", None)
+            if callable(binder):
+                binder(lambda observed: self._persist_settings(observed, key))
             if self._closing:
                 await self._close_ready_slot(
                     slot,
@@ -677,6 +682,36 @@ class RuntimeSupervisor:
                 ):
                     return await slot.runtime.configured_model(project.root_path)
         return EffectiveModel(None, "unknown (runtime not loaded)")
+
+    async def observed_settings_if_loaded(
+        self, project_id: str, thread_id: str,
+    ) -> ProviderSettings | None:
+        key = project_id if self._topology == "project_scoped" else "shared"
+        async with self._slots_lock:
+            slot = self._slots.get(key)
+        if slot is None:
+            return None
+        async with slot.lock:
+            if slot.runtime is None or slot.lease is None or slot.lease.state != "ready":
+                return None
+            observed = await slot.runtime.observed_settings(thread_id)
+            if observed and observed.generation == slot.lease.generation:
+                provider_settings.save(self._repository, project_id, observed)
+                return observed
+        return None
+
+    def _persist_settings(self, observed: ProviderSettings, key: str) -> None:
+        slot = self._slots.get(key)
+        if slot is None or slot.lease is None or slot.lease.generation != observed.generation:
+            return
+        rows = self._repository.store.query_all(
+            "SELECT DISTINCT c.project_id FROM conversations c JOIN thread_revisions r "
+            "ON r.id=c.active_revision_id WHERE r.provider_thread_id=?",
+            (observed.thread_id,),
+        )
+        for row in rows:
+            if key == "shared" or row["project_id"] == key:
+                provider_settings.save(self._repository, row["project_id"], observed)
 
     async def model_catalog_if_loaded(
         self,

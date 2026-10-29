@@ -160,8 +160,8 @@ async def test_session_status_does_not_cold_start_runtime(
         assert view.provider_session_hash is None
         assert view.provider_thread_hash is None
         assert view.behavior.model.value == "unknown"
-        assert view.behavior.model.source == "unknown (runtime not loaded)"
-        assert view.behavior.resolution == "resolves on next Turn"
+        assert view.behavior.model.source == "not observed; stale"
+        assert "observed_at=unknown" in view.behavior.resolution
         assert view.degraded_reason is None
         session_field = next(
             field
@@ -272,12 +272,11 @@ async def test_session_status_model_source_precedence(
             storage_context.repository.get_project(storage_context.project.id)
         )
         provider = await lifecycle.status_view(storage_context.conversation.id)
-        assert provider.behavior.model.value == "fake-model"
-        assert provider.behavior.model.source == "provider default"
-        assert provider.behavior.reasoning_effort.value == "medium"
-        assert provider.behavior.reasoning_effort.source == "model default"
-        assert provider.behavior.service_tier.value == "flex"
-        assert provider.behavior.input_modalities == ("text", "image")
+        assert provider.behavior.model.value == "unknown"
+        assert provider.behavior.model.source == "not observed; stale"
+        assert provider.behavior.reasoning_effort.value == "unknown"
+        assert provider.behavior.service_tier.value == "unknown"
+        assert provider.behavior.input_modalities == ()
 
         with storage_context.store.transaction() as connection:
             connection.execute(
@@ -285,8 +284,8 @@ async def test_session_status_model_source_precedence(
                 (storage_context.project.id,),
             )
         project = await lifecycle.status_view(storage_context.conversation.id)
-        assert project.behavior.model.value == "fake-model"
-        assert project.behavior.model.source == "project default"
+        assert project.behavior.model.value == "unknown"
+        assert project.behavior.model.source == "not observed; stale"
 
         storage_context.repository.update_conversation_preferences(
             storage_context.conversation.id,
@@ -295,8 +294,8 @@ async def test_session_status_model_source_precedence(
         conversation = await lifecycle.status_view(
             storage_context.conversation.id
         )
-        assert conversation.behavior.model.value == "fake-model"
-        assert conversation.behavior.model.source == "conversation override"
+        assert conversation.behavior.model.value == "unknown"
+        assert conversation.behavior.model.source == "not observed; stale"
     finally:
         await lifecycle.close()
         await supervisor.close()
@@ -383,18 +382,15 @@ async def test_session_status_resolves_sources_and_active_turn_drift(
 
         view = await lifecycle.status_view(storage_context.conversation.id)
 
-        assert view.behavior.model.value == "fake-model"
-        assert view.behavior.model.source == "conversation override"
-        assert view.behavior.reasoning_effort.value == "high"
-        assert view.behavior.reasoning_effort.source == "conversation override"
-        assert view.behavior.reasoning_summary.value == "concise"
-        assert view.behavior.personality.value == "pragmatic"
-        assert view.behavior.personality.source == "project default"
-        assert view.behavior.service_tier.value == "flex"
-        assert view.behavior.input_modalities == ("text", "image")
-        assert view.behavior.resolution == "resolved"
+        assert view.behavior.model.value == "unknown"
+        assert view.behavior.reasoning_effort.value == "unknown"
+        assert view.behavior.reasoning_summary.value == "unknown"
+        assert view.behavior.personality.value == "unknown"
+        assert view.behavior.service_tier.value == "unknown"
+        assert view.behavior.input_modalities == ()
+        assert "stale" in view.behavior.resolution
         assert view.activity.active_turn == running
-        assert view.activity.active_settings_differ
+        assert not view.activity.active_settings_differ
         assert view.resume_verification == "verified by active provider Turn"
         assert view.provider_session_id == "status-session"
         assert view.provider_session_hash == sha256_text("status-session")[:12]
@@ -407,15 +403,15 @@ async def test_session_status_resolves_sources_and_active_turn_drift(
         payload = embed.to_dict()
         assert payload["title"] == "🟢 Session active"
         assert [field["name"] for field in payload["fields"]] == [
-            "Model & behavior · next Turn",
+            "Provider settings · last observed",
             "Activity",
             "Session",
             "Execution",
         ]
         rendered = json.dumps(payload, ensure_ascii=False)
-        assert "fake-model" in rendered
+        assert "unknown" in rendered
         assert "old-project-model" in rendered
-        assert "differs from next Turn" in rendered
+        assert "differs from next Turn" not in rendered
         assert "`status-session`" in rendered
         assert "Provider Thread `hash:" in rendered
         assert "Optional capabilities" not in rendered

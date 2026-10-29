@@ -5,8 +5,8 @@ import concurrent.futures
 import json
 import logging
 import threading
-from collections.abc import AsyncIterator, Sequence
-from dataclasses import dataclass
+from collections.abc import AsyncIterator, Callable, Sequence
+from dataclasses import dataclass, replace
 from typing import Any, cast
 
 from openai_codex import (
@@ -51,7 +51,8 @@ from openai_codex.generated.v2_all import (
 from openai_codex.models import InitializeResponse, JsonObject, JsonValue, Notification, ServerInfo
 from openai_codex.types import Personality, ReasoningEffort, ReasoningSummary
 
-from codexd.domain.ids import canonical_json
+from codexd.domain.ids import canonical_json, utc_now_ms
+from codexd.domain.observations import ProviderSettings, settings_values
 from codexd.runtime.port import DynamicToolCall, DynamicToolHandler
 
 logger = logging.getLogger(__name__)
@@ -96,6 +97,11 @@ class DynamicAsyncCodex:
         self._pending_turns: dict[str, str] = {}
         self._turn_routes: dict[str, tuple[str, str]] = {}
         self._observed_image_paths: dict[str, set[str]] = {}
+        self.settings: dict[str, ProviderSettings] = {}
+        self.settings_sink: Callable[[ProviderSettings], None] | None = None
+        self._settings_task: asyncio.Task[None] | None = None
+        self._settings_sequence = 0
+        self._settings_closed = False
         self._sync_client = CodexClient(
             config=config,
             approval_handler=self._handle_server_request,
@@ -110,6 +116,7 @@ class DynamicAsyncCodex:
                 name, separator, version = self._metadata.userAgent.partition("/")
                 if separator and name and version:
                     self._metadata.serverInfo = ServerInfo(name=name, version=version)
+            self._settings_task = asyncio.create_task(self._observe_settings())
         except BaseException:
             await asyncio.to_thread(self._sync_client.close)
             self._loop = None
@@ -132,13 +139,54 @@ class DynamicAsyncCodex:
         return getattr(self._sync_client, "_proc", None)
 
     async def close(self) -> None:
+        self._settings_closed = True
         await asyncio.to_thread(self._sync_client.close)
+        if self._settings_task is not None:
+            await self._settings_task
+            self._settings_task = None
         with self._route_lock:
             self._pending_turns.clear()
             self._turn_routes.clear()
             self._observed_image_paths.clear()
         self._metadata = None
         self._loop = None
+
+    def _record_settings(self, thread_id: str, values: Any, source: str) -> None:
+        self._settings_sequence += 1
+        with self._route_lock:
+            local = next((route[1] for route in self._turn_routes.values()
+                          if route[0] == thread_id), self._pending_turns.get(thread_id))
+        observed = ProviderSettings(
+            thread_id, self._generation,
+            settings_values(values, notification=source == "thread/settings/updated"),
+            source, utc_now_ms(), self._settings_sequence, local,
+        )
+        if len(self.settings) >= 256 and thread_id not in self.settings:
+            self.settings.pop(next(iter(self.settings)))
+        self.settings[thread_id] = observed
+        if self.settings_sink is not None:
+            self.settings_sink(observed)
+
+    async def _observe_settings(self) -> None:
+        try:
+            while not self._settings_closed:
+                notification = await asyncio.to_thread(self._sync_client.next_notification)
+                if notification.method == "thread/settings/updated":
+                    payload = notification.payload
+                    thread_id = getattr(payload, "thread_id", None)
+                    settings = getattr(payload, "thread_settings", None)
+                    if isinstance(thread_id, str) and settings is not None:
+                        self._record_settings(thread_id, settings, notification.method)
+        except Exception:
+            # Do not log full notifications or failures; disconnected snapshots are stale.
+            self.settings = {
+                key: replace(value, fresh=False) for key, value in self.settings.items()
+            }
+
+    def _response_settings(self, response: Any, source: str, before: int) -> None:
+        existing = self.settings.get(response.thread.id)
+        if existing is None or existing.sequence <= before:
+            self._record_settings(response.thread.id, response, source)
 
     async def read_config(self, cwd: str) -> ConfigReadResponse:
         params: JsonObject = {"cwd": cwd, "includeLayers": False}
@@ -187,7 +235,9 @@ class DynamicAsyncCodex:
         )
         payload = _model_payload(params)
         payload["dynamicTools"] = list(self._dynamic_tools)
+        before = self._settings_sequence
         response = await asyncio.to_thread(self._sync_client.thread_start, payload)
+        self._response_settings(response, "thread/start", before)
         return DynamicAsyncThread(self, response.thread.id)
 
     async def thread_resume(
@@ -214,11 +264,13 @@ class DynamicAsyncCodex:
             sandbox=_sandbox_mode(sandbox),
             service_tier=service_tier,
         )
+        before = self._settings_sequence
         response = await asyncio.to_thread(
             self._sync_client.thread_resume,
             thread_id,
             params,
         )
+        self._response_settings(response, "thread/resume", before)
         return DynamicAsyncThread(self, response.thread.id)
 
     async def thread_fork(
@@ -247,11 +299,13 @@ class DynamicAsyncCodex:
             service_tier=service_tier,
             developer_instructions=developer_instructions,
         )
+        before = self._settings_sequence
         response = await asyncio.to_thread(
             self._sync_client.thread_fork,
             thread_id,
             params,
         )
+        self._response_settings(response, "thread/fork", before)
         if response.thread.id == thread_id:
             raise ValueError("fork response reused its source thread")
         return DynamicAsyncThread(self, response.thread.id, fork_request_source=thread_id)
@@ -288,6 +342,11 @@ class DynamicAsyncCodex:
             if thread_id in self._pending_turns:
                 raise RuntimeError("a Codex Thread already has a pending local Turn")
             self._pending_turns[thread_id] = local_turn_id
+            previous = self.settings.get(thread_id)
+            if previous is not None:
+                # A new request may change settings; old response evidence is not
+                # confirmation for this Turn if no settings notification arrives.
+                self.settings[thread_id] = replace(previous, fresh=False)
         try:
             response = self._sync_client.turn_start(thread_id, wire_input, params)
             provider_turn_id = response.turn.id
