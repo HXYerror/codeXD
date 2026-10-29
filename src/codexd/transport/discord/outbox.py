@@ -2150,6 +2150,24 @@ def _attachment_failure_guidance(value: object) -> str | None:
         "attachment_integrity_failed": (
             "The attachment changed or failed integrity validation before Codex started."
         ),
+        "image_catalog_incomplete": (
+            "Image request not sent: model catalog is incomplete. Retry later."
+        ),
+        "image_catalog_empty": "Image request not sent: provider returned an empty model catalog.",
+        "image_model_unconfirmed": (
+            "Image request not sent: the target thread model could not be confirmed after resume. "
+            "History is preserved; retry explicitly or select a model. No automatic replay."
+        ),
+        "image_model_ambiguous": (
+            "Image request not sent: multiple catalog entries match the model."
+        ),
+        "image_model_not_in_catalog": (
+            "Image request not sent: the thread model is absent from the catalog; "
+            "image support is unknown."
+        ),
+        "image_model_text_only": (
+            "Image request not sent: the selected model does not support images."
+        ),
     }
     return archive_messages.get(code)
 

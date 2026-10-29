@@ -312,6 +312,78 @@ async def test_real_0147_dynamic_tools_and_thread_lifecycle(
                 await asyncio.sleep(0.01)
             assert client.settings[thread.id].values["model"] == "contract-model"
             assert client._settings_task is not None and not client._settings_task.done()
+            # #48: simulate an already-completed Turn without settings notification.
+            # The real execution-time resume must recover model evidence before image send.
+            from dataclasses import replace
+            from types import SimpleNamespace
+            from unittest.mock import AsyncMock
+
+            from test_runtime_turns import _model
+
+            from codexd.application.turn_coordinator import TurnCoordinator
+            from codexd.domain.models import ModelCatalogSnapshot
+
+            client.settings[thread.id] = replace(client.settings[thread.id], fresh=False)
+            main_snapshot = await thread.read()
+            revision = storage_context.repository.activate_thread_revision(
+                conversation_id=storage_context.conversation.id,
+                identity=ThreadIdentity(
+                    thread.id, None, main_snapshot.thread.session_id, None, None, "0.147.0"
+                ),
+                config=ThreadConfig(None, None, SandboxProfile.FULL_ACCESS),
+            )
+            runtime48 = CodexSDKRuntime(
+                client=client,
+                generation=7,
+                slot=RuntimeSlotConfig(
+                    "project", "fixture", tmp_path, home, {}, "fixture", "project_scoped"
+                ),
+                manifest=capability_manifest(),
+            )
+            runtime48._threads[thread.id] = thread
+            runtime48.list_models = AsyncMock(
+                return_value=ModelCatalogSnapshot(
+                    (
+                        _model("global-a", is_default=True, modalities=("text",)),
+                        _model("contract-model", is_default=False, modalities=("text", "image")),
+                    ),
+                    True,
+                    None,
+                )
+            )
+            coordinator48 = SimpleNamespace(
+                _repository=storage_context.repository, _validate_revision_identity=AsyncMock()
+            )
+            queued = storage_context.repository.get_turn(turn.id)
+            descriptor = await TurnCoordinator._validate_turn_catalog(
+                coordinator48,
+                runtime48,
+                turn=queued,
+                turn_input=SimpleNamespace(images=(image_path,)),
+            )
+            assert descriptor.model == "contract-model"
+            coordinator48._validate_revision_identity.assert_awaited_once()
+            image_turn = await thread.turn(
+                [LocalImageInput(str(image_path))],
+                local_turn_id="image48",
+                approval_mode=ApprovalMode.deny_all,
+                cwd=str(tmp_path),
+                effort=None,
+                model=descriptor.model,
+                output_schema=None,
+                personality=None,
+                sandbox=Sandbox.read_only,
+                service_tier=None,
+                summary=None,
+            )
+            image_events = [event async for event in image_turn.stream()]
+            assert image_events[-1].payload.turn.status.value == "completed"
+            assert requests[-1]["model"] == "contract-model"
+            assert "input_image" in json.dumps(requests[-1])
+            assert (
+                storage_context.repository.get_active_revision(queued.conversation_id).id
+                == revision.id
+            )
             side = await client.thread_fork(
                 thread.id,
                 approval_mode=ApprovalMode.deny_all,
