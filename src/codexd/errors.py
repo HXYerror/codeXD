@@ -39,3 +39,9 @@ class AttachmentIntegrityError(ConflictError, InvariantError):
 
 class NotFoundError(CodexDError):
     code = "not_found"
+
+
+class ImageAdmissionError(ConflictError):
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)

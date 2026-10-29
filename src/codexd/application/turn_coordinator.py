@@ -4,7 +4,7 @@ import asyncio
 import time
 from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from codexd.application.attachment_materializer import AttachmentMaterializer
 from codexd.application.conversation_locks import ConversationLocks
@@ -29,6 +29,7 @@ from codexd.domain.turns import InterruptOrigin, TurnIdentity, TurnInput, TurnSo
 from codexd.errors import (
     CodexDError,
     ConflictError,
+    ImageAdmissionError,
     InvariantError,
     NotFoundError,
     ProviderThreadRecoveryRequired,
@@ -160,8 +161,8 @@ class TurnCoordinator:
         if self._closing:
             raise ConflictError("Turn coordinator is shutting down")
         async with self._conversation_locks.hold(conversation_id):
-            if turn_input.images:
-                await self._assert_image_model(conversation_id)
+            # Integrity is checked by storage now; capability checks belong after
+            # the execution lifecycle has restored the actual provider thread.
             turn = await asyncio.to_thread(
                 self._repository.enqueue_turn,
                 conversation_id=conversation_id,
@@ -183,30 +184,6 @@ class TurnCoordinator:
     def event_metrics(self) -> dict[str, float | int]:
         return self._event_pump.metrics()
 
-    async def _assert_image_model(self, conversation_id: str) -> None:
-        conversation = await asyncio.to_thread(self._repository.get_conversation, conversation_id)
-        project = await asyncio.to_thread(self._repository.get_project, conversation.project_id)
-        config = await asyncio.to_thread(self._repository.effective_thread_config, conversation_id)
-        runtime, _lease = await self._runtime_supervisor.ensure(project)
-        catalog = await runtime.list_models()
-        if not catalog.complete or not catalog.models:
-            raise InvariantError("Codex model catalog is incomplete or empty")
-        revision = await asyncio.to_thread(self._repository.get_active_revision, conversation_id)
-        configured = await runtime.configured_model(project.root_path)
-        if revision is not None and config.model is None:
-            observed = await runtime.observed_settings(revision.provider_thread_id)
-            configured = EffectiveModel(
-                observed.values.get("model") if observed and observed.fresh else None,
-                "provider observed" if observed and observed.fresh else "unknown",
-            )
-        resolved = resolve_model(catalog, config.model, None, configured)
-        descriptor = resolved.descriptor
-        if descriptor is None:
-            raise ConflictError("effective image model is missing or ambiguous")
-        if "image" not in descriptor.input_modalities:
-            raise ConflictError(
-                f"effective model {descriptor.model} does not support image input"
-            )
 
     async def cancel(
         self,
@@ -676,7 +653,7 @@ class TurnCoordinator:
                     attachment_context=materialized.context,
                     materialized_files=materialized.files,
                 )
-            await self._validate_turn_catalog(
+            descriptor = await self._validate_turn_catalog(
                 runtime,
                 turn=claimed,
                 turn_input=turn_input,
@@ -688,7 +665,11 @@ class TurnCoordinator:
                 local_turn_id=claimed.id,
                 thread=thread_identity,
                 input=turn_input,
-                config=_turn_config(claimed, project),
+                config=(
+                    replace(_turn_config(claimed, project), model=descriptor.model)
+                    if turn_input.images and descriptor is not None
+                    else _turn_config(claimed, project)
+                ),
             )
             self._volatile_turns.drop_input(claimed.id)
         except RuntimeUnavailable as exc:
@@ -1189,9 +1170,6 @@ class TurnCoordinator:
         turn: TurnRecord,
         turn_input: TurnInput,
     ) -> ModelDescriptor | None:
-        catalog = await runtime.list_models()
-        if not catalog.complete or not catalog.models:
-            raise InvariantError("Codex model catalog is incomplete or empty")
         conversation = await asyncio.to_thread(
             self._repository.get_conversation,
             turn.conversation_id,
@@ -1199,7 +1177,7 @@ class TurnCoordinator:
         project = await asyncio.to_thread(self._repository.get_project, conversation.project_id)
         configured = (
             await runtime.configured_model(project.root_path)
-            if turn.effective_model is None
+            if turn.effective_model is None and not turn_input.images
             else EffectiveModel(None, "unknown")
         )
         revision = await asyncio.to_thread(
@@ -1207,17 +1185,53 @@ class TurnCoordinator:
         )
         if turn.effective_model is None and revision is not None:
             observed = await runtime.observed_settings(revision.provider_thread_id)
+            if turn_input.images and (
+                observed is None or not observed.fresh
+                or observed.generation != runtime.generation
+                or observed.thread_id != revision.provider_thread_id
+            ):
+                # Execution-only refresh: never called by show or ingress. Resume
+                # retains the old thread model when the queued request has no override.
+                identity = await runtime.resume_thread(
+                    thread_id=revision.provider_thread_id, cwd=project.root_path,
+                    config=_thread_config(turn),
+                )
+                await self._validate_revision_identity(
+                    turn.conversation_id, revision, identity, require_requested_id=True,
+                )
+                observed = await runtime.observed_settings(revision.provider_thread_id)
+            if turn_input.images and (
+                observed is None or not observed.fresh
+                or observed.generation != runtime.generation
+                or observed.thread_id != revision.provider_thread_id
+                or observed.state != "idle"
+            ):
+                raise ImageAdmissionError("image_model_unconfirmed")
             configured = EffectiveModel(
                 observed.values.get("model") if observed and observed.fresh else None,
                 "provider observed" if observed and observed.fresh else "unknown",
             )
+        # Query capabilities after any execution-time resume, not before it.
+        catalog = await runtime.list_models()
+        if turn_input.images and not catalog.complete:
+            raise ImageAdmissionError("image_catalog_incomplete")
+        if turn_input.images and not catalog.models:
+            raise ImageAdmissionError("image_catalog_empty")
+        if not catalog.complete or not catalog.models:
+            raise InvariantError("Codex model catalog is incomplete or empty")
         resolved = resolve_model(catalog, turn.effective_model, None, configured)
+        if turn_input.images and not resolved.model:
+            raise ImageAdmissionError("image_model_unconfirmed")
         descriptor = resolved.descriptor
         if descriptor is None:
             if sum(
                 resolved.model in {item.id, item.model} for item in catalog.models
             ) > 1:
+                if turn_input.images:
+                    raise ImageAdmissionError("image_model_ambiguous")
                 raise InvariantError("effective model is ambiguous in the Codex catalog")
+            if turn_input.images:
+                raise ImageAdmissionError("image_model_not_in_catalog")
             if (
                 turn_input.images
                 or turn.effective_reasoning_effort is not None
@@ -1228,7 +1242,7 @@ class TurnCoordinator:
             # A plain text request can use provider configuration outside the catalog.
             return None
         if turn_input.images and "image" not in descriptor.input_modalities:
-            raise InvariantError(f"effective model {descriptor.model} does not support image input")
+            raise ImageAdmissionError("image_model_text_only")
         if (
             turn.effective_reasoning_effort is not None
             and turn.effective_reasoning_effort not in descriptor.supported_reasoning_efforts
